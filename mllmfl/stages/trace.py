@@ -1,0 +1,124 @@
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Sequence
+
+from mllmfl.domain.trace import build_trace, load_events, project_fault_window
+from mllmfl.infrastructure.defects4j import defects4j_environment, split_test, test_classpath
+from mllmfl.infrastructure.io import write_csv, write_json, write_text
+from mllmfl.infrastructure.layout import RunLayout
+from mllmfl.infrastructure.process import run_command
+
+
+PROJECT_PREFIX = {
+    "Chart": "org.jfree",
+    "Cli": "org.apache.commons.cli",
+    "Closure": "com.google.javascript",
+    "Codec": "org.apache.commons.codec",
+    "Collections": "org.apache.commons.collections",
+    "Compress": "org.apache.commons.compress",
+    "Csv": "org.apache.commons.csv",
+    "Gson": "com.google.gson",
+    "JacksonCore": "com.fasterxml.jackson.core",
+    "JacksonDatabind": "com.fasterxml.jackson.databind",
+    "JacksonXml": "com.fasterxml.jackson.dataformat.xml",
+    "Jsoup": "org.jsoup",
+    "JxPath": "org.apache.commons.jxpath",
+    "Lang": "org.apache.commons.lang",
+    "Math": "org.apache.commons.math",
+    "Mockito": "org.mockito",
+    "Time": "org.joda.time",
+}
+
+
+def build_classpath(workspace: Path, agent_jar: Path, env: Dict[str, str]) -> str:
+    paths: List[str] = []
+    for relative in (
+        "target/classes", "target/test-classes", "build/classes", "build/tests",
+        "build/test-classes", "classes", "test-classes", "build", "build-tests",
+    ):
+        path = workspace / relative
+        if path.exists():
+            paths.append(str(path))
+    paths.extend(value for value in test_classpath(workspace, env).split(os.pathsep) if value)
+    paths.append(str(agent_jar))
+    return os.pathsep.join(dict.fromkeys(paths))
+
+
+def trace_trigger(workspace: Path, output: Path, test: str, project: str,
+                  agent_jar: Path, env: Dict[str, str], timeout: int,
+                  before: int, after: int, max_calls: int,
+                  log_dir: Path | None = None) -> Dict[str, Any]:
+    test_class, test_method = split_test(test)
+    prefix = PROJECT_PREFIX.get(project, test_class.rsplit(".", 1)[0])
+    output.mkdir(parents=True, exist_ok=True)
+    raw_path = output / "raw_events.jsonl"
+    if raw_path.exists():
+        raw_path.unlink()
+    agent_args = f"{prefix},class:{test_class}"
+    command = [
+        "java", "-Djava.awt.headless=true", f"-Dfltrace.raw.file={raw_path}",
+        f"-javaagent:{agent_jar}={agent_args}", "-cp", build_classpath(workspace, agent_jar, env),
+        "fltrace.runner.SingleTestRunner", test_class, test_method,
+    ]
+    result = run_command(command, cwd=workspace, env=env, timeout=timeout)
+    log_dir = log_dir or output
+    write_text(log_dir / "trace.stdout.log", result.stdout)
+    write_text(log_dir / "trace.stderr.log", result.stderr)
+    if not raw_path.is_file():
+        raise RuntimeError("fullchain agent did not create raw_events.jsonl")
+    full = build_trace(load_events(raw_path))
+    full.update({
+        "project": project, "test": {"class": test_class, "method": test_method},
+        "process_exit_code": result.returncode,
+    })
+    failure_text = "\n".join([result.stdout, result.stderr])
+    window = project_fault_window(
+        full, test_class, test_method, failure_text, before, after, max_calls
+    )
+    window["project"] = project
+    write_json(output / "trace.json", full)
+    write_json(output / "window.json", window)
+    return window
+
+
+def run(
+    layout: RunLayout,
+    projects: Sequence[str],
+    bugs: set[str] | None,
+    trigger: str | None,
+    agent_jar: Path,
+    d4j_home: Path | None,
+    java_home: Path | None,
+    timeout: int,
+    before: int,
+    after: int,
+    max_calls: int,
+    force: bool = False,
+) -> List[Dict[str, object]]:
+    if not agent_jar.is_file():
+        raise FileNotFoundError(f"agent jar not found: {agent_jar}")
+    env = defects4j_environment(d4j_home, java_home)
+    rows = []
+    for project, bug, number, output in layout.discover_triggers(projects, bugs, trigger):
+        if (output / "window.json").exists() and not force:
+            rows.append({"project": project, "bug": bug, "trigger": number, "status": "SKIPPED"})
+            continue
+        test_path = output / "trigger_test.txt"
+        try:
+            test = test_path.read_text(encoding="utf-8").strip().splitlines()[0]
+            log_dir = layout.stage_log_dir("trace", project, bug, number)
+            window = trace_trigger(layout.workspace_dir(project, bug), output, test, project,
+                                   agent_jar, env, timeout, before, after, max_calls, log_dir)
+            rows.append({"project": project, "bug": bug, "trigger": number,
+                         "status": "OK", "call_count": window["call_count"]})
+        except Exception as error:
+            write_text(layout.stage_log_dir("trace", project, bug, number) / "error.log",
+                       str(error) + "\n")
+            rows.append({"project": project, "bug": bug, "trigger": number,
+                         "status": "ERROR", "call_count": 0})
+    write_csv(
+        layout.logs / "trace.csv",
+        rows,
+        ["project", "bug", "trigger", "status", "call_count"],
+    )
+    return rows

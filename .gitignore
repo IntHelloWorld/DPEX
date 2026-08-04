@@ -1,0 +1,29 @@
+# Python
+.venv/
+defects4j/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+
+# Pipeline runtime data (for any --root inside the repository)
+workspace/
+artifacts/
+logs/
+summaries/
+runs/
+
+# Java build output
+fullchain_tracer/target/
+*.class
+
+# Local model data and credentials
+.env
+*.local.json
+**/raw_model_output*
+**/conversation.jsonl
+
+# Local export archives
+*.tar
+*.tar.gz
+*.zip

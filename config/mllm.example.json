@@ -1,0 +1,13 @@
+{
+  "mllm": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "vision_model": "your-vision-model",
+    "top_k": 5,
+    "max_tokens": 4096,
+    "retry": {
+      "max_retries": 3,
+      "backoff_s": 2
+    }
+  }
+}
