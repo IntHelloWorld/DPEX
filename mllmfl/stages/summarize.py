@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Dict, List, Sequence
 
 from mllmfl.domain.models import Candidate
-from mllmfl.domain.trace import WINDOW_SCHEMA, validate_trace
+from mllmfl.domain.trace import EXECUTION_SCHEMA, validate_trace
 from mllmfl.infrastructure.io import read_json, write_csv, write_json, write_text
 from mllmfl.infrastructure.java_source import (
     called_methods,
@@ -14,14 +14,14 @@ from mllmfl.infrastructure.java_source import (
 from mllmfl.infrastructure.layout import RunLayout
 
 
-def candidate_functions(window: Dict[str, object], cap: int) -> List[str]:
+def candidate_functions(execution: Dict[str, object], cap: int) -> List[str]:
     if cap <= 0:
         raise ValueError("candidate cap must be positive")
-    validate_trace(window, WINDOW_SCHEMA)
+    validate_trace(execution, EXECUTION_SCHEMA)
     result = []
-    test = window.get("test") or {}
+    test = execution.get("test") or {}
     test_function = f"{test.get('class', '')}.{test.get('method', '')}"
-    for call in window["calls"]:
+    for call in execution["calls"]:
         for function in (str(call["caller"]), str(call["callee"])):
             if function == test_function or function.endswith(".<clinit>") or function in result:
                 continue
@@ -111,8 +111,8 @@ def run(
             )
             continue
         try:
-            window = read_json(directory / "window.json")
-            functions = candidate_functions(window, cap)
+            execution = read_json(directory / "execution.json")
+            functions = candidate_functions(execution, cap)
             candidates = [
                 summarize_function(
                     layout.workspace_dir(project, bug), value, max_chars, max_called
@@ -122,7 +122,7 @@ def run(
             write_json(path, {
                 "schema": "fault-candidates", "schema_version": 1,
                 "project": project, "bug": bug, "trigger": number,
-                "source_schema": window["schema"], "candidate_count": len(candidates),
+                "source_schema": execution["schema"], "candidate_count": len(candidates),
                 "candidates": [candidate.to_dict() for candidate in candidates],
             })
             rows.append({"project": project, "bug": bug, "trigger": number,

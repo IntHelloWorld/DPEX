@@ -1,13 +1,12 @@
 import json
-import re
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
 from .models import Call, Invocation
 
 FULL_TRACE_SCHEMA = "fullchain-trace"
-WINDOW_SCHEMA = "fullchain-window"
-SCHEMA_VERSION = 2
+EXECUTION_SCHEMA = "fullchain-execution"
+SCHEMA_VERSION = 3
 ALLOWED_EVENTS = {"ENTER", "RETURN", "THROW", "TEST_START", "TEST_FAILURE", "TEST_END"}
 NOISE_PREFIXES = (
     "org.junit.",
@@ -50,7 +49,41 @@ def _ancestor_chain(invocations: Dict[int, Invocation], parent_id: int) -> List[
     return chain
 
 
+def _without_class_initializers(
+    events: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Drop every class initializer and its complete invocation subtree."""
+    entered = {
+        int(event["invocation_id"]): event
+        for event in events
+        if event.get("type") == "ENTER"
+    }
+    excluded = {
+        invocation_id
+        for invocation_id, event in entered.items()
+        if event.get("method") == "<clinit>"
+    }
+    if not excluded:
+        return [dict(event) for event in events]
+
+    children: Dict[int, List[int]] = {}
+    for invocation_id, event in entered.items():
+        children.setdefault(int(event.get("parent_id") or 0), []).append(invocation_id)
+    pending = list(excluded)
+    while pending:
+        for invocation_id in children.get(pending.pop(), []):
+            if invocation_id not in excluded:
+                excluded.add(invocation_id)
+                pending.append(invocation_id)
+    return [
+        dict(event)
+        for event in events
+        if int(event.get("invocation_id") or 0) not in excluded
+    ]
+
+
 def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    events = _without_class_initializers(events)
     unknown = sorted(
         {
             str(event.get("type"))
@@ -83,6 +116,7 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 thread_name=str(event.get("thread_name") or ""),
                 enter_seq=int(event.get("seq") or 0),
                 enter_ns=int(event.get("ts_ns") or 0),
+                origin_test_line=int(event.get("origin_test_line") or 0),
             )
         elif event_type in {"RETURN", "THROW"}:
             invocation_id = int(event["invocation_id"])
@@ -136,6 +170,7 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 enter_seq=child.enter_seq,
                 exit_seq=int(child.exit_seq or 0),
                 exit_type=str(child.exit_type),
+                origin_test_line=child.origin_test_line,
             )
         )
     result = {
@@ -158,7 +193,7 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
     if not isinstance(value, dict):
         raise ValueError("trace must be a JSON object")
     schema = value.get("schema")
-    if schema not in {FULL_TRACE_SCHEMA, WINDOW_SCHEMA}:
+    if schema not in {FULL_TRACE_SCHEMA, EXECUTION_SCHEMA}:
         raise ValueError(f"unsupported trace schema: {schema!r}")
     if expected_schema and schema != expected_schema:
         raise ValueError(f"expected schema {expected_schema}, got {schema}")
@@ -166,94 +201,22 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
         raise ValueError(f"unsupported schema_version: {value.get('schema_version')!r}")
     if not isinstance(value.get("calls"), list) or not isinstance(value.get("invocations"), list):
         raise ValueError("trace calls and invocations must be arrays")
-    required = {"caller", "callee", "invocation_id", "parent_invocation_id", "exit_type"}
+    required = {
+        "caller", "callee", "invocation_id", "parent_invocation_id", "exit_type",
+        "origin_test_line",
+    }
     for index, call in enumerate(value["calls"]):
         if not isinstance(call, dict) or not required.issubset(call):
             raise ValueError(f"invalid call at index {index}")
     return value
 
 
-def extract_stack_methods(text: str) -> List[str]:
-    return list(dict.fromkeys(re.findall(r"^\s*at\s+([A-Za-z0-9_.$<>]+)\(", text, flags=re.M)))
-
-
-def _endpoint_matches(value: str, target: str) -> bool:
-    a, b = value.replace("/", ".").split("."), target.replace("/", ".").split(".")
-    return a == b or (len(a) >= 2 and len(b) >= 2 and a[-2:] == b[-2:])
-
-
-def _context_calls(
-    first: Dict[str, Any],
-    invocations: Dict[int, Dict[str, Any]],
-    selected: set[int],
-) -> List[Dict[str, Any]]:
-    """Recreate omitted ancestor edges so the window retains its call context."""
-    result: List[Dict[str, Any]] = []
-    chain = [int(value) for value in first.get("parent_chain") or []]
-    for parent_id, child_id in zip(chain, chain[1:]):
-        if child_id in selected:
-            continue
-        parent, child = invocations.get(parent_id), invocations.get(child_id)
-        if not parent or not child:
-            continue
-        result.append(
-            {
-                "caller": f"{parent['class']}.{parent['method']}",
-                "callee": f"{child['class']}.{child['method']}",
-                "caller_class": parent["class"],
-                "callee_class": child["class"],
-                "caller_method": parent["method"],
-                "callee_method": child["method"],
-                "caller_descriptor": parent.get("descriptor", ""),
-                "callee_descriptor": child.get("descriptor", ""),
-                "parent_invocation_id": parent_id,
-                "invocation_id": child_id,
-                "parent_chain": [],
-                "thread_id": child.get("thread_id", 0),
-                "enter_seq": child.get("enter_seq", 0),
-                "exit_seq": child.get("exit_seq", 0),
-                "exit_type": child.get("exit_type", "RETURN"),
-                "count": 1,
-                "context": True,
-            }
-        )
-    return result
-
-
-def _compress_siblings(calls: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Collapse only adjacent, equivalent sibling calls while preserving order."""
-    compact: List[Dict[str, Any]] = []
-    for raw in calls:
-        call = dict(raw)
-        key = (
-            call["caller"],
-            call["callee"],
-            call.get("parent_invocation_id"),
-            call.get("caller_descriptor", ""),
-            call.get("callee_descriptor", ""),
-        )
-        if compact and compact[-1]["_key"] == key:
-            compact[-1]["count"] += 1
-            compact[-1]["invocation_ids"].append(call["invocation_id"])
-            continue
-        call["_key"] = key
-        call["count"] = 1
-        call["invocation_ids"] = [call["invocation_id"]]
-        compact.append(call)
-    for call in compact:
-        call.pop("_key", None)
-    return compact
-
-
-def project_fault_window(
+def project_execution(
     full_trace: Dict[str, Any],
     test_class: str,
     test_method: str,
-    failure_text: str = "",
-    before: int = 80,
-    after: int = 80,
-    max_calls: int = 160,
 ) -> Dict[str, Any]:
+    """Project every recorded application call without cropping or compression."""
     validate_trace(full_trace, FULL_TRACE_SCHEMA)
     calls = [
         call
@@ -265,74 +228,23 @@ def project_fault_window(
     ]
     if not calls:
         raise ValueError("no calls remain after noise filtering")
-    test_fqn = f"{test_class}.{test_method}"
-    stack_methods = extract_stack_methods(failure_text)
-    stack_indexes = [
-        index
-        for index, call in enumerate(calls)
-        if any(
-            _endpoint_matches(call[endpoint], method)
-            for method in stack_methods
-            for endpoint in ("caller", "callee")
-        )
-    ]
-    test_indexes = [
-        index
-        for index, call in enumerate(calls)
-        if any(
-            _endpoint_matches(call[endpoint], test_fqn)
-            for endpoint in ("caller", "callee")
-        )
-    ]
-    # Prefer the failure stack, then the test method, and finally the trace tail.
-    if stack_indexes:
-        anchor, mode = stack_indexes[-1], "failure_stack"
-    elif test_indexes:
-        anchor, mode = test_indexes[-1], "test_method"
-    else:
-        anchor, mode = len(calls) - 1, "tail"
-    start = max(0, anchor - max(0, before))
-    end = min(len(calls), anchor + max(0, after) + 1)
-    window = calls[start:end]
-    if max_calls > 0 and len(window) > max_calls:
-        window = window[-max_calls:]
-        start = end - len(window)
-    selected_ids = {int(call["invocation_id"]) for call in window}
-    invocations = {
-        int(item["invocation_id"]): item for item in full_trace["invocations"]
-    }
-    context = _context_calls(window[0], invocations, selected_ids) if window else []
-    compact = _compress_siblings([*context, *window])
-    relevant_ids = set()
-    for call in compact:
-        relevant_ids.add(int(call["invocation_id"]))
-        relevant_ids.update(int(value) for value in call.get("invocation_ids") or [])
-        relevant_ids.add(int(call["parent_invocation_id"]))
-        relevant_ids.update(int(value) for value in call.get("parent_chain") or [])
-    relevant = [
-        item
-        for item in full_trace["invocations"]
-        if int(item["invocation_id"]) in relevant_ids
-    ]
+    projected_calls = []
+    for raw in calls:
+        call = dict(raw)
+        call.update({"count": 1, "context": False, "invocation_ids": [call["invocation_id"]]})
+        projected_calls.append(call)
     result = {
-        "schema": WINDOW_SCHEMA,
+        "schema": EXECUTION_SCHEMA,
         "schema_version": SCHEMA_VERSION,
         "test": {"class": test_class, "method": test_method},
-        "focus": {
-            "mode": mode,
-            "anchor_index": anchor,
-            "window_start": start,
-            "window_end": end,
-            "stack_methods": stack_methods[:20],
-        },
         "original_call_count": len(full_trace["calls"]),
         "filtered_call_count": len(calls),
-        "call_count": len(compact),
+        "call_count": len(projected_calls),
         "test_start": full_trace.get("test_start"),
         "test_end": full_trace.get("test_end"),
         "test_failures": full_trace.get("test_failures", []),
-        "invocations": relevant,
-        "calls": compact,
+        "invocations": list(full_trace["invocations"]),
+        "calls": projected_calls,
     }
-    validate_trace(result, WINDOW_SCHEMA)
+    validate_trace(result, EXECUTION_SCHEMA)
     return result

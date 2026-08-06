@@ -7,6 +7,8 @@ import javassist.CtClass;
 import javassist.CtConstructor;
 import javassist.LoaderClassPath;
 import javassist.Modifier;
+import javassist.bytecode.CodeAttribute;
+import javassist.bytecode.LineNumberAttribute;
 
 import java.lang.instrument.ClassFileTransformer;
 import java.lang.instrument.Instrumentation;
@@ -19,6 +21,8 @@ import java.util.Set;
 public final class Agent {
     private static final Set<String> EXACT = new HashSet<String>();
     private static final List<String> PREFIX = new ArrayList<String>();
+    private static final String TEST_CLASS = System.getProperty("fltrace.test.class", "");
+    private static final String TEST_METHOD = System.getProperty("fltrace.test.method", "");
 
     private Agent() {}
 
@@ -92,6 +96,9 @@ public final class Agent {
                     methodName = behavior.getName();
                 }
                 String descriptor = behavior.getSignature();
+                if (className.equals(TEST_CLASS) && methodName.equals(TEST_METHOD)) {
+                    instrumentTestLines(behavior, className, methodName);
+                }
                 String enter = "{ fltrace.TraceRuntime.enter(\"" + javaLiteral(className) +
                         "\",\"" + javaLiteral(methodName) + "\",\"" +
                         javaLiteral(descriptor) + "\"); }";
@@ -100,6 +107,26 @@ public final class Agent {
                 behavior.addCatch("{ fltrace.TraceRuntime.exitThrow($e); throw $e; }", throwable);
             } catch (Throwable error) {
                 if (Boolean.getBoolean("fltrace.debug")) error.printStackTrace();
+            }
+        }
+
+        private void instrumentTestLines(CtBehavior behavior, String className, String methodName) {
+            CodeAttribute code = behavior.getMethodInfo().getCodeAttribute();
+            if (code == null) return;
+            LineNumberAttribute lines = (LineNumberAttribute) code.getAttribute(
+                    LineNumberAttribute.tag);
+            if (lines == null) return;
+            Set<Integer> inserted = new HashSet<Integer>();
+            for (int index = 0; index < lines.tableLength(); index++) {
+                int line = lines.lineNumber(index);
+                if (line <= 0 || !inserted.add(line)) continue;
+                try {
+                    behavior.insertAt(line, true,
+                            "{ fltrace.TraceRuntime.testLine(\"" + javaLiteral(className) +
+                            "\",\"" + javaLiteral(methodName) + "\"," + line + "); }");
+                } catch (Throwable error) {
+                    if (Boolean.getBoolean("fltrace.debug")) error.printStackTrace();
+                }
             }
         }
     }

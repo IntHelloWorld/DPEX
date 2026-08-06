@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mllmfl.domain.trace import build_trace, load_events, project_fault_window, validate_trace
+from mllmfl.domain.trace import build_trace, load_events, project_execution, validate_trace
 
 
 def events(exit_type="RETURN"):
@@ -30,7 +30,7 @@ def events(exit_type="RETURN"):
 class EventParsingTests(unittest.TestCase):
     def test_builds_full_trace_with_parent_chain_and_exit(self):
         trace = build_trace(events("THROW"))
-        self.assertEqual(trace["schema_version"], 2)
+        self.assertEqual(trace["schema_version"], 3)
         self.assertEqual(trace["calls"][0]["parent_chain"], [1])
         self.assertEqual(trace["calls"][0]["exit_type"], "THROW")
         validate_trace(trace)
@@ -59,18 +59,53 @@ class EventParsingTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "line 2"):
                 load_events(path)
 
+    def test_removes_complete_class_initializer_subtree(self):
+        value = [
+            {"type": "TEST_START", "seq": 1, "class": "p.Test", "method": "testCase"},
+            {"type": "ENTER", "seq": 2, "invocation_id": 1, "parent_id": 0,
+             "class": "p.Test", "method": "testCase", "descriptor": "()V"},
+            {"type": "ENTER", "seq": 3, "invocation_id": 2, "parent_id": 1,
+             "class": "p.StaticState", "method": "<clinit>", "descriptor": "()V"},
+            {"type": "ENTER", "seq": 4, "invocation_id": 3, "parent_id": 2,
+             "class": "p.Helper", "method": "load", "descriptor": "()V"},
+            {"type": "RETURN", "seq": 5, "invocation_id": 3},
+            {"type": "RETURN", "seq": 6, "invocation_id": 2},
+            {"type": "RETURN", "seq": 7, "invocation_id": 1},
+            {"type": "TEST_END", "seq": 8, "successful": True},
+        ]
+        trace = build_trace(value)
+        self.assertEqual(trace["invocation_count"], 1)
+        self.assertEqual(trace["call_count"], 0)
+        self.assertNotIn("<clinit>", json.dumps(trace))
+        self.assertNotIn("p.Helper.load", json.dumps(trace))
 
-class WindowTests(unittest.TestCase):
-    def test_prefers_failure_stack_and_preserves_thread(self):
-        trace = build_trace(events())
-        window = project_fault_window(trace, "p.Test", "testCase", " at p.Service.run(X.java:1)")
-        self.assertEqual(window["focus"]["mode"], "failure_stack")
-        self.assertEqual(window["calls"][0]["thread_id"], 1)
 
-    def test_test_then_tail_fallback_and_size_limit(self):
+class ExecutionProjectionTests(unittest.TestCase):
+    def test_preserves_every_filtered_call_and_thread(self):
         trace = build_trace(events())
-        by_test = project_fault_window(trace, "p.Test", "testCase")
-        self.assertEqual(by_test["focus"]["mode"], "test_method")
-        by_tail = project_fault_window(trace, "missing.Test", "none", max_calls=1)
-        self.assertEqual(by_tail["focus"]["mode"], "tail")
-        self.assertLessEqual(by_tail["call_count"], 1)
+        execution = project_execution(trace, "p.Test", "testCase")
+        self.assertEqual(execution["schema"], "fullchain-execution")
+        self.assertEqual(execution["original_call_count"], 1)
+        self.assertEqual(execution["filtered_call_count"], 1)
+        self.assertEqual(execution["call_count"], 1)
+        self.assertEqual(execution["calls"][0]["thread_id"], 1)
+
+    def test_does_not_compress_repeated_sibling_calls(self):
+        repeated = events()
+        repeated.insert(4, {
+            "type": "ENTER", "seq": 5, "ts_ns": 31, "thread_id": 1,
+            "thread_name": "main", "invocation_id": 3, "parent_id": 1,
+            "class": "p.Service", "method": "run", "descriptor": "(I)V",
+        })
+        repeated.insert(5, {
+            "type": "RETURN", "seq": 6, "ts_ns": 32, "thread_id": 1,
+            "invocation_id": 3, "duration_ns": 1,
+        })
+        repeated[6]["seq"] = 7
+        repeated[7]["seq"] = 8
+        execution = project_execution(build_trace(repeated), "p.Test", "testCase")
+        self.assertEqual(execution["call_count"], 2)
+        self.assertEqual([call["count"] for call in execution["calls"]], [1, 1])
+        self.assertEqual(
+            [call["invocation_ids"] for call in execution["calls"]], [[2], [3]]
+        )

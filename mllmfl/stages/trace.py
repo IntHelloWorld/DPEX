@@ -2,9 +2,11 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-from mllmfl.domain.trace import build_trace, load_events, project_fault_window
+from mllmfl.domain.trace import build_trace, load_events, project_execution
+from mllmfl.domain.test_slice import slice_execution
 from mllmfl.infrastructure.defects4j import defects4j_environment, split_test, test_classpath
 from mllmfl.infrastructure.io import write_csv, write_json, write_text
+from mllmfl.infrastructure.java_source import find_java_file
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.process import run_command
 
@@ -46,7 +48,6 @@ def build_classpath(workspace: Path, agent_jar: Path, env: Dict[str, str]) -> st
 
 def trace_trigger(workspace: Path, output: Path, test: str, project: str,
                   agent_jar: Path, env: Dict[str, str], timeout: int,
-                  before: int, after: int, max_calls: int,
                   log_dir: Path | None = None) -> Dict[str, Any]:
     test_class, test_method = split_test(test)
     prefix = PROJECT_PREFIX.get(project, test_class.rsplit(".", 1)[0])
@@ -57,6 +58,7 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
     agent_args = f"{prefix},class:{test_class}"
     command = [
         "java", "-Djava.awt.headless=true", f"-Dfltrace.raw.file={raw_path}",
+        f"-Dfltrace.test.class={test_class}", f"-Dfltrace.test.method={test_method}",
         f"-javaagent:{agent_jar}={agent_args}", "-cp", build_classpath(workspace, agent_jar, env),
         "fltrace.runner.SingleTestRunner", test_class, test_method,
     ]
@@ -71,14 +73,17 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
         "project": project, "test": {"class": test_class, "method": test_method},
         "process_exit_code": result.returncode,
     })
-    failure_text = "\n".join([result.stdout, result.stderr])
-    window = project_fault_window(
-        full, test_class, test_method, failure_text, before, after, max_calls
+    execution = project_execution(full, test_class, test_method)
+    execution["project"] = project
+    sliced = slice_execution(
+        execution, find_java_file(workspace, test_class), test_class, test_method
     )
-    window["project"] = project
     write_json(output / "trace.json", full)
-    write_json(output / "window.json", window)
-    return window
+    write_json(output / "execution.json", execution)
+    write_json(output / "execution_sliced.json", sliced)
+    write_json(output / "test_slice.json", sliced["slice"])
+    (output / "window.json").unlink(missing_ok=True)
+    return execution
 
 
 def run(
@@ -90,9 +95,6 @@ def run(
     d4j_home: Path | None,
     java_home: Path | None,
     timeout: int,
-    before: int,
-    after: int,
-    max_calls: int,
     force: bool = False,
 ) -> List[Dict[str, object]]:
     if not agent_jar.is_file():
@@ -100,17 +102,19 @@ def run(
     env = defects4j_environment(d4j_home, java_home)
     rows = []
     for project, bug, number, output in layout.discover_triggers(projects, bugs, trigger):
-        if (output / "window.json").exists() and not force:
+        if (output / "execution.json").exists() and (output / "execution_sliced.json").exists() and not force:
             rows.append({"project": project, "bug": bug, "trigger": number, "status": "SKIPPED"})
             continue
         test_path = output / "trigger_test.txt"
         try:
             test = test_path.read_text(encoding="utf-8").strip().splitlines()[0]
             log_dir = layout.stage_log_dir("trace", project, bug, number)
-            window = trace_trigger(layout.workspace_dir(project, bug), output, test, project,
-                                   agent_jar, env, timeout, before, after, max_calls, log_dir)
+            execution = trace_trigger(
+                layout.workspace_dir(project, bug), output, test, project,
+                agent_jar, env, timeout, log_dir,
+            )
             rows.append({"project": project, "bug": bug, "trigger": number,
-                         "status": "OK", "call_count": window["call_count"]})
+                         "status": "OK", "call_count": execution["call_count"]})
         except Exception as error:
             write_text(layout.stage_log_dir("trace", project, bug, number) / "error.log",
                        str(error) + "\n")

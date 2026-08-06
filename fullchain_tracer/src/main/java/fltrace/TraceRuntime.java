@@ -17,6 +17,12 @@ public final class TraceRuntime {
                     return new ArrayDeque<Frame>();
                 }
             };
+    private static final ThreadLocal<Integer> TEST_LINE =
+            new ThreadLocal<Integer>() {
+                @Override protected Integer initialValue() {
+                    return Integer.valueOf(0);
+                }
+            };
     private static PrintWriter OUT = null;
 
     private static final class Frame {
@@ -60,6 +66,17 @@ public final class TraceRuntime {
 
     private TraceRuntime() {}
 
+    public static void testLine(String className, String methodName, int line) {
+        try {
+            String expectedClass = System.getProperty("fltrace.test.class", "");
+            String expectedMethod = System.getProperty("fltrace.test.method", "");
+            if (expectedClass.equals(className) && expectedMethod.equals(methodName)) {
+                TEST_LINE.set(Integer.valueOf(line));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static void enter(String className, String methodName, String descriptor) {
         try {
             if (OUT == null) return;
@@ -74,7 +91,8 @@ public final class TraceRuntime {
                     ",\"parent_id\":" + parentId +
                     ",\"class\":\"" + esc(className) + "\"" +
                     ",\"method\":\"" + esc(methodName) + "\"" +
-                    ",\"descriptor\":\"" + esc(descriptor) + "\"}");
+                    ",\"descriptor\":\"" + esc(descriptor) + "\"" +
+                    ",\"origin_test_line\":" + TEST_LINE.get().intValue() + "}");
         } catch (Throwable ignored) {
         }
     }
@@ -102,6 +120,7 @@ public final class TraceRuntime {
             emit("{\"type\":\"" + type + "\"" + common(timestamp) +
                     ",\"invocation_id\":" + frame.invocationId +
                     ",\"duration_ns\":" + Math.max(0L, timestamp - frame.enterNs) +
+                    ",\"origin_test_line\":" + TEST_LINE.get().intValue() +
                     extra + "}");
         } catch (Throwable ignored) {
         }
@@ -109,6 +128,7 @@ public final class TraceRuntime {
 
     public static void testStart(String className, String methodName) {
         try {
+            TEST_LINE.set(Integer.valueOf(0));
             long timestamp = System.nanoTime();
             emit("{\"type\":\"TEST_START\"" + common(timestamp) +
                     ",\"class\":\"" + esc(className) + "\"" +
@@ -122,11 +142,28 @@ public final class TraceRuntime {
             long timestamp = System.nanoTime();
             String exceptionClass = error == null ? "" : error.getClass().getName();
             String message = error == null ? "" : error.getMessage();
+            StackTraceElement frame = testFrame(error);
+            String sourceFile = frame == null ? "" : frame.getFileName();
+            int sourceLine = frame == null ? TEST_LINE.get().intValue() : frame.getLineNumber();
             emit("{\"type\":\"TEST_FAILURE\"" + common(timestamp) +
                     ",\"exception_class\":\"" + esc(exceptionClass) + "\"" +
-                    ",\"message\":\"" + esc(message) + "\"}");
+                    ",\"message\":\"" + esc(message) + "\"" +
+                    ",\"source_file\":\"" + esc(sourceFile) + "\"" +
+                    ",\"source_line\":" + sourceLine + "}");
         } catch (Throwable ignored) {
         }
+    }
+
+    private static StackTraceElement testFrame(Throwable error) {
+        if (error == null) return null;
+        String testClass = System.getProperty("fltrace.test.class", "");
+        String testMethod = System.getProperty("fltrace.test.method", "");
+        for (StackTraceElement frame : error.getStackTrace()) {
+            if (testClass.equals(frame.getClassName()) && testMethod.equals(frame.getMethodName())) {
+                return frame;
+            }
+        }
+        return null;
     }
 
     public static void testEnd(boolean successful, int failureCount) {

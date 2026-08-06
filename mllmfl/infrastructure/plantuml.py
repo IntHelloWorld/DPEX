@@ -36,6 +36,6 @@ def render(
         if width >= limit_size or height >= limit_size:
             raise RuntimeError(
                 f"PlantUML output reached the {limit_size}px limit ({width}x{height}); "
-                "increase --plantuml-limit-size or reduce the UML window"
+                "increase --plantuml-limit-size"
             )
     return png

@@ -89,7 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     collect_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
 
-    trace_parser = subparsers.add_parser("trace", help="record and project Fullchain v2 traces")
+    trace_parser = subparsers.add_parser(
+        "trace", help="record Fullchain v3 executions and test-boundary slices"
+    )
     _common(trace_parser)
     trace_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     trace_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
@@ -97,11 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent-jar",
         default=str(PROJECT_ROOT / "lib" / "fullchain-tracer.jar"),
     )
-    trace_parser.add_argument("--before", type=int, default=80)
-    trace_parser.add_argument("--after", type=int, default=80)
-    trace_parser.add_argument("--max-calls", type=int, default=160)
 
-    uml_parser = subparsers.add_parser("uml", help="render fault-focused sequence diagrams")
+    uml_parser = subparsers.add_parser(
+        "uml", help="render sliced execution sequence diagrams"
+    )
     _common(uml_parser)
     uml_parser.add_argument("--plantuml-command", default="plantuml")
     uml_parser.add_argument(
@@ -110,12 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
     uml_parser.add_argument(
         "--plantuml-limit-size",
         type=int,
-        default=16384,
+        default=32768,
         help="maximum PNG width/height before rendering fails",
     )
 
     summary_parser = subparsers.add_parser(
-        "summarize", help="extract and summarize window candidates"
+        "summarize", help="extract and summarize execution candidates"
     )
     _common(summary_parser)
     summary_parser.add_argument("--candidate-cap", type=_positive_int, default=100)
@@ -174,9 +175,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             Path(args.d4j_home).expanduser() if args.d4j_home else None,
             Path(args.java_home).expanduser() if args.java_home else None,
             args.timeout,
-            args.before,
-            args.after,
-            args.max_calls,
             args.force,
         )
     elif args.stage == "uml":

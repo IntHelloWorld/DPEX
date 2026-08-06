@@ -1,8 +1,9 @@
 import hashlib
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-from mllmfl.domain.trace import WINDOW_SCHEMA, validate_trace
+from mllmfl.domain.trace import EXECUTION_SCHEMA, validate_trace
 from mllmfl.infrastructure.io import read_json, write_csv, write_json, write_text
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.plantuml import render
@@ -61,10 +62,10 @@ def readable_signature(method: str, descriptor: str) -> str:
     return f"{method}({', '.join(args)})"
 
 
-def _root_test_invocation(window: Dict[str, Any]) -> Dict[str, Any] | None:
-    test = window.get("test") or {}
+def _root_test_invocation(execution: Dict[str, Any]) -> Dict[str, Any] | None:
+    test = execution.get("test") or {}
     matches = [
-        invocation for invocation in window.get("invocations") or []
+        invocation for invocation in execution.get("invocations") or []
         if invocation.get("class") == test.get("class")
         and invocation.get("method") == test.get("method")
     ]
@@ -74,20 +75,83 @@ def _root_test_invocation(window: Dict[str, Any]) -> Dict[str, Any] | None:
                                            int(item.get("enter_seq") or 0)))
 
 
+def _compress_repeated_subtrees(execution: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Merge adjacent identical sibling subtrees, keeping their first occurrence."""
+    calls = [dict(call) for call in execution["calls"]]
+    by_id = {int(call["invocation_id"]): call for call in calls}
+    invocations = {
+        int(invocation["invocation_id"]): invocation
+        for invocation in execution.get("invocations") or []
+    }
+    children: Dict[int, List[int]] = {}
+    for call in calls:
+        children.setdefault(int(call["parent_invocation_id"]), []).append(
+            int(call["invocation_id"])
+        )
+
+    @lru_cache(maxsize=None)
+    def signature(invocation_id: int) -> Tuple[Any, ...]:
+        call = by_id[invocation_id]
+        invocation = invocations.get(invocation_id) or {}
+        return (
+            call.get("caller_class"),
+            call.get("caller_method"),
+            call.get("caller_descriptor"),
+            call.get("callee_class"),
+            call.get("callee_method"),
+            call.get("callee_descriptor"),
+            call.get("thread_id"),
+            call.get("exit_type"),
+            invocation.get("exception_class", ""),
+            invocation.get("message", ""),
+            tuple(signature(child_id) for child_id in children.get(invocation_id, [])),
+        )
+
+    result: List[Dict[str, Any]] = []
+
+    def keep_children(parent_id: int) -> None:
+        sibling_ids = children.get(parent_id, [])
+        index = 0
+        while index < len(sibling_ids):
+            first_id = sibling_ids[index]
+            first_signature = signature(first_id)
+            end = index + 1
+            while end < len(sibling_ids) and signature(sibling_ids[end]) == first_signature:
+                end += 1
+            kept = dict(by_id[first_id])
+            kept["count"] = sum(
+                int(by_id[invocation_id].get("count", 1))
+                for invocation_id in sibling_ids[index:end]
+            )
+            result.append(kept)
+            keep_children(first_id)
+            index = end
+
+    call_ids = set(by_id)
+    root_parents = []
+    for call in calls:
+        parent_id = int(call["parent_invocation_id"])
+        if parent_id not in call_ids and parent_id not in root_parents:
+            root_parents.append(parent_id)
+    for parent_id in root_parents:
+        keep_children(parent_id)
+    return result
+
+
 def make_puml(
-    window: Dict[str, Any],
+    execution: Dict[str, Any],
     project: str = "",
     bug: str = "",
     trigger: str = "",
 ) -> str:
-    validate_trace(window, WINDOW_SCHEMA)
-    calls = window["calls"]
+    validate_trace(execution, EXECUTION_SCHEMA)
+    calls = _compress_repeated_subtrees(execution)
     classes = []
     for call in calls:
         classes.extend([call.get("caller_class") or call["caller"].rsplit(".", 1)[0],
                         call.get("callee_class") or call["callee"].rsplit(".", 1)[0]])
     labels = minimal_class_labels(classes)
-    test_class = str((window.get("test") or {}).get("class") or "")
+    test_class = str((execution.get("test") or {}).get("class") or "")
     ordered = ([test_class] if test_class in labels else []) + [
         value for value in labels if value != test_class
     ]
@@ -96,7 +160,7 @@ def make_puml(
     for class_name in ordered:
         lines.append(f'participant "{_escape(labels[class_name])}" as {_alias(class_name)}')
     events = []
-    root_test = _root_test_invocation(window)
+    root_test = _root_test_invocation(execution)
     if root_test is not None:
         events.append((int(root_test.get("enter_seq") or 0), -1, -1, "root_enter", root_test))
         events.append((int(root_test.get("exit_seq") or 0), 2, -1, "root_exit", root_test))
@@ -155,7 +219,7 @@ def run(
     plantuml_jar: Path | None,
     timeout: int,
     force: bool = False,
-    limit_size: int = 16384,
+    limit_size: int = 32768,
 ) -> List[Dict[str, object]]:
     rows = []
     for project, bug, number, directory in layout.discover_triggers(projects, bugs, trigger):
@@ -165,13 +229,20 @@ def run(
             rows.append({"project": project, "bug": bug, "trigger": number, "status": "SKIPPED"})
             continue
         try:
-            window = read_json(directory / "window.json")
-            puml = make_puml(window, project, bug, number)
+            sliced_path = directory / "execution_sliced.json"
+            execution_path = sliced_path if sliced_path.exists() else directory / "execution.json"
+            execution = read_json(execution_path)
+            puml = make_puml(execution, project, bug, number)
+            displayed_calls = _compress_repeated_subtrees(execution)
             write_text(puml_path, puml)
             render(puml_path, plantuml_command, plantuml_jar, timeout, limit_size)
             write_json(directory / "uml.json", {
-                "schema": "fault-focused-uml", "schema_version": 1,
-                "source_schema": window["schema"], "call_count": len(window["calls"]),
+                "schema": "execution-uml", "schema_version": 1,
+                "source_schema": execution["schema"], "call_count": len(execution["calls"]),
+                "source_file": execution_path.name,
+                "slice_applied": bool((execution.get("slice") or {}).get("applied")),
+                "displayed_call_count": len(displayed_calls),
+                "collapsed_call_count": len(execution["calls"]) - len(displayed_calls),
                 "puml": puml_path.name, "image": png_path.name,
             })
             rows.append({"project": project, "bug": bug, "trigger": number, "status": "OK"})

@@ -1,7 +1,7 @@
 # MLLM Fault Localization
 
 This repository provides a reproducible Defects4J fault-localization pipeline. The Python package
-`mllmfl` orchestrates collection, Fullchain v2 tracing, fault-focused sequence diagrams, source
+`mllmfl` orchestrates collection, Fullchain v3 tracing, test-boundary-sliced sequence diagrams, source
 summaries, multimodal localization, and per-bug vote aggregation. The bytecode tracer remains an
 independent Maven module in `fullchain_tracer/`.
 
@@ -47,9 +47,8 @@ an existing stage result. `localize` should always be exercised with `--dry-run`
 request, copy the example configuration to an ignored `*.local.json`, set `api_key_env`, and export
 that environment variable. Inline API keys are rejected.
 
-PNG rendering defaults to a 16384-pixel PlantUML limit. If a larger diagram reaches that boundary,
-`uml` fails explicitly instead of keeping a truncated image; raise `--plantuml-limit-size` or reduce
-the trace window.
+PNG rendering defaults to a 32768-pixel PlantUML limit. If a larger diagram reaches that boundary,
+`uml` fails explicitly instead of keeping a truncated image; raise `--plantuml-limit-size`.
 
 ## Artifact contracts
 
@@ -58,19 +57,31 @@ Stages communicate only through versioned JSON:
 | File | Schema | Producer | Consumer |
 |---|---|---|---|
 | `collect.json` | `collected-trigger` v1 | collect | trace metadata |
-| `trace.json` | `fullchain-trace` v2 | trace | diagnostics |
-| `window.json` | `fullchain-window` v2 | trace | uml, summarize |
-| `uml.json` | `fault-focused-uml` v1 | uml | localization audit |
+| `trace.json` | `fullchain-trace` v3 | trace | diagnostics |
+| `execution.json` | `fullchain-execution` v3 | trace | summarize, fallback diagnostics |
+| `execution_sliced.json` | `fullchain-execution` v3 | trace | uml |
+| `test_slice.json` | `test-boundary-slice` v2 | trace | slice audit |
+| `uml.json` | `execution-uml` v1 | uml | localization audit |
 | `candidates.json` | `fault-candidates` v1 | summarize | localize |
 | `localization.json` | `fault-localization` v1 | localize | aggregate |
 | `summaries/...json` | `fault-localization-aggregate` v1 | aggregate | evaluation |
 
 Full traces retain invocation IDs, parent chains, descriptors, threads, timing, and return/throw
-state. `window.json` is a bounded projection anchored on the failure stack, then the failing test,
-then the trace tail. Missing ancestors are restored as context and only consecutive sibling calls
-may be compressed.
+state and the originating test-source line. `execution.json` retains every recorded application call
+after framework-noise filtering. The trace stage additionally locates the failed test statement,
+uses the tree-sitter Java AST to perform a conservative local-variable and control-dependency
+backward slice over the test method, and writes
+`execution_sliced.json`. Calls that cannot be mapped to the test body (including fixture and async
+work) are retained conservatively. JVM class initializers (`<clinit>`) are excluded;
+their complete invocation subtrees are also excluded so the trace never invents a direct caller for
+methods reached only through class initialization.
 
-Candidates are derived exclusively from the normalized window. The summarizer reads only the buggy
+UML prefers `execution_sliced.json` and falls back to `execution.json` when no slice artifact exists.
+For readability, UML also merges adjacent, completely identical sibling invocation subtrees from
+the highest level downward. The first subtree is drawn once and its root message is marked `×N`;
+the complete calls remain unchanged in `trace.json` and `execution.json`.
+
+Candidates are derived exclusively from the normalized execution. The summarizer reads only the buggy
 checkout; it does not use patches, fixed versions, ground truth, or model predictions.
 
 ## Validation

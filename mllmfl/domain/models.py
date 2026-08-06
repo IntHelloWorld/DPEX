@@ -13,6 +13,7 @@ class Invocation:
     thread_name: str
     enter_seq: int
     enter_ns: int
+    origin_test_line: int = 0
     exit_seq: Optional[int] = None
     exit_ns: Optional[int] = None
     exit_type: Optional[str] = None
@@ -47,6 +48,7 @@ class Call:
     enter_seq: int
     exit_seq: int
     exit_type: str
+    origin_test_line: int = 0
     count: int = 1
     context: bool = False
 
