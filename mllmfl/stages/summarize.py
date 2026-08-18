@@ -14,6 +14,11 @@ from mllmfl.infrastructure.java_source import (
 from mllmfl.infrastructure.layout import RunLayout
 
 
+# Keep candidate extraction available for localization while method-summary generation is
+# temporarily disabled. Set this back to True to restore the existing rule-based summarizer.
+GENERATE_METHOD_SUMMARIES = False
+
+
 def candidate_functions(execution: Dict[str, object], cap: int) -> List[str]:
     if cap <= 0:
         raise ValueError("candidate cap must be positive")
@@ -84,6 +89,11 @@ def summarize_function(
                      body["signature"], body["start_line"], body["end_line"], calls)
 
 
+def candidate_without_summary(function: str) -> Candidate:
+    class_name, method = split_function(function)
+    return Candidate(function, class_name, method, "", "SUMMARY_DISABLED")
+
+
 def run(
     layout: RunLayout,
     projects: Sequence[str],
@@ -113,16 +123,22 @@ def run(
         try:
             execution = read_json(directory / "execution.json")
             functions = candidate_functions(execution, cap)
-            candidates = [
-                summarize_function(
-                    layout.workspace_dir(project, bug), value, max_chars, max_called
-                )
-                for value in functions
-            ]
+            if GENERATE_METHOD_SUMMARIES:
+                candidates = [
+                    summarize_function(
+                        layout.workspace_dir(project, bug), value, max_chars, max_called
+                    )
+                    for value in functions
+                ]
+            else:
+                candidates = [candidate_without_summary(value) for value in functions]
             write_json(path, {
                 "schema": "fault-candidates", "schema_version": 1,
                 "project": project, "bug": bug, "trigger": number,
                 "source_schema": execution["schema"], "candidate_count": len(candidates),
+                "summary_generation": (
+                    "enabled" if GENERATE_METHOD_SUMMARIES else "disabled"
+                ),
                 "candidates": [candidate.to_dict() for candidate in candidates],
             })
             rows.append({"project": project, "bug": bug, "trigger": number,

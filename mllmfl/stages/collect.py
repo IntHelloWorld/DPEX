@@ -67,14 +67,18 @@ def run(
                 write_text(output / "trigger_test.txt", test + "\n")
                 write_text(trigger_log / "test.stdout.log", result.stdout)
                 write_text(trigger_log / "test.stderr.log", result.stderr)
+                test_output = "\n".join(
+                    part.rstrip() for part in (result.stdout, result.stderr) if part
+                )
                 write_text(
                     output / "failure.txt",
-                    (result.stdout + "\n" + result.stderr).strip() + "\n",
+                    test_output + ("\n" if test_output else ""),
                 )
                 write_json(output / "collect.json", {
                     "schema": "collected-trigger", "schema_version": 1,
                     "project": project, "bug": bug, "trigger": index,
                     "test": test, "test_exit_code": result.returncode,
+                    "test_output": test_output,
                 })
             rows.append(
                 {

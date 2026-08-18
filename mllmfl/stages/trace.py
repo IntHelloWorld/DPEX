@@ -2,10 +2,12 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
+from mllmfl.domain.failure import extract_error_stack
+from mllmfl.domain.schemas import validate_defect_context
 from mllmfl.domain.trace import build_trace, load_events, project_execution
 from mllmfl.domain.test_slice import slice_execution
 from mllmfl.infrastructure.defects4j import defects4j_environment, split_test, test_classpath
-from mllmfl.infrastructure.io import write_csv, write_json, write_text
+from mllmfl.infrastructure.io import read_json, write_csv, write_json, write_text
 from mllmfl.infrastructure.java_source import find_java_file
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.process import run_command
@@ -66,6 +68,23 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
     log_dir = log_dir or output
     write_text(log_dir / "trace.stdout.log", result.stdout)
     write_text(log_dir / "trace.stderr.log", result.stderr)
+    error_stack = extract_error_stack(result.stdout + "\n" + result.stderr)
+    collect_path = output / "collect.json"
+    collect_data = read_json(collect_path) if collect_path.is_file() else {}
+    test_output = str(collect_data.get("test_output") or "")
+    if not test_output:
+        legacy_failure = output / "failure.txt"
+        if legacy_failure.is_file():
+            test_output = legacy_failure.read_text(encoding="utf-8", errors="ignore").strip()
+    defect_context = {
+        "schema": "defect-context",
+        "schema_version": 1,
+        "test": test,
+        "error_stack": error_stack,
+        "test_output": test_output,
+    }
+    validate_defect_context(defect_context)
+    write_json(output / "defect_context.json", defect_context)
     if not raw_path.is_file():
         raise RuntimeError("fullchain agent did not create raw_events.jsonl")
     full = build_trace(load_events(raw_path))

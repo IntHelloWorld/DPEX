@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.stages import aggregate, collect, localize, summarize, trace, uml
+from mllmfl.stages import aggregate, collect, evaluate, localize, summarize, trace, uml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROJECTS = [
@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     uml_parser = subparsers.add_parser(
-        "uml", help="render sliced execution sequence diagrams"
+        "uml", help="render first-level invocation subtree sequence diagrams"
     )
     _common(uml_parser)
     uml_parser.add_argument("--plantuml-command", default="plantuml")
@@ -112,16 +112,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--plantuml-limit-size",
         type=int,
         default=32768,
-        help="maximum PNG width/height before rendering fails",
+        help="maximum fragment PNG width/height before rendering fails",
     )
 
     summary_parser = subparsers.add_parser(
-        "summarize", help="extract and summarize execution candidates"
+        "summarize", help="extract execution candidates (method summaries disabled)"
     )
     _common(summary_parser)
     summary_parser.add_argument("--candidate-cap", type=_positive_int, default=100)
-    summary_parser.add_argument("--max-summary-chars", type=int, default=240)
-    summary_parser.add_argument("--max-called-methods", type=int, default=8)
+    summary_parser.add_argument(
+        "--max-summary-chars", type=int, default=240,
+        help="reserved while method-summary generation is disabled",
+    )
+    summary_parser.add_argument(
+        "--max-called-methods", type=int, default=8,
+        help="reserved while method-summary generation is disabled",
+    )
 
     localize_parser = subparsers.add_parser("localize", help="rank candidates with an MLLM")
     _common(localize_parser)
@@ -134,6 +140,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _common(aggregate_parser, include_trigger=False, include_force=False)
     aggregate_parser.add_argument("--top-k", type=_positive_int, default=5)
+
+    evaluate_parser = subparsers.add_parser(
+        "evaluate", help="evaluate aggregate rankings against Defects4J patches"
+    )
+    _common(evaluate_parser, include_trigger=False, include_force=False)
+    evaluate_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     return parser
 
 
@@ -214,8 +226,17 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.dry_run,
             args.force,
         )
-    else:
+    elif args.stage == "aggregate":
         rows = aggregate.run(layout, projects, bugs, args.top_k)
+    else:
+        if not args.d4j_home:
+            parser.error("evaluate requires --d4j-home or D4J_HOME")
+        rows = evaluate.run(
+            layout,
+            projects,
+            bugs,
+            Path(args.d4j_home).expanduser().resolve(),
+        )
     counts = {}
     for row in rows:
         status = str(row.get("status", "OK"))

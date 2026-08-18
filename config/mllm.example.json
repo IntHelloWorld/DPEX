@@ -1,8 +1,9 @@
 {
   "mllm": {
-    "base_url": "https://api.openai.com/v1",
+    "base_url": "https://api.key77qiqi.com/v1",
     "api_key_env": "OPENAI_API_KEY",
-    "vision_model": "your-vision-model",
+    "vision_model": "gpt-5.5-2026-04-24",
+    "reasoning_effort": "medium",
     "top_k": 5,
     "max_tokens": 4096,
     "retry": {

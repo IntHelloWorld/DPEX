@@ -88,6 +88,7 @@ class Candidate:
 @dataclass(frozen=True)
 class Ranking:
     function: str
+    signature: str
     rank: int
     reason: str = ""
 

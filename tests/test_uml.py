@@ -1,7 +1,13 @@
 import unittest
 
 from mllmfl.domain.trace import build_trace, project_execution
-from mllmfl.stages.uml import make_puml, minimal_class_labels, readable_signature
+from mllmfl.stages.uml import (
+    first_level_segments,
+    make_puml,
+    method_signatures,
+    minimal_class_labels,
+    readable_signature,
+)
 from tests.test_trace_domain import events
 
 
@@ -95,3 +101,52 @@ class UMLTests(unittest.TestCase):
         puml = make_puml(execution)
         self.assertEqual(puml.count("repeat()"), 2)
         self.assertNotIn("repeat() ×2", puml)
+
+    def test_partitions_repeated_first_level_methods_by_runtime_invocation(self):
+        repeated = [
+            {"type": "TEST_START", "seq": 1, "class": "p.Test", "method": "testCase"},
+            {"type": "ENTER", "seq": 2, "invocation_id": 1, "parent_id": 0,
+             "class": "p.Test", "method": "testCase", "descriptor": "()V"},
+            {"type": "ENTER", "seq": 3, "invocation_id": 2, "parent_id": 1,
+             "class": "p.Service", "method": "run", "descriptor": "()V",
+             "origin_test_line": 10},
+            {"type": "ENTER", "seq": 4, "invocation_id": 3, "parent_id": 2,
+             "class": "p.Left", "method": "onlyLeft", "descriptor": "()V"},
+            {"type": "RETURN", "seq": 5, "invocation_id": 3},
+            {"type": "RETURN", "seq": 6, "invocation_id": 2},
+            {"type": "ENTER", "seq": 7, "invocation_id": 4, "parent_id": 1,
+             "class": "p.Service", "method": "run", "descriptor": "()V",
+             "origin_test_line": 20},
+            {"type": "ENTER", "seq": 8, "invocation_id": 5, "parent_id": 4,
+             "class": "p.Right", "method": "onlyRight", "descriptor": "()V"},
+            {"type": "RETURN", "seq": 9, "invocation_id": 5},
+            {"type": "RETURN", "seq": 10, "invocation_id": 4},
+            {"type": "THROW", "seq": 11, "invocation_id": 1,
+             "exception_class": "java.lang.AssertionError"},
+            {"type": "TEST_FAILURE", "seq": 12,
+             "exception_class": "java.lang.AssertionError", "source_line": 21},
+            {"type": "TEST_END", "seq": 13, "successful": False},
+        ]
+        execution = project_execution(build_trace(repeated), "p.Test", "testCase")
+        root, segments, excluded = first_level_segments(execution)
+        self.assertEqual(root["invocation_id"], 1)
+        self.assertEqual(excluded, 0)
+        self.assertEqual([item[0]["invocation_id"] for item in segments], [2, 4])
+        self.assertEqual([len(item[1]["calls"]) for item in segments], [2, 2])
+        left = make_puml(segments[0][1], include_test_boundary=False)
+        right = make_puml(segments[1][1], include_test_boundary=False)
+        self.assertIn("onlyLeft()", left)
+        self.assertNotIn("onlyRight()", left)
+        self.assertIn("onlyRight()", right)
+        self.assertNotIn("onlyLeft()", right)
+        self.assertNotIn("-->]", left)
+        self.assertNotIn("throws", left)
+        self.assertEqual(
+            method_signatures(segments[0][1]),
+            ["p.Service.run()", "p.Left.onlyLeft()"],
+        )
+
+    def test_rejects_missing_test_root_and_empty_first_level(self):
+        execution = project_execution(build_trace(events()), "p.Other", "missing")
+        with self.assertRaisesRegex(ValueError, "test root"):
+            first_level_segments(execution)
