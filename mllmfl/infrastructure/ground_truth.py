@@ -1,20 +1,15 @@
 import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable, List
+from typing import Any, Dict, List
 
-from tree_sitter import Language, Node, Parser
-import tree_sitter_java
-
-
-JAVA_LANGUAGE = Language(tree_sitter_java.language())
-TYPE_DECLARATIONS = {
-    "annotation_type_declaration",
-    "class_declaration",
-    "enum_declaration",
-    "interface_declaration",
-    "record_declaration",
-}
+from mllmfl.infrastructure.method_location import (
+    JavaExecutable,
+    MethodLocation,
+    exact_parameters,
+    java_executables,
+    same_parameters,
+)
 HUNK_RE = re.compile(
     r"^@@\s+-(?P<fixed_start>\d+)(?:,(?P<fixed_count>\d+))?\s+"
     r"\+(?P<buggy_start>\d+)(?:,(?P<buggy_count>\d+))?\s+@@"
@@ -34,13 +29,6 @@ class PatchFile:
     fixed_changed_lines: frozenset[int]
     buggy_changed_lines: frozenset[int]
     hunks: tuple[PatchHunk, ...]
-
-
-@dataclass(frozen=True)
-class JavaExecutable:
-    function: str
-    start_line: int
-    end_line: int
 
 
 def _patch_path(line: str) -> str:
@@ -121,67 +109,6 @@ def parse_source_patch(text: str) -> List[PatchFile]:
     return result
 
 
-def _walk(node: Node) -> Iterable[Node]:
-    pending = [node]
-    while pending:
-        current = pending.pop()
-        yield current
-        pending.extend(reversed(current.named_children))
-
-
-def _text(source: bytes, node: Node | None) -> str:
-    if node is None:
-        return ""
-    return source[node.start_byte : node.end_byte].decode("utf-8", errors="replace")
-
-
-def _type_names(source: bytes, node: Node) -> List[str]:
-    names = []
-    current = node.parent
-    while current is not None:
-        if current.type in TYPE_DECLARATIONS:
-            name = _text(source, current.child_by_field_name("name"))
-            if name:
-                names.append(name)
-        current = current.parent
-    names.reverse()
-    return names
-
-
-def java_executables(java_text: str) -> List[JavaExecutable]:
-    source = java_text.encode("utf-8")
-    tree = Parser(JAVA_LANGUAGE).parse(source)
-    if tree.root_node.has_error:
-        raise ValueError("cannot parse buggy Java source")
-    package_match = re.search(
-        r"^\s*package\s+([A-Za-z_$][\w.$]*)\s*;", java_text, re.MULTILINE
-    )
-    package = package_match.group(1) if package_match else ""
-    result = []
-    for node in _walk(tree.root_node):
-        if node.type not in {"method_declaration", "constructor_declaration"}:
-            continue
-        types = _type_names(source, node)
-        if not types:
-            continue
-        class_name = "$".join(types)
-        if package:
-            class_name = f"{package}.{class_name}"
-        method = (
-            "<init>"
-            if node.type == "constructor_declaration"
-            else _text(source, node.child_by_field_name("name"))
-        )
-        if not method:
-            continue
-        result.append(JavaExecutable(
-            function=f"{class_name}.{method}",
-            start_line=node.start_point.row + 1,
-            end_line=node.end_point.row + 1,
-        ))
-    return result
-
-
 def _resolve_source(workspace: Path, patch_path: str) -> Path:
     relative = PurePosixPath(patch_path)
     if relative.is_absolute() or ".." in relative.parts or "\\" in patch_path:
@@ -227,19 +154,52 @@ def reconstruct_fixed_source(buggy_text: str, hunks: tuple[PatchHunk, ...]) -> s
     return "\n".join(fixed_lines) + ("\n" if buggy_text.endswith("\n") else "")
 
 
-def ground_truth_methods(
+def _changed_executables(
+    executables: List[JavaExecutable], changed_lines: frozenset[int]
+) -> List[JavaExecutable]:
+    return [
+        item for item in executables
+        if any(item.start_line <= line <= item.end_line for line in changed_lines)
+    ]
+
+
+def _buggy_counterpart(
+    fixed: JavaExecutable,
+    buggy_executables: List[JavaExecutable],
+) -> JavaExecutable | None:
+    same_function = [
+        item for item in buggy_executables if item.function == fixed.function
+    ]
+    exact = [
+        item for item in same_function
+        if exact_parameters(item.parameter_types, fixed.parameter_types)
+    ]
+    compatible = [
+        item for item in same_function
+        if same_parameters(item.parameter_types, fixed.parameter_types)
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if not exact and len(compatible) == 1:
+        return compatible[0]
+    if not compatible and len(same_function) == 1:
+        return same_function[0]
+    return None
+
+
+def ground_truth_locations(
     d4j_home: Path,
     workspace: Path,
     project: str,
     bug: str,
-) -> List[str]:
+) -> List[Dict[str, Any]]:
     patch = d4j_home / "framework" / "projects" / project / "patches" / f"{bug}.src.patch"
     if not patch.is_file():
         raise ValueError(f"Defects4J source patch not found: {patch}")
     files = parse_source_patch(patch.read_text(encoding="utf-8", errors="replace"))
     if not files:
         raise ValueError(f"Defects4J source patch contains no Java changes: {patch}")
-    methods: set[str] = set()
+    locations: set[MethodLocation] = set()
     unresolved = []
     for patched in files:
         source_path = _resolve_source(workspace, patched.path)
@@ -247,29 +207,55 @@ def ground_truth_methods(
         fixed_text = reconstruct_fixed_source(buggy_text, patched.hunks)
         buggy_executables = java_executables(buggy_text)
         fixed_executables = java_executables(fixed_text)
-        matched = {
-            item.function
-            for item in buggy_executables
-            if any(
-                item.start_line <= line <= item.end_line
-                for line in patched.buggy_changed_lines
-            )
-        }
-        matched.update(
-            item.function
-            for item in fixed_executables
-            if any(
-                item.start_line <= line <= item.end_line
-                for line in patched.fixed_changed_lines
-            )
+        matched = _changed_executables(
+            buggy_executables, patched.buggy_changed_lines
         )
+        for fixed in _changed_executables(
+            fixed_executables, patched.fixed_changed_lines
+        ):
+            counterpart = _buggy_counterpart(fixed, buggy_executables)
+            if counterpart is not None and counterpart not in matched:
+                matched.append(counterpart)
         if not matched:
             unresolved.append(patched.path)
-        methods.update(matched)
+        relative = source_path.resolve().relative_to(workspace.resolve()).as_posix()
+        locations.update(
+            MethodLocation(
+                function=item.function,
+                source_file=relative,
+                start_line=item.start_line,
+                end_line=item.end_line,
+            )
+            for item in matched
+        )
     if unresolved:
         raise ValueError(
             "cannot map Defects4J patch to buggy methods: " + ", ".join(sorted(unresolved))
         )
-    if not methods:
+    if not locations:
         raise ValueError("Defects4J patch produced no ground-truth methods")
-    return sorted(methods)
+    return [
+        item.to_dict()
+        for item in sorted(
+            locations,
+            key=lambda value: (
+                value.source_file,
+                value.start_line,
+                value.end_line,
+                value.function,
+            ),
+        )
+    ]
+
+
+def ground_truth_methods(
+    d4j_home: Path,
+    workspace: Path,
+    project: str,
+    bug: str,
+) -> List[str]:
+    """Compatibility view of source-range ground truth as unique function names."""
+    return sorted({
+        str(item["function"])
+        for item in ground_truth_locations(d4j_home, workspace, project, bug)
+    })

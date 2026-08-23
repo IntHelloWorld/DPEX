@@ -3,16 +3,24 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mllmfl.domain.evaluation import evaluate_ranking, mean_metrics
+from mllmfl.domain.evaluation import (
+    evaluate_location_ranking,
+    evaluate_ranking,
+    mean_metrics,
+)
+from mllmfl.domain.models import Ranking
 from mllmfl.domain.schemas import validate_aggregate, validate_evaluation
 from mllmfl.infrastructure.ground_truth import (
+    ground_truth_locations,
     ground_truth_methods,
     java_executables,
     parse_source_patch,
     reconstruct_fixed_source,
 )
+from mllmfl.infrastructure.method_location import resolve_method_location
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.stages import evaluate
+from mllmfl.stages.localize import attach_source_locations
 
 
 PATCH = """diff --git a/src/p/A.java b/src/p/A.java
@@ -32,6 +40,25 @@ public class A {
     void helper() {}
     void broken() {
         if (value != null) return;
+    }
+}
+"""
+
+OVERLOAD_PATCH = """diff --git a/src/p/A.java b/src/p/A.java
+--- a/src/p/A.java
++++ b/src/p/A.java
+@@ -4,3 +4,3 @@ class A {
+     void run(String value) {
+-        sink(value);
++        sink(value.trim());
+     }
+"""
+
+OVERLOAD_SOURCE = """package p;
+class A {
+    void run(int value) {}
+    void run(String value) {
+        sink(value.trim());
     }
 }
 """
@@ -67,7 +94,92 @@ class GroundTruthTests(unittest.TestCase):
             source.parent.mkdir(parents=True)
             source.write_text(SOURCE, encoding="utf-8")
             methods = ground_truth_methods(root / "d4j", root / "workspace", "P", "1")
+            locations = ground_truth_locations(
+                root / "d4j", root / "workspace", "P", "1"
+            )
         self.assertEqual(methods, ["p.A.broken"])
+        self.assertEqual(locations, [{
+            "function": "p.A.broken", "source_file": "src/p/A.java",
+            "start_line": 4, "end_line": 6,
+        }])
+
+    def test_resolves_overloaded_runtime_method_to_exact_buggy_range(self):
+        source_text = """package p;
+class A {
+    void run(int value) {}
+    void run(String value) {}
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            source = workspace / "src/p/A.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(source_text, encoding="utf-8")
+            integer = resolve_method_location(
+                workspace, "p.A.run", descriptor="(I)V"
+            )
+            string = resolve_method_location(
+                workspace, "p.A.run", descriptor="(Ljava/lang/String;)V"
+            )
+            ranking, dropped = attach_source_locations([
+                Ranking(
+                    "p.A.run", "p.A.run(String)", 1,
+                    method_id="M002", descriptor="(Ljava/lang/String;)V",
+                )
+            ], workspace)
+        self.assertEqual((integer.start_line, integer.end_line), (3, 3))
+        self.assertEqual((string.start_line, string.end_line), (4, 4))
+        self.assertEqual(dropped, [])
+        self.assertEqual(
+            (ranking[0].source_file, ranking[0].start_line, ranking[0].end_line),
+            ("src/p/A.java", 4, 4),
+        )
+        unresolved, unresolved_ids = attach_source_locations([
+            Ranking(
+                "p.Missing.run", "p.Missing.run()", 1,
+                method_id="M999", descriptor="()V",
+            )
+        ], Path("/definitely/missing/workspace"))
+        self.assertEqual(unresolved, [])
+        self.assertEqual(unresolved_ids, ["M999"])
+
+    def test_ground_truth_patch_selects_one_overloaded_source_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            patch = root / "d4j/framework/projects/P/patches/1.src.patch"
+            patch.parent.mkdir(parents=True)
+            patch.write_text(OVERLOAD_PATCH, encoding="utf-8")
+            source = root / "workspace/src/p/A.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(OVERLOAD_SOURCE, encoding="utf-8")
+            locations = ground_truth_locations(
+                root / "d4j", root / "workspace", "P", "1"
+            )
+        self.assertEqual(locations, [{
+            "function": "p.A.run", "source_file": "src/p/A.java",
+            "start_line": 4, "end_line": 6,
+        }])
+
+    def test_descriptor_keeps_qualified_types_for_same_simple_name(self):
+        source_text = """package p;
+class A {
+    void run(p1.Tick value) {}
+    void run(p2.Tick value) {}
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            source = workspace / "src/p/A.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(source_text, encoding="utf-8")
+            first = resolve_method_location(
+                workspace, "p.A.run", descriptor="(Lp1/Tick;)V"
+            )
+            second = resolve_method_location(
+                workspace, "p.A.run", descriptor="(Lp2/Tick;)V"
+            )
+        self.assertEqual(first.start_line, 3)
+        self.assertEqual(second.start_line, 4)
 
 
 class MetricTests(unittest.TestCase):
@@ -89,6 +201,18 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(mean_metrics([]), {
             "top_1": 0.0, "top_3": 0.0, "top_5": 0.0, "mrr": 0.0, "map": 0.0,
         })
+
+    def test_source_ranges_distinguish_overloads_with_same_function(self):
+        ranking = [
+            {"function": "p.A.run", "source_file": "src/p/A.java",
+             "start_line": 3, "end_line": 3},
+            {"function": "p.A.run", "source_file": "src/p/A.java",
+             "start_line": 4, "end_line": 4},
+        ]
+        metrics = evaluate_location_ranking(ranking, [ranking[1]])
+        self.assertEqual(metrics["relevant_ranks"], [2])
+        self.assertEqual(metrics["reciprocal_rank"], 0.5)
+        self.assertEqual(metrics["average_precision"], 0.5)
 
 
 class EvaluateStageTests(unittest.TestCase):
@@ -147,6 +271,40 @@ class EvaluateStageTests(unittest.TestCase):
             }), encoding="utf-8")
             rows = evaluate.run(layout, ["P"], {"1"}, Path(directory) / "d4j")
         self.assertEqual(rows[0]["status"], "NO_VALID_RESULT")
+
+    def test_evaluates_v2_aggregate_by_buggy_source_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = RunLayout(root / "run")
+            layout.ensure()
+            source = layout.workspace_dir("P", "1") / "src/p/A.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(SOURCE, encoding="utf-8")
+            patch = root / "d4j/framework/projects/P/patches/1.src.patch"
+            patch.parent.mkdir(parents=True)
+            patch.write_text(PATCH, encoding="utf-8")
+            summary = layout.summaries / "P/bug_1.json"
+            summary.parent.mkdir(parents=True)
+            summary.write_text(json.dumps({
+                "schema": "fault-localization-aggregate",
+                "schema_version": 2,
+                "project": "P", "bug": "1", "top_k": 5,
+                "valid_trigger_count": 1, "status_counts": {"OK": 1},
+                "ranking": [{
+                    "function": "p.A.broken", "signature": "p.A.broken()",
+                    "source_file": "src/p/A.java", "start_line": 4,
+                    "end_line": 6, "rank": 1,
+                }],
+            }), encoding="utf-8")
+
+            rows = evaluate.run(layout, ["P"], {"1"}, root / "d4j")
+            output = json.loads((layout.summaries / "evaluation.json").read_text())
+
+        self.assertEqual(rows[0]["status"], "OK")
+        self.assertEqual(output["schema_version"], 2)
+        self.assertEqual(output["bugs"][0]["identity_mode"], "source_range")
+        self.assertEqual(output["bugs"][0]["relevant_ranks"], [1])
+        self.assertEqual(output["metrics"]["top_1"], 1.0)
 
     def test_evaluation_schema_rejects_inconsistent_counts(self):
         value = {

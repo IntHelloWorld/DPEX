@@ -91,6 +91,23 @@ class Ranking:
     signature: str
     rank: int
     reason: str = ""
+    method_id: str = field(default="", repr=False)
+    descriptor: str = field(default="", repr=False)
+    source_file: str = ""
+    start_line: Optional[int] = None
+    end_line: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        value = {
+            "function": self.function,
+            "signature": self.signature,
+            "rank": self.rank,
+            "reason": self.reason,
+        }
+        if self.source_file:
+            value.update({
+                "source_file": self.source_file,
+                "start_line": self.start_line,
+                "end_line": self.end_line,
+            })
+        return value

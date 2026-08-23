@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from mllmfl.domain.interaction import localization_interaction_mode
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.stages import aggregate, collect, evaluate, localize, summarize, trace, uml
 
@@ -88,6 +89,12 @@ def build_parser() -> argparse.ArgumentParser:
     _common(collect_parser, include_trigger=False)
     collect_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     collect_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
+    collect_parser.add_argument(
+        "--max-failing-tests",
+        type=_positive_int,
+        default=3,
+        help="maximum failing tests per bug; randomly sample when more are available",
+    )
 
     trace_parser = subparsers.add_parser(
         "trace", help="record Fullchain v3 executions and test-boundary slices"
@@ -101,10 +108,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     uml_parser = subparsers.add_parser(
-        "uml", help="render first-level invocation subtree sequence diagrams"
+        "uml", help="render adaptively folded runtime sequence subgraphs"
     )
     _common(uml_parser)
     uml_parser.add_argument("--plantuml-command", default="plantuml")
+    uml_parser.add_argument(
+        "--config", default=str(PROJECT_ROOT / "config" / "mllm.example.json"),
+        help="configuration file containing UML image limits",
+    )
+    uml_parser.add_argument(
+        "--max-visible-units", "--max-calls",
+        dest="max_visible_units", type=_positive_int,
+        help="maximum visible calls plus sibling bundles per subgraph",
+    )
+    uml_parser.add_argument("--max-participants", type=_positive_int)
+    uml_parser.add_argument("--plantuml-batch-size", type=_positive_int)
     uml_parser.add_argument(
         "--plantuml-jar", default=str(PROJECT_ROOT / "lib" / "plantuml.jar")
     )
@@ -176,6 +194,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             Path(args.java_home).expanduser() if args.java_home else None,
             args.timeout,
             args.force,
+            args.max_failing_tests,
         )
     elif args.stage == "trace":
         rows = trace.run(
@@ -190,6 +209,21 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.force,
         )
     elif args.stage == "uml":
+        uml_config = json.loads(Path(args.config).expanduser().read_text(encoding="utf-8"))
+        uml_cfg = uml_config.get("uml") or {}
+        interaction_mode = localization_interaction_mode(uml_config)
+        max_visible_units = args.max_visible_units or int(
+            uml_cfg.get(
+                "max_visible_units_per_image",
+                uml_cfg.get("max_calls_per_image", 24),
+            )
+        )
+        max_participants = (
+            args.max_participants or int(uml_cfg.get("max_participants_per_image", 8))
+        )
+        plantuml_batch_size = (
+            args.plantuml_batch_size or int(uml_cfg.get("plantuml_batch_size", 100))
+        )
         rows = uml.run(
             layout,
             projects,
@@ -202,6 +236,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.timeout,
             args.force,
             args.plantuml_limit_size,
+            max_visible_units,
+            max_participants,
+            plantuml_batch_size,
+            interaction_mode,
         )
     elif args.stage == "summarize":
         rows = summarize.run(

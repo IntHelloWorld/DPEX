@@ -73,6 +73,28 @@ class T {
         self.assertIn("second.add(1)", selected_code)
         self.assertNotIn("Runnable ignored", selected_code)
 
+    def test_selects_calls_that_can_transfer_control_to_catch(self):
+        source = """package p;
+class T {
+    void testCase() {
+        boolean success = false;
+        try {
+            Service.run();
+            success = true;
+        } catch (RuntimeException error) {
+            success = false;
+        }
+        assertTrue(success);
+    }
+}
+"""
+        statements = extract_statements(source, "p.T", "testCase")
+        selected = select_statements(statements, 11)
+        selected_code = "\n".join(item.code for item in selected)
+        self.assertIn("Service.run()", selected_code)
+        self.assertIn("success = true", selected_code)
+        self.assertIn("success = false", selected_code)
+
     def test_parse_error_or_missing_method_returns_no_statements(self):
         self.assertEqual(extract_statements("class T { void testCase( {", "T", "testCase"), [])
         self.assertEqual(extract_statements("class T {}", "T", "testCase"), [])
@@ -134,6 +156,33 @@ class T {
             sliced["slice"]["strategy"], "tree-sitter-test-method-backward-slice"
         )
         self.assertLess(sliced["call_count"], execution["call_count"])
+        self.assertTrue(any(
+            invocation["class"] == "p.T" and invocation["method"] == "testCase"
+            for invocation in sliced["invocations"]
+        ))
+
+    def test_no_runtime_call_matches_slice_preserves_complete_execution(self):
+        events = [
+            {"type": "TEST_START", "seq": 1, "class": "p.T", "method": "testCase"},
+            {"type": "ENTER", "seq": 2, "invocation_id": 1, "parent_id": 0,
+             "class": "p.T", "method": "testCase", "descriptor": "()V"},
+            {"type": "ENTER", "seq": 3, "invocation_id": 2, "parent_id": 1,
+             "class": "p.Service", "method": "run", "descriptor": "()V",
+             "origin_test_line": 999},
+            {"type": "RETURN", "seq": 4, "invocation_id": 2},
+            {"type": "THROW", "seq": 5, "invocation_id": 1,
+             "exception_class": "java.lang.AssertionError"},
+            {"type": "TEST_FAILURE", "seq": 6,
+             "exception_class": "java.lang.AssertionError", "source_line": 14},
+            {"type": "TEST_END", "seq": 7, "successful": False},
+        ]
+        execution = project_execution(build_trace(events), "p.T", "testCase")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "T.java"
+            source.write_text(SOURCE, encoding="utf-8")
+            sliced = slice_execution(execution, source, "p.T", "testCase")
+        self.assertFalse(sliced["slice"]["applied"])
+        self.assertEqual(sliced["calls"], execution["calls"])
 
     def test_missing_failure_line_preserves_complete_execution(self):
         events = [
@@ -150,6 +199,27 @@ class T {
         execution = project_execution(build_trace(events), "p.T", "testCase")
         sliced = slice_execution(execution, None, "p.T", "testCase")
         self.assertFalse(sliced["slice"]["applied"])
+        self.assertEqual(sliced["calls"], execution["calls"])
+
+    def test_test_method_not_entered_disables_slicing(self):
+        events = [
+            {"type": "TEST_START", "seq": 1, "class": "p.T", "method": "testCase"},
+            {"type": "ENTER", "seq": 2, "invocation_id": 1, "parent_id": 0,
+             "class": "p.T", "method": "setUp", "descriptor": "()V"},
+            {"type": "ENTER", "seq": 3, "invocation_id": 2, "parent_id": 1,
+             "class": "p.Service", "method": "prepare", "descriptor": "()V"},
+            {"type": "THROW", "seq": 4, "invocation_id": 2,
+             "exception_class": "p.Failure"},
+            {"type": "THROW", "seq": 5, "invocation_id": 1,
+             "exception_class": "p.Failure"},
+            {"type": "TEST_FAILURE", "seq": 6,
+             "exception_class": "p.Failure", "source_line": 4},
+            {"type": "TEST_END", "seq": 7, "successful": False},
+        ]
+        execution = project_execution(build_trace(events), "p.T", "testCase")
+        sliced = slice_execution(execution, None, "p.T", "testCase")
+        self.assertFalse(sliced["slice"]["applied"])
+        self.assertEqual(sliced["slice"]["reason"], "target test method was not entered")
         self.assertEqual(sliced["calls"], execution["calls"])
 
 

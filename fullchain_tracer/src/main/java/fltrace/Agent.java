@@ -74,6 +74,9 @@ public final class Agent {
                 for (CtBehavior behavior : transformedClass.getDeclaredBehaviors()) {
                     instrumentBehavior(behavior, dottedName, throwable);
                 }
+                for (CtBehavior behavior : transformedClass.getDeclaredBehaviors()) {
+                    rebuildMethodMetadata(behavior, pool, transformedClass);
+                }
                 return transformedClass.toBytecode();
             } catch (Throwable error) {
                 if (Boolean.getBoolean("fltrace.debug")) error.printStackTrace();
@@ -96,15 +99,15 @@ public final class Agent {
                     methodName = behavior.getName();
                 }
                 String descriptor = behavior.getSignature();
-                if (className.equals(TEST_CLASS) && methodName.equals(TEST_METHOD)) {
-                    instrumentTestLines(behavior, className, methodName);
-                }
                 String enter = "{ fltrace.TraceRuntime.enter(\"" + javaLiteral(className) +
                         "\",\"" + javaLiteral(methodName) + "\",\"" +
                         javaLiteral(descriptor) + "\"); }";
                 behavior.insertBefore(enter);
                 behavior.insertAfter("{ fltrace.TraceRuntime.exitNormal(); }", false);
                 behavior.addCatch("{ fltrace.TraceRuntime.exitThrow($e); throw $e; }", throwable);
+                if (className.equals(TEST_CLASS) && methodName.equals(TEST_METHOD)) {
+                    instrumentTestLines(behavior, className, methodName);
+                }
             } catch (Throwable error) {
                 if (Boolean.getBoolean("fltrace.debug")) error.printStackTrace();
             }
@@ -128,6 +131,15 @@ public final class Agent {
                     if (Boolean.getBoolean("fltrace.debug")) error.printStackTrace();
                 }
             }
+        }
+
+        private void rebuildMethodMetadata(CtBehavior behavior, ClassPool pool,
+                                           CtClass transformedClass) throws Exception {
+            CodeAttribute code = behavior.getMethodInfo().getCodeAttribute();
+            if (code == null) return;
+            code.setMaxStack(code.computeMaxStack());
+            behavior.getMethodInfo().rebuildStackMapIf6(
+                    pool, transformedClass.getClassFile2());
         }
     }
 }

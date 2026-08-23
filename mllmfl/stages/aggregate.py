@@ -6,34 +6,60 @@ from mllmfl.infrastructure.io import read_json, write_csv, write_json
 from mllmfl.infrastructure.layout import RunLayout
 
 
-def aggregate_rankings(results: Sequence[Dict[str, Any]], top_k: int) -> List[Dict[str, Any]]:
+def aggregate_rankings(
+    results: Sequence[Dict[str, Any]],
+    top_k: int,
+    use_source_ranges: bool | None = None,
+) -> List[Dict[str, Any]]:
     if top_k <= 0:
         raise ValueError("top_k must be positive")
-    stats: Dict[str, Dict[str, Any]] = {}
+    ranked_items = [
+        item
+        for result in results
+        for item in (result.get("ranking") or [])[:top_k]
+    ]
+    if use_source_ranges is None:
+        use_source_ranges = bool(ranked_items) and all(
+            str(item.get("source_file") or "")
+            and isinstance(item.get("start_line"), int)
+            and isinstance(item.get("end_line"), int)
+            for item in ranked_items
+        )
+    stats: Dict[Any, Dict[str, Any]] = {}
     for result in results:
         seen = set()
         trigger = str(result.get("trigger", ""))
         for fallback_rank, item in enumerate((result.get("ranking") or [])[:top_k], 1):
             function = str(item.get("function") or "")
-            if not function or function in seen:
+            identity: Any = function
+            if use_source_ranges:
+                identity = (
+                    str(item.get("source_file") or ""),
+                    int(item.get("start_line") or 0),
+                    int(item.get("end_line") or 0),
+                )
+            if not function or identity in seen:
                 continue
-            seen.add(function)
+            seen.add(identity)
             rank = int(item.get("rank") or fallback_rank)
             stat = stats.setdefault(
-                function,
+                identity,
                 {
                     "function": function,
+                    **(
+                        {
+                            "signature": str(item.get("signature") or ""),
+                            "source_file": identity[0],
+                            "start_line": identity[1],
+                            "end_line": identity[2],
+                        }
+                        if use_source_ranges else {}
+                    ),
                     "trigger_support": 0,
-                    "rank_sum": 0,
-                    "best_rank": rank,
-                    "reciprocal_rank_sum": 0.0,
                     "trigger_details": [],
                 },
             )
             stat["trigger_support"] += 1
-            stat["rank_sum"] += rank
-            stat["best_rank"] = min(stat["best_rank"], rank)
-            stat["reciprocal_rank_sum"] += 1.0 / rank
             stat["trigger_details"].append(
                 {
                     "trigger": trigger,
@@ -41,21 +67,8 @@ def aggregate_rankings(results: Sequence[Dict[str, Any]], top_k: int) -> List[Di
                     "reason": str(item.get("reason") or "")[:200],
                 }
             )
-    ranking = []
-    for stat in stats.values():
-        support = stat["trigger_support"]
-        stat["average_rank"] = round(stat.pop("rank_sum") / support, 4)
-        stat["reciprocal_rank_sum"] = round(stat["reciprocal_rank_sum"], 6)
-        ranking.append(stat)
-    ranking.sort(
-        key=lambda item: (
-            -item["trigger_support"],
-            item["average_rank"],
-            item["best_rank"],
-            -item["reciprocal_rank_sum"],
-            item["function"],
-        )
-    )
+    ranking = list(stats.values())
+    ranking.sort(key=lambda item: -item["trigger_support"])
     for index, item in enumerate(ranking[:top_k], 1):
         item["rank"] = index
     return ranking[:top_k]
@@ -81,10 +94,16 @@ def run(layout: RunLayout, projects: Sequence[str], bugs: set[str] | None,
     rows = []
     for key in sorted(set(grouped) | set(statuses)):
         project, bug = key
-        ranking = aggregate_rankings(grouped.get(key, []), top_k)
+        results = grouped.get(key, [])
+        use_source_ranges = bool(results) and all(
+            result.get("schema_version") == 4 for result in results
+        )
+        ranking = aggregate_rankings(
+            results, top_k, use_source_ranges=use_source_ranges
+        )
         output = {
             "schema": "fault-localization-aggregate",
-            "schema_version": 1,
+            "schema_version": 2 if use_source_ranges else 1,
             "project": project,
             "bug": bug,
             "top_k": top_k,

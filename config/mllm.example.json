@@ -1,9 +1,16 @@
 {
+  "uml": {
+    "max_visible_units_per_image": 24,
+    "max_participants_per_image": 8,
+    "plantuml_batch_size": 100
+  },
   "mllm": {
-    "base_url": "https://api.key77qiqi.com/v1",
+    "base_url": "https://api.openai.com/v1",
     "api_key_env": "OPENAI_API_KEY",
-    "vision_model": "gpt-5.5-2026-04-24",
+    "vision_model": "gpt-5.5",
+    "interaction_mode": "text_index",
     "reasoning_effort": "medium",
+    "invalid_final_json_retries": 2,
     "top_k": 5,
     "max_tokens": 4096,
     "retry": {

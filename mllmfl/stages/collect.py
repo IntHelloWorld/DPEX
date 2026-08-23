@@ -1,3 +1,5 @@
+import random
+import shutil
 from pathlib import Path
 from typing import Dict, List, Sequence
 
@@ -9,6 +11,38 @@ from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.process import run_command
 
 
+def select_failing_tests(tests: Sequence[str], maximum: int) -> List[str]:
+    if maximum <= 0:
+        raise ValueError("maximum failing tests must be positive")
+    if len(tests) <= maximum:
+        return list(tests)
+    selected_indices = sorted(random.sample(range(len(tests)), maximum))
+    return [tests[index] for index in selected_indices]
+
+
+def _prepare_trigger_directories(
+    layout: RunLayout,
+    project: str,
+    bug: str,
+    tests: Sequence[str],
+) -> None:
+    triggers = layout.artifacts / project / f"bug_{bug}" / "triggers"
+    expected = {f"trigger_{index}" for index in range(1, len(tests) + 1)}
+    if triggers.is_dir():
+        for path in triggers.glob("trigger_*"):
+            if (
+                path.is_dir()
+                and path.name.removeprefix("trigger_").isdigit()
+                and path.name not in expected
+            ):
+                shutil.rmtree(path)
+    for index, test in enumerate(tests, 1):
+        output = layout.trigger_dir(project, bug, index)
+        test_path = output / "trigger_test.txt"
+        if test_path.is_file() and test_path.read_text(encoding="utf-8").strip() != test:
+            shutil.rmtree(output)
+
+
 def run(
     layout: RunLayout,
     projects: Sequence[str],
@@ -17,7 +51,10 @@ def run(
     java_home: Path | None,
     timeout: int,
     force: bool = False,
+    max_failing_tests: int = 3,
 ) -> List[Dict[str, object]]:
+    if max_failing_tests <= 0:
+        raise ValueError("maximum failing tests must be positive")
     layout.ensure()
     env = defects4j_environment(d4j_home, java_home)
     ensure_defects4j(env)
@@ -54,7 +91,9 @@ def run(
                     }
                 )
                 continue
-            tests = trigger_tests(workspace, env)
+            available_tests = trigger_tests(workspace, env)
+            tests = select_failing_tests(available_tests, max_failing_tests)
+            _prepare_trigger_directories(layout, project, bug, tests)
             for index, test in enumerate(tests, 1):
                 output = layout.trigger_dir(project, bug, index)
                 trigger_log = layout.stage_log_dir("collect", project, bug, index)
@@ -85,8 +124,13 @@ def run(
                     "project": project,
                     "bug": bug,
                     "status": "OK",
+                    "available_trigger_count": len(available_tests),
                     "trigger_count": len(tests),
                 }
             )
-    write_csv(layout.logs / "collect.csv", rows, ["project", "bug", "status", "trigger_count"])
+    write_csv(
+        layout.logs / "collect.csv",
+        rows,
+        ["project", "bug", "status", "available_trigger_count", "trigger_count"],
+    )
     return rows

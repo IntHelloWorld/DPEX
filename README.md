@@ -33,9 +33,11 @@ Use a separate run root for each experiment. Runtime data is never read from sou
 Run one Chart bug through the local stages:
 
 ```bash
-python -m mllmfl collect --root runs/chart-1 --projects Chart --bugs 1
+python -m mllmfl collect --root runs/chart-1 --projects Chart --bugs 1 \
+  --max-failing-tests 3
 python -m mllmfl trace --root runs/chart-1 --projects Chart --bugs 1
-python -m mllmfl uml --root runs/chart-1 --projects Chart --bugs 1
+python -m mllmfl uml --root runs/chart-1 --projects Chart --bugs 1 \
+  --config config/mllm.example.json
 python -m mllmfl summarize --root runs/chart-1 --projects Chart --bugs 1
 python -m mllmfl localize --root runs/chart-1 --projects Chart --bugs 1 \
   --config config/mllm.example.json --dry-run
@@ -47,11 +49,20 @@ python -m mllmfl evaluate --root runs/chart-1 --projects Chart --bugs 1 \
 Every stage supports `--help`. Stages that operate on triggers accept `--trigger`; `--force` replaces
 an existing stage result. `localize` should always be exercised with `--dry-run` first. For a real
 request, copy the example configuration to an ignored `*.local.json`, set `api_key_env`, and export
-that environment variable. Inline API keys are rejected.
+that environment variable (`OPENAI_API_KEY` by default). Inline API keys are rejected.
 
-Localization uses the Responses API with `reasoning_effort: medium`. It does not send a
-`temperature` parameter, so reasoning effort is the only model-generation control configured by
-this pipeline.
+Collection processes at most three failing tests per bug by default. If Defects4J exports more than
+that limit, `collect` randomly samples the configured number while preserving their original export
+order. Change the limit with `--max-failing-tests`; each selected test still receives an isolated
+trigger directory and downstream localization run.
+
+Localization uses OpenAI's Responses API with `gpt-5.5`. Requests use
+`reasoning: {"effort": "medium"}`, set
+`parallel_tool_calls: false`, and do not send `temperature`, `top_p`, or penalty parameters.
+Responses use `store: false`; each continuation replays the complete ordered local history,
+including encrypted reasoning output, function calls, tool results, and viewed images. A stable
+`prompt_cache_key` is reused during one localization task and rotates after compatible upstream
+route failures.
 
 PNG rendering defaults to a 32768-pixel PlantUML limit. If a fragment reaches that boundary, `uml`
 fails explicitly instead of keeping a truncated image; raise `--plantuml-limit-size`.
@@ -68,11 +79,11 @@ Stages communicate only through versioned JSON:
 | `execution_sliced.json` | `fullchain-execution` v3 | trace | uml |
 | `test_slice.json` | `test-boundary-slice` v2 | trace | slice audit |
 | `defect_context.json` | `defect-context` v1 | trace | localize defect context |
-| `uml.json` | `execution-uml-index` v2 | uml | localize navigation and audit |
+| `uml.json` | `execution-uml-graph` v1/v2 | uml | localize navigation and audit |
 | `candidates.json` | `fault-candidates` v1 | summarize | localize |
-| `localization.json` | `fault-localization` v3 | localize | aggregate |
-| `summaries/...json` | `fault-localization-aggregate` v1 | aggregate | evaluation |
-| `summaries/evaluation.json` | `fault-localization-evaluation` v1 | evaluate | reporting |
+| `localization.json` | `fault-localization` v4 | localize | aggregate |
+| `summaries/...json` | `fault-localization-aggregate` v1/v2 | aggregate | evaluation |
+| `summaries/evaluation.json` | `fault-localization-evaluation` v2 | evaluate | reporting |
 
 Full traces retain invocation IDs, parent chains, descriptors, threads, timing, and return/throw
 state and the originating test-source line. `execution.json` retains every recorded application call
@@ -85,30 +96,93 @@ their complete invocation subtrees are also excluded so the trace never invents 
 methods reached only through class initialization.
 
 UML prefers `execution_sliced.json` and falls back to `execution.json` when no slice artifact exists.
-It treats the failing test invocation as level 0 and emits one image under `sequence_diagrams/` for
-each direct runtime child invocation. Repeated calls to the same method remain separate index entries.
-Each image contains only that invocation and its descendants. Within a fragment, adjacent completely
-identical sibling subtrees are still merged from the highest level downward; the first subtree is
-drawn once and its root message is marked `×N`. The complete calls remain unchanged in trace artifacts.
+It builds one uniformly navigable graph of sequence subgraphs. The entry subgraph is centered on the
+failing test invocation. If that invocation is absent, a layout-only execution root treats every real
+top-level invocation as a direct child without adding a candidate method or changing the trace. Each
+subgraph is breadth-first loaded up to 24 visible units and 8 participants by default. A visible unit
+is either a call or a consecutive sibling bundle; the focal invocation is context and does not consume
+a unit. `CALL_INTERNAL` folds use directional `TO`/`FROM` links. Oversized sibling lists are split
+into symmetric `SIBLING_PEER` views: every view repeats the same focal call arrow, exposes every other
+peer ID, and uses prefix/suffix notes bound to self-messages on the focal activation bar to map hidden
+ranges to `VIEW <diagram-id>`. Consecutive repeated sequences of recursively identical complete
+sibling subtrees are compressed bottom-up: a one-call pattern is marked `×N`, while a multi-call
+pattern is rendered once inside a `loop repeated sequence ×N` block. The original occurrence IDs
+remain recorded in `execution_compressed.json`, and the complete calls remain unchanged in the trace
+artifacts. Configure
+the limits with `max_visible_units_per_image`, `max_participants_per_image`,
+`--max-visible-units`, and `--max-participants` (`--max-calls` remains a CLI alias).
+The graph index records these synthetic-root boundary arrows separately as
+`layout_root_call_count`; `trace_call_count` remains the unchanged call count from the execution
+artifact.
 
-Localization initially sends no image. Its prompt contains the failing-test identifier, complete
-line-numbered sliced test code, error stack, test output (including an explicitly empty section),
-and the ordered fragment index; it omits the project, bug ID, and candidate-function list. Missing
-sliced source or an unavailable error stack prevents localization from starting. A tool-capable
-vision model can call
-`view_sequence_diagram` as many times as needed, one image per tool round; the localizer validates the requested ID, appends the
-corresponding image and that fragment's ordered unique method signatures to the same Chat Completions
-conversation, and records viewed diagram IDs and tool
-rounds in `localization.json`. Candidate functions remain local and are used only to validate the
-model's final ranking. Aggregate accepts historical localization v1/v2 and current v3 results.
-The model's final JSON uses `signature` and `reason`; every signature must exactly match a method
-signature returned by a successfully viewed diagram. The persisted v3 ranking also records the
-corresponding signature alongside the legacy function identifier used by aggregation.
+The `mllm.interaction_mode` configuration selects the UML/localization protocol. Its default,
+`text_index`, preserves graph v1: call arrows use `Mxxx`, viewed images are accompanied by visible
+method signatures and navigation metadata, and the model returns signatures. Set it to
+`image_only` to generate graph v2: call occurrences use `Cxxx`, every distinct runtime method has
+one deterministic `Mxxx` identifier reused across all calls, and the private `method_catalog` in
+`uml.json` maps IDs back to exact functions, signatures, and descriptors. Use the same configuration
+file for `uml` and `localize`; changing modes requires rerunning both stages with `--force`. In this
+mode the agent returns both the method ID and the short signature shown in the image, for example
+`M001` and `add(TickUnit)`. Local resolution prefers an exact ID-and-signature pair, then the ID,
+then a unique short-signature match; entries that cannot be resolved are discarded.
 
-Real localization runs also write `conversation.jsonl` beside `localization.json`. It records every
-system, user, assistant, and tool message in order, including the raw final assistant message. Image
-messages are represented only as `{\"type\": \"image_ref\", \"diagram_id\": ...}`; Base64 image
-data is never written to the conversation log. The file is a runtime artifact and remains git-ignored.
+Compare the selected execution's call counts before compression and after compression for one bug:
+
+```bash
+.venv/bin/python scripts/count_uml_compression.py \
+  --root runs/chart-all --project Chart --bug 4
+```
+
+Use `--trigger 1` to inspect one failing test, or `--json` for machine-readable output. The script
+reads `execution_compressed.json`; it does not count repeated focus boundaries or navigation notes
+introduced later by diagram pagination.
+
+Localization sends the entry subgraph image with the initial request. Its prompt contains the
+failing-test identifier, complete line-numbered sliced test code, error stack, and test output
+(including an explicitly empty section); it omits the project, bug ID, candidate-function list, and
+filesystem image paths. Missing sliced source or an unavailable error stack prevents localization
+from starting. A tool-capable vision model can navigate only directly linked IDs through
+`view_sequence_diagram`. The prompt permits at most one diagram request in each assistant response.
+If the provider still returns multiple tool calls, the localizer retains and executes only the
+first; the remaining calls are discarded without generating tool errors. In `text_index` mode, each
+successful result includes the current image, visible method signatures, fold metadata, and direct
+links; final JSON uses `signature` and `reason`. In `image_only` mode, tool output contains only a minimal
+acknowledgement plus the image: the model reads `D-xxx` navigation and `Mxxx` method IDs directly
+from the diagram and returns `method_id`, the image-visible short `method_signature`, and `reason`.
+Resolution is limited to methods in successfully viewed diagrams that map to local candidates; it
+prefers matching both fields, then the ID alone, then a unique short signature alone. Unresolved
+entries are discarded. In both modes the persisted v4 ranking
+contains between one and the configured `top_k` maximum number of evidence-supported methods; the
+model is not required to pad the result to that maximum. After validating the model output, the
+localizer resolves each method against the buggy Java AST and stores its workspace-relative source
+file plus declaration start/end lines. Methods without one unambiguous buggy-source range are
+discarded. Source-range identity keeps overloads in the same class separate during aggregation.
+The
+localizer records viewed diagram IDs and tool rounds in `localization.json`. Candidate functions
+remain local and are used only to validate the model's final ranking. Aggregate accepts historical
+localization v1-v3 results in legacy function mode and current v4 results in source-range mode.
+Evaluation maps Defects4J patch lines to ranges in the same buggy Java AST; it compares source file
+and start/end lines rather than transient UML method IDs. Bug-level
+aggregation counts in how many trigger rankings each method appears, sorts only by that frequency,
+and preserves first-appearance order when frequencies tie.
+Before each diagram-tool call, the system prompt asks the model for a JSON progress object describing
+its current evidence and why the selected linked subgraph is useful. Tool-navigation requests keep
+JSON Output disabled so the provider can return structured tool calls. A response without a diagram
+tool call is treated as the final answer and must itself be exactly one JSON object; Markdown fences
+and surrounding prose are rejected. If that response is invalid or violates the ranking output
+contract, localization preserves the complete conversation and asks the model to correct it while
+keeping the same tool-capable request contract. It makes up to `mllm.invalid_final_json_retries`
+additional attempts (default `2`) before reporting the validation failure. The initial user message
+contains the run-specific defect context and configured maximum ranking size.
+
+Real localization runs also write `conversation.jsonl` beside `localization.json`. It records the
+system instruction plus every accepted Responses turn in order, including assistant reasoning
+summaries, tool calls, and tool results. When a provider response contains multiple tool
+calls, only its retained first call is persisted. Image messages are represented only as
+`{\"type\": \"image_ref\", \"diagram_id\": ...}`; Base64 image data is never written to the
+conversation log; each referenced local PNG is loaded only when an HTTP request is built.
+`response_usage.jsonl` records each completion ID and its provider usage object. Both files are
+runtime artifacts and remain git-ignored.
 
 Candidates are derived exclusively from the normalized execution. Method-summary generation is
 temporarily disabled: the `summarize` stage still writes the required `candidates.json`, but each

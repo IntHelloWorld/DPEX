@@ -1,119 +1,29 @@
-from pathlib import Path, PurePosixPath
+import re
+from pathlib import PurePosixPath
 from typing import Any, Dict
 
 
-def _artifact_path(value: Any, field: str, base_dir: Path | None) -> str:
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"invalid UML segment {field}")
-    relative = PurePosixPath(value)
-    if relative.is_absolute() or ".." in relative.parts or "\\" in value:
-        raise ValueError(f"unsafe UML segment {field}: {value}")
-    if base_dir is not None:
-        target = (base_dir / Path(*relative.parts)).resolve()
-        root = base_dir.resolve()
-        if not target.is_relative_to(root):
-            raise ValueError(f"UML segment {field} escapes trigger directory: {value}")
-        if not target.is_file():
-            raise ValueError(f"UML segment {field} not found: {value}")
-    return value
-
-
-def validate_uml_index(value: Any, base_dir: Path | None = None) -> Dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError("UML index must be a JSON object")
-    if value.get("schema") != "execution-uml-index" or value.get("schema_version") != 2:
-        raise ValueError("unsupported UML index schema")
-    if value.get("source_schema") != "fullchain-execution":
-        raise ValueError("invalid UML index source schema")
-    if value.get("strategy") != "test-root-direct-invocation-subtrees":
-        raise ValueError("invalid UML index strategy")
-    if not isinstance(value.get("slice_applied"), bool):
-        raise ValueError("invalid UML index slice_applied")
-    test = value.get("test")
-    if not isinstance(test, dict) or not all(
-        isinstance(test.get(field), str) and test[field].strip()
-        for field in ("class", "method")
+def _method_location_key(
+    item: Dict[str, Any], index: int, context: str
+) -> tuple[str, int, int]:
+    source_file = item.get("source_file")
+    start_line = item.get("start_line")
+    end_line = item.get("end_line")
+    if not isinstance(source_file, str) or not source_file.strip():
+        raise ValueError(f"invalid {context} source_file at index {index}")
+    relative = PurePosixPath(source_file)
+    if relative.is_absolute() or ".." in relative.parts or "\\" in source_file:
+        raise ValueError(f"unsafe {context} source_file at index {index}")
+    if (
+        not isinstance(start_line, int)
+        or isinstance(start_line, bool)
+        or not isinstance(end_line, int)
+        or isinstance(end_line, bool)
+        or start_line <= 0
+        or end_line < start_line
     ):
-        raise ValueError("invalid UML index test")
-    if not isinstance(value.get("root_invocation_id"), int) or value["root_invocation_id"] <= 0:
-        raise ValueError("invalid UML index root invocation")
-    segments = value.get("segments")
-    if not isinstance(segments, list) or not segments:
-        raise ValueError("UML index segments must be a non-empty array")
-    seen_ids, seen_invocations = set(), set()
-    total_calls = 0
-    previous_order: tuple[int, int] | None = None
-    for index, segment in enumerate(segments, 1):
-        if not isinstance(segment, dict):
-            raise ValueError(f"invalid UML segment at index {index - 1}")
-        if segment.get("ordinal") != index:
-            raise ValueError(f"non-contiguous UML segment ordinal at index {index - 1}")
-        diagram_id = segment.get("diagram_id")
-        if not isinstance(diagram_id, str) or not diagram_id.strip():
-            raise ValueError(f"invalid UML segment diagram_id at index {index - 1}")
-        if diagram_id in seen_ids:
-            raise ValueError(f"duplicate UML segment diagram_id: {diagram_id}")
-        seen_ids.add(diagram_id)
-        invocation_id = segment.get("invocation_id")
-        if not isinstance(invocation_id, int) or invocation_id <= 0:
-            raise ValueError(f"invalid UML segment invocation_id at index {index - 1}")
-        if invocation_id in seen_invocations:
-            raise ValueError(f"duplicate UML segment invocation_id: {invocation_id}")
-        seen_invocations.add(invocation_id)
-        enter_seq = segment.get("enter_seq")
-        if not isinstance(enter_seq, int) or enter_seq < 0:
-            raise ValueError(f"invalid UML segment enter_seq at index {index - 1}")
-        order = (enter_seq, invocation_id)
-        if previous_order is not None and order < previous_order:
-            raise ValueError(f"out-of-order UML segment at index {index - 1}")
-        previous_order = order
-        if not isinstance(segment.get("function"), str) or not segment["function"].strip():
-            raise ValueError(f"invalid UML segment function at index {index - 1}")
-        if not isinstance(segment.get("descriptor"), str) or not isinstance(
-            segment.get("signature"), str
-        ):
-            raise ValueError(f"invalid UML segment signature at index {index - 1}")
-        method_signatures = segment.get("method_signatures")
-        if (
-            not isinstance(method_signatures, list)
-            or not method_signatures
-            or not all(isinstance(item, str) and item.strip() for item in method_signatures)
-            or len(method_signatures) != len(set(method_signatures))
-        ):
-            raise ValueError(f"invalid UML segment method_signatures at index {index - 1}")
-        call_count = segment.get("call_count")
-        displayed = segment.get("displayed_call_count")
-        if (
-            not isinstance(call_count, int)
-            or not isinstance(displayed, int)
-            or call_count <= 0
-            or displayed <= 0
-            or displayed > call_count
-        ):
-            raise ValueError(f"invalid UML segment call counts at index {index - 1}")
-        total_calls += call_count
-        origin_line = segment.get("origin_test_line")
-        exit_seq = segment.get("exit_seq")
-        if not isinstance(origin_line, int) or origin_line < 0:
-            raise ValueError(f"invalid UML segment origin_test_line at index {index - 1}")
-        if not isinstance(exit_seq, int) or exit_seq < enter_seq:
-            raise ValueError(f"invalid UML segment exit_seq at index {index - 1}")
-        if segment.get("exit_type") not in {"RETURN", "THROW"}:
-            raise ValueError(f"invalid UML segment exit_type at index {index - 1}")
-        puml = _artifact_path(segment.get("puml"), "puml", base_dir)
-        image = _artifact_path(segment.get("image"), "image", base_dir)
-        if not puml.endswith(".puml") or not image.endswith(".png"):
-            raise ValueError(f"invalid UML segment file extension at index {index - 1}")
-    partitioned = value.get("partitioned_call_count")
-    source = value.get("source_call_count")
-    excluded = value.get("excluded_call_count")
-    if not all(isinstance(item, int) and item >= 0 for item in (partitioned, source, excluded)):
-        raise ValueError("invalid UML index call counts")
-    if partitioned != total_calls or source != partitioned + excluded:
-        raise ValueError("inconsistent UML index call counts")
-    if value.get("segment_count") != len(segments):
-        raise ValueError("inconsistent UML index segment count")
-    return value
+        raise ValueError(f"invalid {context} line range at index {index}")
+    return source_file, start_line, end_line
 
 
 def validate_candidates(value: Any) -> Dict[str, Any]:
@@ -162,9 +72,9 @@ def validate_defect_context(value: Any) -> Dict[str, Any]:
 def validate_localization(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("localization artifact must be a JSON object")
-    if value.get("schema") != "fault-localization" or value.get("schema_version") not in {1, 2, 3}:
+    if value.get("schema") != "fault-localization" or value.get("schema_version") not in {1, 2, 3, 4}:
         raise ValueError("unsupported localization schema")
-    if value.get("schema_version") in {2, 3}:
+    if value.get("schema_version") in {2, 3, 4}:
         viewed = value.get("viewed_diagrams")
         counts = (
             value.get("diagram_count"),
@@ -186,28 +96,62 @@ def validate_localization(value: Any) -> Dict[str, Any]:
         raise ValueError("ranking must be an array")
     seen = set()
     seen_signatures = set()
+    seen_locations = set()
     for index, item in enumerate(ranking):
         if not isinstance(item, dict) or not str(item.get("function") or "").strip():
             raise ValueError(f"invalid ranking at index {index}")
         function = str(item["function"])
-        if value.get("schema_version") != 3 and function in seen:
+        if value.get("schema_version") not in {3, 4} and function in seen:
             raise ValueError(f"duplicate ranking function: {function}")
         seen.add(function)
-        if value.get("schema_version") == 3:
+        if value.get("schema_version") in {3, 4}:
             signature = item.get("signature")
             if not isinstance(signature, str) or not signature.strip():
                 raise ValueError(f"invalid ranking signature at index {index}")
-            if signature in seen_signatures:
+            if value.get("schema_version") == 3 and signature in seen_signatures:
                 raise ValueError(f"duplicate ranking signature: {signature}")
             if signature.rsplit("(", 1)[0] != function:
                 raise ValueError(f"ranking signature does not match function at index {index}")
             seen_signatures.add(signature)
+        if value.get("schema_version") == 4:
+            location_key = _method_location_key(item, index, "ranking")
+            if location_key in seen_locations:
+                raise ValueError(f"duplicate ranking source location: {location_key}")
+            seen_locations.add(location_key)
         try:
             rank = int(item.get("rank") or 0)
         except (TypeError, ValueError, OverflowError) as error:
             raise ValueError(f"invalid ranking rank at index {index}") from error
         if rank != index + 1:
             raise ValueError(f"non-contiguous rank at index {index}")
+    interaction_mode = value.get("interaction_mode")
+    if interaction_mode not in {None, "text_index", "image_only"}:
+        raise ValueError("invalid localization interaction_mode")
+    if interaction_mode == "image_only":
+        returned_ids = value.get("returned_method_ids")
+        dropped_ids = value.get("dropped_invalid_method_ids")
+        if (
+            not isinstance(returned_ids, list)
+            or len(returned_ids) != len(ranking)
+            or len(returned_ids) != len(set(returned_ids))
+            or not all(
+                isinstance(item, str) and re.fullmatch(r"M\d{3,}", item)
+                for item in returned_ids
+            )
+            or not isinstance(dropped_ids, list)
+            or not all(isinstance(item, str) for item in dropped_ids)
+        ):
+            raise ValueError("invalid localization method ID audit")
+    elif "returned_method_ids" in value or "dropped_invalid_method_ids" in value:
+        raise ValueError("method ID audit requires image_only interaction mode")
+    source_dropped = value.get("dropped_unresolved_source_methods")
+    if value.get("schema_version") == 4:
+        if not isinstance(source_dropped, list) or not all(
+            isinstance(item, str) and item.strip() for item in source_dropped
+        ):
+            raise ValueError("invalid unresolved source method audit")
+    elif source_dropped is not None:
+        raise ValueError("unresolved source method audit requires localization v4")
     return value
 
 
@@ -216,7 +160,7 @@ def validate_aggregate(value: Any) -> Dict[str, Any]:
         raise ValueError("aggregate artifact must be a JSON object")
     if value.get("schema") != "fault-localization-aggregate" or value.get(
         "schema_version"
-    ) != 1:
+    ) not in {1, 2}:
         raise ValueError("unsupported aggregate schema")
     if not all(
         isinstance(value.get(field), str) and value[field].strip()
@@ -250,9 +194,19 @@ def validate_aggregate(value: Any) -> Dict[str, Any]:
         function = item.get("function")
         if not isinstance(function, str) or not function.strip():
             raise ValueError(f"invalid aggregate function at index {index - 1}")
-        if function in seen:
-            raise ValueError(f"duplicate aggregate function: {function}")
-        seen.add(function)
+        identity = function
+        if value.get("schema_version") == 2:
+            signature = item.get("signature")
+            if (
+                not isinstance(signature, str)
+                or not signature.strip()
+                or signature.rsplit("(", 1)[0] != function
+            ):
+                raise ValueError(f"invalid aggregate signature at index {index - 1}")
+            identity = _method_location_key(item, index - 1, "aggregate")
+        if identity in seen:
+            raise ValueError(f"duplicate aggregate method: {identity}")
+        seen.add(identity)
         if item.get("rank") != index:
             raise ValueError(f"non-contiguous aggregate rank at index {index - 1}")
     return value
@@ -263,7 +217,7 @@ def validate_evaluation(value: Any) -> Dict[str, Any]:
         raise ValueError("evaluation artifact must be a JSON object")
     if value.get("schema") != "fault-localization-evaluation" or value.get(
         "schema_version"
-    ) != 1:
+    ) not in {1, 2}:
         raise ValueError("unsupported evaluation schema")
     evaluated = value.get("evaluated_bug_count")
     skipped = value.get("skipped_bug_count")
@@ -304,8 +258,59 @@ def validate_evaluation(value: Any) -> Dict[str, Any]:
         if any(
             not isinstance(function, str) or not function.strip()
             for function in truth + ranking
-        ) or len(truth) != len(set(truth)) or len(ranking) != len(set(ranking)):
+        ) or len(truth) != len(set(truth)) or (
+            value.get("schema_version") == 1
+            and len(ranking) != len(set(ranking))
+        ):
             raise ValueError(f"invalid evaluation functions at index {index}")
+        if value.get("schema_version") == 2:
+            identity_mode = item.get("identity_mode")
+            truth_locations = item.get("ground_truth_locations")
+            ranking_locations = item.get("ranking_locations")
+            if identity_mode not in {"none", "function", "source_range"} or not all(
+                isinstance(locations, list)
+                for locations in (truth_locations, ranking_locations)
+            ):
+                raise ValueError(f"invalid evaluation identity mode at index {index}")
+            truth_keys = []
+            ranking_keys = []
+            for location_index, location in enumerate(truth_locations):
+                if (
+                    not isinstance(location, dict)
+                    or not str(location.get("function") or "").strip()
+                    or location.get("function") not in truth
+                ):
+                    raise ValueError(
+                        f"invalid ground-truth location at index {index}"
+                    )
+                truth_keys.append(_method_location_key(
+                    location, location_index, "ground-truth"
+                ))
+            for location_index, location in enumerate(ranking_locations):
+                if (
+                    not isinstance(location, dict)
+                    or location_index >= len(ranking)
+                    or location.get("function") != ranking[location_index]
+                ):
+                    raise ValueError(f"invalid ranking location at index {index}")
+                ranking_keys.append(_method_location_key(
+                    location, location_index, "evaluation ranking"
+                ))
+            if len(truth_keys) != len(set(truth_keys)) or len(ranking_keys) != len(
+                set(ranking_keys)
+            ):
+                raise ValueError(f"duplicate evaluation source location at index {index}")
+            if identity_mode == "source_range" and (
+                not truth_locations
+                or len(ranking_locations) != len(ranking)
+            ):
+                raise ValueError(f"incomplete evaluation source locations at index {index}")
+            if identity_mode == "function" and len(ranking) != len(set(ranking)):
+                raise ValueError(f"duplicate evaluation function at index {index}")
+            if identity_mode != "source_range" and (
+                truth_locations or ranking_locations
+            ):
+                raise ValueError(f"unexpected evaluation source locations at index {index}")
         if (
             any(not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0 for rank in ranks)
             or ranks != sorted(set(ranks))
