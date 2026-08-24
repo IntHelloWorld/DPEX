@@ -100,28 +100,3 @@ def extract_methods(java_text: str, class_name: str, method: str) -> List[Dict[s
             "end_line": end_line,
         })
     return results
-
-
-def called_methods(code: str, limit: int = 8) -> List[str]:
-    clean = re.sub(r"/\*.*?\*/|//[^\n]*", " ", code, flags=re.S)
-    excluded = {
-        "if",
-        "for",
-        "while",
-        "switch",
-        "catch",
-        "return",
-        "throw",
-        "new",
-        "super",
-        "this",
-        "assert",
-    }
-    result = []
-    for match in re.finditer(r"(?:\.|\b)([A-Za-z_$][\w$]*)\s*\(", clean):
-        name = match.group(1)
-        if name not in excluded and name not in result:
-            result.append(name)
-        if len(result) >= limit:
-            break
-    return result

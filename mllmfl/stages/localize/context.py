@@ -28,12 +28,13 @@ def invalid_final_json_retries(config: Dict[str, Any]) -> int:
 SYSTEM_PROMPT = """You are a software defect-localization agent.
 
 ## Localization Approach
-The initial user message lists every failing test and its entry sequence-diagram ID. Use
-view_sequence_diagram(diagram_id) to open whichever failing-test entry is useful. An entry image is
-returned together with that test's line-numbered code, error stack, and test output. Follow linked
-Txxx-Dxxx IDs to inspect child subgraphs until you have enough evidence, then return one bug-level
-localization result. You may explore the failing tests selectively, but base every ranked method on
-a successfully viewed image.
+The initial user message lists every failing test and its entry sequence-diagram ID. Total Calls is
+the number of runtime calls captured for that failing test, and Diagram Count is the number of
+diagram nodes that can be viewed on demand. Use view_sequence_diagram(diagram_id) to open
+whichever failing-test entry is useful. An entry image is returned together with that test's
+line-numbered code, error stack, and test output. Follow linked Txxx-Dxxx IDs to inspect child
+subgraphs until you have enough evidence, then return one bug-level localization result. You may
+explore the failing tests selectively, but base every ranked method on a successfully viewed image.
 
 Distinguish the caller that triggers or observes the failure from a callee whose implementation
 contains the defect. A caller's proximity to the exception is evidence about the trigger path, not
@@ -186,10 +187,15 @@ def defect_output_context(
 def build_prompt(tests: Sequence[Dict[str, Any]]) -> str:
     if not tests:
         raise ValueError("failing tests must be non-empty")
-    lines = ["[Failing Tests]"]
+    lines = [
+        "[Failing Tests]",
+        "| Test ID | Failing Test | Entry Diagram | Total Calls | Diagram Count |",
+        "| --- | --- | --- | ---: | ---: |",
+    ]
     for item in tests:
         lines.append(
-            f"{item['test_id']} | {item['test']} | Entry: {item['entry_diagram_id']}"
+            f"| {item['test_id']} | {item['test']} | {item['entry_diagram_id']} | "
+            f"{item['call_count']} | {item['diagram_count']} |"
         )
     return "\n".join(lines)
 

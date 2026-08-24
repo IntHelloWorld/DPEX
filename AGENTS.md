@@ -2,9 +2,9 @@
 
 ## 项目结构
 
-- `mllmfl/domain/` 定义版本化 trace、candidate 和 ranking 模型及纯逻辑。
+- `mllmfl/domain/` 定义版本化 trace 和 ranking 模型及纯逻辑。
 - `mllmfl/infrastructure/` 封装 Defects4J、外部命令、文件、Java 源码和 PlantUML。
-- `mllmfl/stages/` 实现 collect、trace、uml、summarize、localize、aggregate。
+- `mllmfl/stages/` 实现 collect、trace、uml、localize、aggregate。
 - `fullchain_tracer/` 是独立 Maven 字节码 agent；工具 JAR 位于 `lib/`。
 - 所有运行产物必须写入 `--root` 的 `workspace/`、`artifacts/`、`logs/`、`summaries/`。
 

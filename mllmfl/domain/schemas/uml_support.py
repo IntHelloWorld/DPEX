@@ -2,7 +2,13 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 
-def artifact_path(value: Any, field: str, base_dir: Path | None) -> str:
+def artifact_path(
+    value: Any,
+    field: str,
+    base_dir: Path | None,
+    *,
+    must_exist: bool = True,
+) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"invalid UML segment {field}")
     relative = PurePosixPath(value)
@@ -13,6 +19,6 @@ def artifact_path(value: Any, field: str, base_dir: Path | None) -> str:
         root = base_dir.resolve()
         if not target.is_relative_to(root):
             raise ValueError(f"UML segment {field} escapes trigger directory: {value}")
-        if not target.is_file():
+        if must_exist and not target.is_file():
             raise ValueError(f"UML segment {field} not found: {value}")
     return value

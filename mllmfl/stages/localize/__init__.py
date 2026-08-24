@@ -9,6 +9,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
 from mllmfl.infrastructure.io import append_jsonl, write_text
+from mllmfl.infrastructure.plantuml import (
+    ensure_rendered,
+    runtime_settings,
+)
 
 from .client import _image_part, _post_response, _response_message
 from .context import (
@@ -118,6 +122,31 @@ def run_agent(
 
     prompt_cache_key = new_prompt_cache_key()
 
+    def diagram_image_path(node: Dict[str, Any]) -> Path:
+        image_path = directory / Path(*Path(str(node["image"])).parts)
+        rendering = node.get("_rendering") or uml_bundle.get("rendering") or {
+            "mode": "eager",
+        }
+        if not isinstance(rendering, dict):
+            raise ValueError("invalid runtime diagram rendering metadata")
+        mode = str(rendering.get("mode") or "")
+        if mode == "eager":
+            return image_path
+        if mode != "on_demand":
+            raise ValueError(f"unsupported runtime diagram rendering mode: {mode}")
+        puml_path = directory / Path(*Path(str(node["puml"])).parts)
+        command, jar = runtime_settings(config, rendering)
+        limit_size = int(rendering.get("limit_size") or 0)
+        ensure_rendered(
+            puml_path,
+            image_path,
+            command,
+            jar,
+            timeout,
+            limit_size,
+        )
+        return image_path
+
     def final_response_error(content: str) -> str:
         if suite_mode and not any(entry_id in viewed_set for entry_id in entry_ids):
             return "at least one failing-test entry diagram must be viewed"
@@ -143,8 +172,7 @@ def run_agent(
                 node = nodes.get(diagram_id)
                 if node is None:
                     raise ValueError(f"request input references unknown diagram: {diagram_id}")
-                image_path = directory / Path(*Path(str(node["image"])).parts)
-                content[index] = _image_part(image_path)
+                content[index] = _image_part(diagram_image_path(node))
         return hydrated
 
     while True:
@@ -241,21 +269,40 @@ def run_agent(
                     ),
                 }
             else:
-                context = entry_contexts.get(diagram_id)
-                result = (
-                    entry_failure_context(context)
-                    if context is not None
-                    else {"ok": True, "diagram_id": diagram_id}
-                )
-                diagram_view_count += 1
-                if diagram_id not in viewed_set:
-                    viewed_set.add(diagram_id)
-                    viewed.append(diagram_id)
-                discovered.update(
-                    str(link["diagram_id"])
-                    for link in node.get("links") or []
-                )
-                image_content.append({"type": "image_ref", "diagram_id": diagram_id})
+                try:
+                    diagram_image_path(node)
+                except (OSError, RuntimeError, ValueError) as error:
+                    result = {
+                        "ok": False,
+                        "error": f"diagram rendering failed: {diagram_id}",
+                    }
+                    append_jsonl(
+                        directory / "render_errors.jsonl",
+                        {
+                            "schema": "on-demand-render-error",
+                            "schema_version": 1,
+                            "diagram_id": diagram_id,
+                            "error": str(error),
+                        },
+                    )
+                else:
+                    context = entry_contexts.get(diagram_id)
+                    result = (
+                        entry_failure_context(context)
+                        if context is not None
+                        else {"ok": True, "diagram_id": diagram_id}
+                    )
+                    diagram_view_count += 1
+                    if diagram_id not in viewed_set:
+                        viewed_set.add(diagram_id)
+                        viewed.append(diagram_id)
+                    discovered.update(
+                        str(link["diagram_id"])
+                        for link in node.get("links") or []
+                    )
+                    image_content.append({
+                        "type": "image_ref", "diagram_id": diagram_id,
+                    })
 
             tool_item = {
                 "role": "tool",

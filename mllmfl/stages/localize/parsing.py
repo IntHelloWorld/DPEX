@@ -59,29 +59,32 @@ def _catalog_method_signature(item: Dict[str, str]) -> str:
     return function.rsplit(".", 1)[-1] + signature[len(function):]
 
 
+def _normalized_method_signature(signature: str) -> str:
+    """Normalize insignificant spacing after parameter-separating commas."""
+    return re.sub(r",\s*", ", ", signature.strip())
+
+
 def gate_method_id_ranking(
     raw: Any,
-    candidates: Sequence[str],
     method_catalog: Sequence[Dict[str, str]],
     viewed_method_ids: Sequence[str],
     top_k: int,
 ) -> Tuple[List[Ranking], List[str]]:
-    """Resolve image-visible methods by exact ID+signature or unique signature."""
+    """Resolve visible methods by normalized ID+signature or unique signature."""
     if top_k <= 0:
         raise ValueError("top_k must be positive")
-    candidate_set = set(candidates)
     viewed_set = set(viewed_method_ids)
     id_lookup = {
         str(item.get("method_id") or ""): item
         for item in method_catalog
         if str(item.get("method_id") or "") in viewed_set
-        and str(item.get("function") or "") in candidate_set
     }
     signature_lookup: Dict[str, List[Dict[str, str]]] = {}
     for catalog_item in id_lookup.values():
         method_signature = _catalog_method_signature(catalog_item)
         if method_signature:
-            signature_lookup.setdefault(method_signature, []).append(catalog_item)
+            normalized_signature = _normalized_method_signature(method_signature)
+            signature_lookup.setdefault(normalized_signature, []).append(catalog_item)
     result, dropped, seen = [], [], set()
     if not isinstance(raw, list):
         return result, dropped
@@ -90,12 +93,14 @@ def gate_method_id_ranking(
             continue
         method_id = str(item.get("method_id") or "").strip()
         method_signature = str(item.get("method_signature") or "").strip()
+        normalized_signature = _normalized_method_signature(method_signature)
         id_match = id_lookup.get(method_id)
-        signature_matches = signature_lookup.get(method_signature, [])
+        signature_matches = signature_lookup.get(normalized_signature, [])
         catalog_item = None
         if (
             id_match is not None
-            and _catalog_method_signature(id_match) == method_signature
+            and _normalized_method_signature(_catalog_method_signature(id_match))
+            == normalized_signature
         ):
             catalog_item = id_match
         elif len(signature_matches) == 1:

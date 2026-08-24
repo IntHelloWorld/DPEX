@@ -105,7 +105,7 @@ def run(
             try:
                 existing_index = validate_uml_index(read_json(index_path), directory)
                 if (
-                    existing_index.get("schema_version") != 3
+                    existing_index.get("schema_version") not in {3, 4}
                     or existing_index.get("test_id") != test_id
                     or existing_index.get("method_catalog_fingerprint")
                     != catalog_fingerprint
@@ -307,7 +307,7 @@ def run(
             )
             index = {
                 "schema": "execution-uml-graph",
-                "schema_version": 3,
+                "schema_version": 4,
                 "test_id": test_id,
                 "method_catalog_fingerprint": catalog_fingerprint,
                 "source_schema": execution["schema"],
@@ -332,6 +332,13 @@ def run(
                 "max_visible_units": max_visible_units,
                 "max_participants_per_image": max_participants,
                 "plantuml_batch_size": batch_size,
+                "rendering": {
+                    "mode": "on_demand",
+                    "format": "png",
+                    "limit_size": limit_size,
+                    "plantuml_command": plantuml_command,
+                    "plantuml_jar": str(plantuml_jar) if plantuml_jar else None,
+                },
                 "entry_diagram_id": entry_diagram_id,
                 "entry_reason": entry_reason,
                 "node_count": len(nodes),
@@ -360,7 +367,7 @@ def run(
                 graph = validate_uml_index(read_json(directory / "uml.json"), directory)
                 test_id = _test_id(number)
                 if (
-                    graph.get("schema_version") != 3
+                    graph.get("schema_version") not in {3, 4}
                     or graph.get("test_id") != test_id
                     or graph.get("method_catalog_fingerprint") != catalog_fingerprint
                 ):

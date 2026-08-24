@@ -134,7 +134,21 @@ class UMLTests(unittest.TestCase):
             [item["entry_diagram_id"] for item in suite["tests"]],
             ["T001-D001", "T002-D001"],
         )
-        self.assertTrue(all(graph["schema_version"] == 3 for graph in graphs))
+        self.assertTrue(all(graph["schema_version"] == 4 for graph in graphs))
+        self.assertTrue(all(
+            graph["rendering"] == {
+                "mode": "on_demand", "format": "png", "limit_size": 32768,
+                "plantuml_command": "plantuml", "plantuml_jar": None,
+            }
+            for graph in graphs
+        ))
+        self.assertFalse(any(
+            path.is_file()
+            for number in (1, 2)
+            for path in (
+                layout.trigger_dir("P", "1", number) / "sequence_diagrams"
+            ).glob("*.png")
+        ))
         shared_ids = [
             next(
                 item["method_id"] for item in graph["method_catalog"]

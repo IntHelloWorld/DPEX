@@ -1,7 +1,6 @@
 from .execution import validate_compressed_execution
 from .pipeline import (
     validate_aggregate,
-    validate_candidates,
     validate_defect_context,
     validate_evaluation,
     validate_localization,
@@ -14,7 +13,6 @@ from .uml_support import artifact_path as _artifact_path
 
 __all__ = [
     "validate_aggregate",
-    "validate_candidates",
     "validate_compressed_execution",
     "validate_defect_context",
     "validate_evaluation",

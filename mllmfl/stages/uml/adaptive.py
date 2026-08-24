@@ -184,9 +184,6 @@ def adaptive_graph_diagram_nodes(
     internal_nodes = planned["nodes"]
     by_id = {str(node["diagram_id"]): node for node in internal_nodes}
     output_nodes: List[Dict[str, Any]] = []
-    puml_paths: List[Path] = []
-    node_by_puml: Dict[Path, Dict[str, Any]] = {}
-
     for node in internal_nodes:
         diagram_id = str(node["diagram_id"])
         focus_item = node["focus"]
@@ -306,7 +303,6 @@ def adaptive_graph_diagram_nodes(
             method_ids=invocation_method_ids,
         )
         write_text(puml_path, puml)
-        puml_paths.append(puml_path)
 
         signatures = method_signatures(value)
         if not synthetic:
@@ -362,23 +358,4 @@ def adaptive_graph_diagram_nodes(
             if invocation_id in invocation_method_ids
         ))
         output_nodes.append(output)
-        node_by_puml[puml_path] = output
-
-    from mllmfl.infrastructure.plantuml import render_many
-    _, failed_paths = render_many(
-        puml_paths,
-        plantuml_command,
-        plantuml_jar,
-        timeout,
-        limit_size,
-        batch_size,
-    )
-    failures = [
-        {
-            "diagram_id": str(node_by_puml[path]["diagram_id"]),
-            "image": str(node_by_puml[path]["image"]),
-            "error": str(error),
-        }
-        for path, error in sorted(failed_paths.items(), key=lambda item: str(item[0]))
-    ]
-    return output_nodes, str(planned["entry_diagram_id"]), failures, method_catalog
+    return output_nodes, str(planned["entry_diagram_id"]), [], method_catalog

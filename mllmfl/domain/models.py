@@ -67,25 +67,6 @@ class Failure:
 
 
 @dataclass(frozen=True)
-class Candidate:
-    function: str
-    class_name: str
-    method: str
-    summary: str
-    status: str
-    source_file: str = ""
-    signature: str = ""
-    start_line: Optional[int] = None
-    end_line: Optional[int] = None
-    called_methods: List[str] = field(default_factory=list)
-
-    def to_dict(self) -> Dict[str, Any]:
-        value = asdict(self)
-        value["class"] = value.pop("class_name")
-        return value
-
-
-@dataclass(frozen=True)
 class Ranking:
     function: str
     signature: str

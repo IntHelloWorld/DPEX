@@ -26,35 +26,6 @@ def _method_location_key(
     return source_file, start_line, end_line
 
 
-def validate_candidates(value: Any) -> Dict[str, Any]:
-    if not isinstance(value, dict):
-        raise ValueError("candidates artifact must be a JSON object")
-    if value.get("schema") != "fault-candidates" or value.get("schema_version") != 1:
-        raise ValueError("unsupported candidates schema")
-    candidates = value.get("candidates")
-    if not isinstance(candidates, list):
-        raise ValueError("candidates must be an array")
-    summary_generation = value.get("summary_generation")
-    if summary_generation not in {None, "enabled", "disabled"}:
-        raise ValueError("invalid candidates summary_generation")
-    seen = set()
-    for index, candidate in enumerate(candidates):
-        if not isinstance(candidate, dict) or not isinstance(candidate.get("function"), str):
-            raise ValueError(f"invalid candidate at index {index}")
-        function = candidate["function"].strip()
-        if not function:
-            raise ValueError(f"empty candidate function at index {index}")
-        if function in seen:
-            raise ValueError(f"duplicate candidate function: {function}")
-        seen.add(function)
-        if summary_generation == "disabled" and (
-            candidate.get("summary") != ""
-            or candidate.get("status") != "SUMMARY_DISABLED"
-        ):
-            raise ValueError(f"candidate summary is not disabled at index {index}")
-    return value
-
-
 def validate_defect_context(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("defect context must be a JSON object")

@@ -11,7 +11,7 @@ from .context import DIAGRAM_TOOL, build_system_prompt
 
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
-DEFAULT_VISION_MODEL = "gpt-5.5"
+DEFAULT_VISION_MODEL = "gpt-5.4"
 DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
 REASONING_EFFORTS = {
     "none", "minimal", "low", "medium", "high", "xhigh", "max",

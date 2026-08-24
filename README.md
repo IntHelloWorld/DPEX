@@ -21,7 +21,7 @@ The pipeline writes exclusively under `--root` using this layout:
 <root>/
 ├── workspace/                         # Defects4J checkouts
 ├── artifacts/<project>/bug_<id>/
-│   ├── triggers/trigger_<n>/          # isolated trace/UML/candidate artifacts
+│   ├── triggers/trigger_<n>/          # isolated trace/UML artifacts
 │   ├── uml_suite.json                 # all failing tests and bug-global Mxxx catalog
 │   └── localization.json              # one bug-level agent ranking
 ├── logs/<stage>/<project>/bug_<id>/   # stage summaries and per-trigger diagnostics
@@ -39,33 +39,44 @@ python -m mllmfl collect --root runs/chart-1 --projects Chart --bugs 1
 python -m mllmfl trace --root runs/chart-1 --projects Chart --bugs 1
 python -m mllmfl uml --root runs/chart-1 --projects Chart --bugs 1 \
   --config config/mllm.example.json
-python -m mllmfl summarize --root runs/chart-1 --projects Chart --bugs 1
 python -m mllmfl localize --root runs/chart-1 --projects Chart --bugs 1 \
   --config config/mllm.example.json --dry-run
 python -m mllmfl evaluate --root runs/chart-1 --projects Chart --bugs 1 \
   --d4j-home "$D4J_HOME"
 ```
 
-Every stage supports `--help`. Trace and summarize accept `--trigger`; UML and localization process
+Every stage supports `--help`. Trace accepts `--trigger`; UML and localization process
 all failing tests for a bug together. `--force` replaces an existing stage result. `localize` should
 always be exercised with `--dry-run` first. For a real
 request, copy the example configuration to an ignored `*.local.json`, set `api_key_env`, and export
 that environment variable (`OPENAI_API_KEY` by default). Inline API keys are rejected.
 
-Collection processes every failing test in Defects4J export order. Each test receives an isolated
-trigger directory and a stable `Txxx` ID. Trace, slicing, UML rendering, and candidate extraction
-remain test-isolated; localization consumes all completed tests in one bug-level agent session.
+Localization is serial by default. Use `--workers N` to run up to `N` bugs concurrently; each bug
+keeps its own prompt, conversation, usage, render-error, result, and error-log files, while the main
+process writes the combined `logs/localize.csv` in deterministic project/bug order. For example:
 
-Localization uses OpenAI's Responses API with `gpt-5.5`. Requests use
+```bash
+python -m mllmfl localize --root runs/chart-many --projects Chart --bugs 1,2,3,4 \
+  --config config/mllm.local.json --workers 4
+```
+
+Collection processes every failing test in Defects4J export order. Each test receives an isolated
+trigger directory and a stable `Txxx` ID. Trace, slicing, and UML rendering remain test-isolated;
+localization consumes all completed tests in one bug-level agent session.
+
+Localization uses OpenAI's Responses API with `gpt-5.4`. Requests use
 `reasoning: {"effort": "medium"}`, set
 `parallel_tool_calls: false`, and do not send `temperature`, `top_p`, or penalty parameters.
+The `parallel_tool_calls` setting controls tool calls inside one model response and is independent
+of bug-level `--workers` concurrency.
 Responses use `store: false`; each continuation replays the complete ordered local history,
 including encrypted reasoning output, function calls, tool results, and viewed images. A stable
 `prompt_cache_key` is reused during one localization task and rotates after compatible upstream
 route failures.
 
-PNG rendering defaults to a 32768-pixel PlantUML limit. If a fragment reaches that boundary, `uml`
-fails explicitly instead of keeping a truncated image; raise `--plantuml-limit-size`.
+PNG rendering is performed on demand when the agent opens a diagram and defaults to a
+32768-pixel PlantUML limit. A fragment that reaches that boundary is rejected instead of caching a
+truncated image; raise `--plantuml-limit-size` when generating the UML graph.
 
 ## Artifact contracts
 
@@ -75,13 +86,12 @@ Stages communicate only through versioned JSON:
 |---|---|---|---|
 | `collect.json` | `collected-trigger` v2 | collect | trace metadata |
 | `trace.json` | `fullchain-trace` v3 | trace | diagnostics |
-| `execution.json` | `fullchain-execution` v3 | trace | summarize, fallback diagnostics |
+| `execution.json` | `fullchain-execution` v3 | trace | fallback diagnostics |
 | `execution_sliced.json` | `fullchain-execution` v3 | trace | uml |
 | `test_slice.json` | `test-boundary-slice` v2 | trace | slice audit |
 | `defect_context.json` | `defect-context` v1 | trace | localize defect context |
-| `uml.json` | `execution-uml-graph` v3 | uml | test-local navigation and audit |
+| `uml.json` | `execution-uml-graph` v4 | uml | test-local navigation and lazy rendering |
 | `uml_suite.json` | `execution-uml-suite` v1 | uml | bug-level localization context |
-| `candidates.json` | `fault-candidates` v1 | summarize | localize |
 | `localization.json` | `fault-localization` v5 | localize | evaluation |
 | `summaries/evaluation.json` | `fault-localization-evaluation` v2 | evaluate | reporting |
 
@@ -98,7 +108,7 @@ methods reached only through class initialization.
 UML prefers `execution_sliced.json` and falls back to `execution.json` when no slice artifact exists.
 It builds one uniformly navigable graph of sequence subgraphs. The entry subgraph is centered on the
 failing test invocation. If that invocation is absent, a layout-only execution root treats every real
-top-level invocation as a direct child without adding a candidate method or changing the trace. Each
+top-level invocation as a direct child without adding a synthetic method or changing the trace. Each
 subgraph is breadth-first loaded up to 24 visible units and 8 participants by default. A visible unit
 is either a call or a consecutive sibling bundle; the focal invocation is context and does not consume
 a unit. `CALL_INTERNAL` folds use directional `TO`/`FROM` links. Oversized sibling lists are split
@@ -113,7 +123,10 @@ the limits with `max_visible_units_per_image`, `max_participants_per_image`,
 `--max-visible-units`, and `--max-participants` (`--max-calls` remains a CLI alias).
 The graph index records these synthetic-root boundary arrows separately as
 `layout_root_call_count`; `trace_call_count` remains the unchanged call count from the execution
-artifact.
+artifact. UML writes every PUML source and the complete navigation graph up front, but does not
+pre-render PNG files. The first successful view of a diagram renders and validates exactly that PNG
+through PlantUML; subsequent views reuse a content-addressed cache. Cache files are replaced
+atomically, so interrupted rendering cannot leave a reusable partial image.
 
 UML and localization are image-only. Call occurrences use `Cxxx`; every distinct runtime method has
 one deterministic bug-global `Mxxx` identifier reused across every failing-test image. Diagram IDs
@@ -122,7 +135,7 @@ test. `uml_suite.json` maps all entry IDs and contains the private bug-global me
 resolve model output back to exact functions, signatures, and descriptors. The agent returns the
 method ID and short signature shown in an image, for example `M001` and `add(TickUnit)`. Local
 resolution accepts an exact ID-and-signature pair. If those fields conflict, it uses a unique
-short-signature match among viewed candidate methods; ambiguous or unmatched entries are discarded.
+short-signature match among viewed methods; ambiguous or unmatched entries are discarded.
 
 Compare the selected execution's call counts before compression and after compression for one bug:
 
@@ -137,7 +150,7 @@ introduced later by diagram pagination.
 
 Localization starts one session per bug. The initial user message contains only every failing-test
 identifier, its `Txxx` ID, and its entry `Txxx-Dxxx` ID; it contains no image,
-test code, error stack, test output, candidate list, project ID, bug ID, or filesystem path. Every
+test code, error stack, test output, method catalog, project ID, bug ID, or filesystem path. Every
 listed entry is initially accessible through `view_sequence_diagram`. Opening an entry returns that
 test's line-numbered sliced/full code, error stack, test output, and image. Opening a child linked
 from a viewed image returns only a minimal acknowledgement and the image. The prompt permits at most
@@ -147,7 +160,7 @@ generating tool errors.
 
 The model reads `Txxx-Dxxx` navigation and bug-global `Mxxx` method IDs directly from images and
 returns `method_id`, the image-visible short `method_signature`, and `reason`. Resolution is limited
-to methods in successfully viewed diagrams that map to the union of local candidates. It prefers
+to methods in successfully viewed diagrams and the bug-global method catalog. It prefers
 matching both fields; conflicting IDs may be corrected only by a unique short-signature match.
 Ambiguous or unresolved entries are discarded. The persisted v5 ranking contains between one and
 the configured `top_k` maximum number of evidence-supported methods; the model is not required to
@@ -172,13 +185,11 @@ system instruction plus every accepted Responses turn in order, including assist
 summaries, tool calls, and tool results. When a provider response contains multiple tool
 calls, only its retained first call is persisted. Image messages are represented only as
 `{\"type\": \"image_ref\", \"diagram_id\": ...}`; Base64 image data is never written to the
-conversation log; each referenced local PNG is loaded only when an HTTP request is built.
+conversation log; each referenced local PNG is rendered if needed and loaded only when an HTTP
+request is built. Recoverable render failures are recorded in `render_errors.jsonl` and do not mark
+the diagram as viewed.
 `response_usage.jsonl` records each completion ID and its provider usage object. Both files are
 runtime artifacts and remain git-ignored.
-
-Candidates are derived exclusively from the normalized execution. Method-summary generation is
-temporarily disabled: the `summarize` stage still writes the required `candidates.json`, but each
-candidate has an empty `summary`, a `SUMMARY_DISABLED` status, and no source implementation metadata.
 
 Evaluation reads the bug-level v5 agent ranking (or a historical aggregate) and Defects4J
 `*.src.patch` files. It verifies

@@ -16,6 +16,7 @@ runs/
 # Java build output
 fullchain_tracer/target/
 *.class
+.local-java11/
 
 # Local model data and credentials
 .env
@@ -27,3 +28,7 @@ fullchain_tracer/target/
 *.tar
 *.tar.gz
 *.zip
+
+# Others
+reproduce/
+benchmark/

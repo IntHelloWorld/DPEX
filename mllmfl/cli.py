@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.stages import aggregate, collect, evaluate, localize, summarize, trace, uml
+from mllmfl.stages import aggregate, collect, evaluate, localize, trace, uml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROJECTS = [
@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
         "uml", help="render adaptively folded runtime sequence subgraphs"
     )
     _common(uml_parser, include_trigger=False)
-    uml_parser.add_argument("--plantuml-command", default="plantuml")
+    uml_parser.add_argument("--plantuml-command")
     uml_parser.add_argument(
         "--config", default=str(PROJECT_ROOT / "config" / "mllm.example.json"),
         help="configuration file containing UML image limits",
@@ -115,35 +115,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
     uml_parser.add_argument("--max-participants", type=_positive_int)
     uml_parser.add_argument("--plantuml-batch-size", type=_positive_int)
-    uml_parser.add_argument(
-        "--plantuml-jar", default=str(PROJECT_ROOT / "lib" / "plantuml.jar")
-    )
+    uml_parser.add_argument("--plantuml-jar")
     uml_parser.add_argument(
         "--plantuml-limit-size",
-        type=int,
-        default=32768,
+        type=_positive_int,
         help="maximum fragment PNG width/height before rendering fails",
     )
 
-    summary_parser = subparsers.add_parser(
-        "summarize", help="extract execution candidates (method summaries disabled)"
-    )
-    _common(summary_parser)
-    summary_parser.add_argument("--candidate-cap", type=_positive_int, default=100)
-    summary_parser.add_argument(
-        "--max-summary-chars", type=int, default=240,
-        help="reserved while method-summary generation is disabled",
-    )
-    summary_parser.add_argument(
-        "--max-called-methods", type=int, default=8,
-        help="reserved while method-summary generation is disabled",
-    )
-
-    localize_parser = subparsers.add_parser("localize", help="rank candidates with an MLLM")
+    localize_parser = subparsers.add_parser("localize", help="rank methods with an MLLM")
     _common(localize_parser, include_trigger=False)
     localize_parser.add_argument("--config", required=True)
     localize_parser.add_argument("--top-k", type=_positive_int)
     localize_parser.add_argument("--dry-run", action="store_true")
+    localize_parser.add_argument(
+        "--workers",
+        "--max-workers",
+        dest="workers",
+        type=_positive_int,
+        default=1,
+        help="maximum number of bugs localized concurrently (default: 1)",
+    )
 
     aggregate_parser = subparsers.add_parser(
         "aggregate", help="aggregate historical trigger-level rankings per bug"
@@ -214,32 +205,34 @@ def main(argv: Sequence[str] | None = None) -> None:
         plantuml_batch_size = (
             args.plantuml_batch_size or int(uml_cfg.get("plantuml_batch_size", 100))
         )
+        plantuml_command = (
+            args.plantuml_command
+            or str(uml_cfg.get("plantuml_command") or "plantuml")
+        )
+        plantuml_jar_value = (
+            args.plantuml_jar
+            if args.plantuml_jar is not None
+            else uml_cfg.get("plantuml_jar", str(PROJECT_ROOT / "lib" / "plantuml.jar"))
+        )
+        plantuml_limit_size = (
+            args.plantuml_limit_size
+            or int(uml_cfg.get("plantuml_limit_size", 32768))
+        )
         rows = uml.run(
             layout,
             projects,
             bugs,
             None,
-            args.plantuml_command,
-            Path(args.plantuml_jar).expanduser().resolve()
-            if args.plantuml_jar
+            plantuml_command,
+            Path(str(plantuml_jar_value)).expanduser().resolve()
+            if plantuml_jar_value
             else None,
             args.timeout,
             args.force,
-            args.plantuml_limit_size,
+            plantuml_limit_size,
             max_visible_units,
             max_participants,
             plantuml_batch_size,
-        )
-    elif args.stage == "summarize":
-        rows = summarize.run(
-            layout,
-            projects,
-            bugs,
-            args.trigger,
-            args.candidate_cap,
-            args.max_summary_chars,
-            args.max_called_methods,
-            args.force,
         )
     elif args.stage == "localize":
         rows = localize.run(
@@ -252,6 +245,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.top_k,
             args.dry_run,
             args.force,
+            args.workers,
         )
     elif args.stage == "aggregate":
         rows = aggregate.run(layout, projects, bugs, args.top_k)

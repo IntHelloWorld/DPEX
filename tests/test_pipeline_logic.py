@@ -2,6 +2,7 @@ import io
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -11,7 +12,6 @@ from mllmfl.cli import build_parser
 from mllmfl.domain.failure import extract_error_stack
 from mllmfl.domain.interaction import IMAGE_ONLY_MODE
 from mllmfl.domain.schemas import (
-    validate_candidates,
     validate_defect_context,
     validate_localization,
     validate_uml_index,
@@ -33,7 +33,6 @@ from mllmfl.stages.localize import (
     test_code_context,
     validate_model_ranking_payload,
 )
-from mllmfl.stages.summarize import candidate_functions, candidate_without_summary
 
 
 class JavaSourceTests(unittest.TestCase):
@@ -99,6 +98,8 @@ class LocalizationTests(unittest.TestCase):
         self.assertIn("software defect-localization agent", SYSTEM_PROMPT)
         self.assertIn("## Localization Approach", SYSTEM_PROMPT)
         self.assertIn("until you have enough evidence", SYSTEM_PROMPT)
+        self.assertIn("Total Calls", SYSTEM_PROMPT)
+        self.assertIn("Diagram Count", SYSTEM_PROMPT)
         self.assertIn("## Diagram Guide", SYSTEM_PROMPT)
         self.assertIn("arrows are method calls", SYSTEM_PROMPT)
         self.assertIn("TO/FROM/VIEW Txxx-Dxxx", SYSTEM_PROMPT)
@@ -125,30 +126,35 @@ class LocalizationTests(unittest.TestCase):
         self.assertIn("must not exceed 3 entries", build_system_prompt(3))
         self.assertNotIn("__TOP_K__", build_system_prompt(3))
 
-    def test_initial_prompt_omits_candidates_project_and_bug(self):
+    def test_initial_prompt_omits_private_context(self):
         prompt = build_prompt([{
             "test_id": "T001", "test": "p.Test::testCase",
             "entry_diagram_id": "T001-D001",
+            "call_count": 42, "diagram_count": 3,
         }])
-        self.assertNotIn("[Candidate Functions]", prompt)
         self.assertNotIn("[Project]", prompt)
         self.assertNotIn("[Bug]", prompt)
-        self.assertNotIn("candidate", SYSTEM_PROMPT.lower())
-        self.assertIn("T001 | p.Test::testCase | Entry: T001-D001", prompt)
+        self.assertIn(
+            "| Test ID | Failing Test | Entry Diagram | Total Calls | Diagram Count |",
+            prompt,
+        )
+        self.assertIn("| T001 | p.Test::testCase | T001-D001 | 42 | 3 |", prompt)
         self.assertNotIn("Error Stack", prompt)
         self.assertNotIn("Test Output", prompt)
         self.assertNotIn("test_code", prompt)
 
     def test_initial_prompt_lists_all_entries_without_images_or_details(self):
         prompt = build_prompt([
-            {"test_id": "T001", "test": "p.A::one", "entry_diagram_id": "T001-D001"},
-            {"test_id": "T002", "test": "p.B::two", "entry_diagram_id": "T002-D001"},
+            {"test_id": "T001", "test": "p.A::one", "entry_diagram_id": "T001-D001",
+             "call_count": 12, "diagram_count": 2},
+            {"test_id": "T002", "test": "p.B::two", "entry_diagram_id": "T002-D001",
+             "call_count": 34, "diagram_count": 5},
         ])
         self.assertNotIn("p.Service.run", prompt)
         self.assertNotIn("Visible Units", prompt)
         self.assertNotIn("[Initial Sequence Subgraph]", prompt)
-        self.assertIn("T001 | p.A::one | Entry: T001-D001", prompt)
-        self.assertIn("T002 | p.B::two | Entry: T002-D001", prompt)
+        self.assertIn("| T001 | p.A::one | T001-D001 | 12 | 2 |", prompt)
+        self.assertIn("| T002 | p.B::two | T002-D001 | 34 | 5 |", prompt)
         self.assertNotIn("Task Parameters", prompt)
         self.assertNotIn("Maximum ranked methods", prompt)
         self.assertNotIn('"ranked"', prompt)
@@ -217,8 +223,7 @@ class LocalizationTests(unittest.TestCase):
                 "method_id": "M998", "method_signature": "missing()",
                 "reason": "no match",
             },
-        ], ["p.A.run", "p.B.work", "p.C.add"], catalog,
-            ["M001", "M002", "M003"], 5)
+        ], catalog, ["M001", "M002", "M003"], 5)
         self.assertEqual(
             [item.function for item in ranking],
             ["p.A.run", "p.C.add"],
@@ -241,10 +246,33 @@ class LocalizationTests(unittest.TestCase):
         ranking, dropped = gate_method_id_ranking([{
             "method_id": "M001", "method_signature": "add(TickUnit)",
             "reason": "conflicting and ambiguous",
-        }], ["p.A.run", "p.B.add", "p.C.add"], catalog,
-            ["M001", "M002", "M003"], 5)
+        }], catalog, ["M001", "M002", "M003"], 5)
         self.assertEqual(ranking, [])
         self.assertEqual(dropped, ["M001"])
+
+    def test_formats_missing_spaces_after_signature_commas(self):
+        catalog = [{
+            "method_id": "M001",
+            "function": "p.ShapeUtilities.equal",
+            "signature": (
+                "p.ShapeUtilities.equal(GeneralPath, GeneralPath)"
+            ),
+            "descriptor": "(Ljava/awt/geom/GeneralPath;"
+                          "Ljava/awt/geom/GeneralPath;)Z",
+        }]
+        ranking, dropped = gate_method_id_ranking([{
+            "method_id": "M001",
+            "method_signature": "equal(GeneralPath,GeneralPath)",
+            "reason": "comparison returned the wrong result",
+        }], catalog, ["M001"], 5)
+
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(ranking), 1)
+        self.assertEqual(ranking[0].method_id, "M001")
+        self.assertEqual(
+            ranking[0].signature,
+            "p.ShapeUtilities.equal(GeneralPath, GeneralPath)",
+        )
 
     def test_signature_only_fallback_rejects_ambiguous_or_unviewed_methods(self):
         catalog = [
@@ -258,28 +286,14 @@ class LocalizationTests(unittest.TestCase):
         ranking, dropped = gate_method_id_ranking([
             {"method_id": "M999", "method_signature": "add(TickUnit)"},
             {"method_id": "M998", "method_signature": "work()"},
-        ], ["p.A.add", "p.B.add", "p.C.work"], catalog, ["M001", "M002"], 5)
+        ], catalog, ["M001", "M002"], 5)
         self.assertEqual(ranking, [])
         self.assertEqual(dropped, ["M999", "M998"])
 
     def test_schema_validation_rejects_duplicate_and_non_contiguous_values(self):
-        with self.assertRaisesRegex(ValueError, "duplicate candidate"):
-            validate_candidates({"schema": "fault-candidates", "schema_version": 1, "candidates": [
-                {"function": "p.A.m"}, {"function": "p.A.m"},
-            ]})
         with self.assertRaisesRegex(ValueError, "non-contiguous"):
             validate_localization({"schema": "fault-localization", "schema_version": 1,
                                    "ranking": [{"function": "p.A.m", "rank": 2}]})
-
-    def test_disabled_summary_contract_rejects_populated_summary(self):
-        with self.assertRaisesRegex(ValueError, "summary is not disabled"):
-            validate_candidates({
-                "schema": "fault-candidates", "schema_version": 1,
-                "summary_generation": "disabled",
-                "candidates": [{
-                    "function": "p.A.m", "summary": "unexpected", "status": "OK",
-                }],
-            })
 
     def test_schema_validation_normalizes_invalid_rank_type(self):
         with self.assertRaisesRegex(ValueError, "invalid ranking rank"):
@@ -890,6 +904,60 @@ class LocalizationTests(unittest.TestCase):
         second_input = post.call_args_list[1].args[1]
         self.assertIn("unknown diagram_id", second_input[-1]["content"])
 
+    @patch("mllmfl.stages.localize.ensure_rendered")
+    @patch("mllmfl.stages.localize._post_response")
+    def test_agent_does_not_mark_failed_on_demand_render_as_viewed(
+        self, post, ensure
+    ):
+        ensure.side_effect = RuntimeError("PlantUML syntax error")
+        post.side_effect = [
+            self.agent_response({"tool_calls": [{"id": "view", "function": {
+                "name": "view_sequence_diagram",
+                "arguments": '{"diagram_id":"T001-D001"}',
+            }}]}, "resp-1"),
+            self.agent_response({"content": (
+                '{"ranked":[{"method_id":"M001",'
+                '"method_signature":"run()","reason":"evidence"}]}'
+            )}, "resp-2"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "entry.puml").write_text(
+                "@startuml\n@enduml\n", encoding="utf-8"
+            )
+            bundle = {
+                "tests": [{
+                    "test_id": "T001", "test": "p.Test::testCase",
+                    "entry_diagram_id": "T001-D001", "test_code": "1 | run();",
+                    "error_stack": "p.Error", "test_output": "failed",
+                }],
+                "nodes": [{
+                    **self.graph_node(
+                        "T001-D001", image="entry.png", links=[]
+                    ),
+                    "puml": "entry.puml",
+                    "_rendering": {
+                        "mode": "on_demand", "format": "png", "limit_size": 4096,
+                    },
+                }],
+            }
+            raw, _, viewed, rounds, views = run_agent(
+                {"mllm": {"invalid_final_json_retries": 0}},
+                "prompt", bundle, root, 30,
+            )
+            errors = [
+                json.loads(line)
+                for line in (root / "render_errors.jsonl").read_text().splitlines()
+            ]
+
+        self.assertIn('"method_id":"M001"', raw)
+        self.assertEqual((viewed, rounds, views), ([], 1, 0))
+        self.assertEqual(ensure.call_count, 1)
+        self.assertEqual(errors[0]["diagram_id"], "T001-D001")
+        second_input = post.call_args_list[1].args[1]
+        self.assertEqual(second_input[-1]["role"], "tool")
+        self.assertIn("diagram rendering failed", second_input[-1]["content"])
+
     @patch("mllmfl.stages.localize._post_response")
     def test_agent_keeps_only_first_tool_call_without_error(self, post):
         post.side_effect = [
@@ -1051,7 +1119,7 @@ class LocalizationTests(unittest.TestCase):
 
     @patch("mllmfl.stages.localize.requests.post")
     @patch.dict("os.environ", {"OPENAI_API_KEY": "secret"}, clear=False)
-    def test_responses_uses_gpt_5_5_stateless_defaults(self, post):
+    def test_responses_uses_gpt_5_4_stateless_defaults(self, post):
         response = unittest.mock.Mock(status_code=200)
         response.json.return_value = {
             "id": "response-1",
@@ -1069,8 +1137,8 @@ class LocalizationTests(unittest.TestCase):
         )
 
         payload = post.call_args.kwargs["json"]
-        self.assertEqual(model, "gpt-5.5")
-        self.assertEqual(payload["model"], "gpt-5.5")
+        self.assertEqual(model, "gpt-5.4")
+        self.assertEqual(payload["model"], "gpt-5.4")
         self.assertEqual(payload["reasoning"], {"effort": "medium"})
         self.assertNotIn("previous_response_id", payload)
         self.assertFalse(payload["parallel_tool_calls"])
@@ -1189,6 +1257,41 @@ class UMLIndexTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "v3 diagram_id"):
             validate_uml_index(value)
 
+    def test_v4_allows_missing_png_but_requires_puml_and_matching_stem(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            diagrams = root / "sequence_diagrams"
+            diagrams.mkdir()
+            (diagrams / "T001-D001.puml").write_text(
+                "@startuml\n@enduml\n", encoding="utf-8"
+            )
+            value = self._graph_index()
+            value.update({
+                "schema_version": 4,
+                "test_id": "T001",
+                "method_catalog_fingerprint": "a" * 64,
+                "entry_diagram_id": "T001-D001",
+                "rendering": {
+                    "mode": "on_demand", "format": "png", "limit_size": 32768,
+                    "plantuml_command": "plantuml", "plantuml_jar": None,
+                },
+                "method_catalog": [{
+                    "method_id": "M007", "function": "p.Service.run",
+                    "signature": "p.Service.run()", "descriptor": "()V",
+                }],
+            })
+            value["nodes"][0].update({
+                "diagram_id": "T001-D001",
+                "method_ids": ["M007"],
+                "puml": "sequence_diagrams/T001-D001.puml",
+                "image": "sequence_diagrams/T001-D001.png",
+            })
+
+            self.assertIs(validate_uml_index(value, root), value)
+            value["nodes"][0]["image"] = "sequence_diagrams/other.png"
+            with self.assertRaisesRegex(ValueError, "do not share a stem"):
+                validate_uml_index(value, root)
+
     def test_validates_files_and_rejects_unsafe_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1305,11 +1408,19 @@ class BugLevelLocalizationStageTests(unittest.TestCase):
                 (diagrams / f"{entry_id}.puml").write_text(
                     "@startuml\n@enduml\n", encoding="utf-8"
                 )
-                (diagrams / f"{entry_id}.png").write_bytes(b"png")
                 graph = {
-                    "schema": "execution-uml-graph", "schema_version": 3,
+                    "schema": "execution-uml-graph", "schema_version": 4,
                     "test_id": test_id,
                     "method_catalog_fingerprint": fingerprint,
+                    "rendering": {
+                        "mode": "on_demand", "format": "png",
+                        "limit_size": 32768,
+                        "plantuml_command": "plantuml",
+                        "plantuml_jar": str(
+                            Path(__file__).resolve().parents[1]
+                            / "lib" / "plantuml.jar"
+                        ),
+                    },
                     "source_schema": "fullchain-execution",
                     "strategy": "test-root-adaptive-graph",
                     "entry_reason": "test_invocation", "slice_applied": True,
@@ -1333,14 +1444,6 @@ class BugLevelLocalizationStageTests(unittest.TestCase):
                 }
                 (trigger / "uml.json").write_text(json.dumps(graph), encoding="utf-8")
                 (trigger / "trigger_test.txt").write_text(test + "\n", encoding="utf-8")
-                (trigger / "candidates.json").write_text(json.dumps({
-                    "schema": "fault-candidates", "schema_version": 1,
-                    "summary_generation": "disabled",
-                    "candidates": [{
-                        "function": "p.Service.run", "summary": "",
-                        "status": "SUMMARY_DISABLED",
-                    }],
-                }), encoding="utf-8")
                 (trigger / "test_slice.json").write_text(json.dumps({
                     "schema": "test-boundary-slice", "schema_version": 2,
                     "applied": True, "selected_statements": [{
@@ -1380,8 +1483,72 @@ class BugLevelLocalizationStageTests(unittest.TestCase):
         self.assertEqual(result["schema_version"], 5)
         self.assertEqual(result["test_count"], 2)
         self.assertNotIn("[Error Stack]", prompt)
-        self.assertIn("T001 | p.A::one | Entry: T001-D001", prompt)
-        self.assertIn("T002 | p.B::two | Entry: T002-D001", prompt)
+        self.assertIn("| T001 | p.A::one | T001-D001 | 1 | 1 |", prompt)
+        self.assertIn("| T002 | p.B::two | T002-D001 | 1 | 1 |", prompt)
+
+    def test_workers_localize_bugs_concurrently_and_keep_summary_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            for bug in ("1", "2"):
+                layout.trigger_dir("P", bug, 1).mkdir(parents=True)
+            config = layout.root / "config.json"
+            config.write_text("{}", encoding="utf-8")
+            rendezvous = threading.Barrier(2)
+
+            def fake_localize(
+                _layout, project, bug, _config, _timeout, _top_k, _dry_run, _force
+            ):
+                rendezvous.wait(timeout=2)
+                return {
+                    "project": project,
+                    "bug": bug,
+                    "status": "DRY_RUN",
+                    "top1": "",
+                }
+
+            with patch(
+                "mllmfl.stages.localize.stage._localize_bug",
+                side_effect=fake_localize,
+            ) as worker:
+                rows = localize.run(
+                    layout, ["P"], {"1", "2"}, None, config, 30, 1, True,
+                    workers=2,
+                )
+            summary_lines = (layout.logs / "localize.csv").read_text(
+                encoding="utf-8"
+            ).splitlines()
+
+        self.assertEqual(worker.call_count, 2)
+        self.assertEqual([row["bug"] for row in rows], ["1", "2"])
+        self.assertEqual(summary_lines, [
+            "project,bug,status,top1",
+            "P,1,DRY_RUN,",
+            "P,2,DRY_RUN,",
+        ])
+
+    def test_concurrent_bug_failures_have_isolated_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            for bug in ("1", "2"):
+                layout.trigger_dir("P", bug, 1).mkdir(parents=True)
+            config = layout.root / "config.json"
+            config.write_text("{}", encoding="utf-8")
+
+            rows = localize.run(
+                layout, ["P"], {"1", "2"}, None, config, 30, 1, True,
+                workers=2,
+            )
+            errors = [
+                (
+                    layout.stage_log_dir("localize", "P", bug) / "error.log"
+                ).read_text(encoding="utf-8")
+                for bug in ("1", "2")
+            ]
+
+        self.assertEqual([row["status"] for row in rows], ["ERROR", "ERROR"])
+        self.assertTrue(all("uml_suite.json" in error for error in errors))
 
 
 class AggregateTests(unittest.TestCase):
@@ -1538,18 +1705,11 @@ class CliValidationTests(unittest.TestCase):
         args = build_parser().parse_args(["collect"])
         self.assertFalse(hasattr(args, "max_failing_tests"))
 
-    def test_method_summary_generation_is_disabled(self):
-        candidate = candidate_without_summary("p.Service.run")
-        self.assertEqual(candidate.function, "p.Service.run")
-        self.assertEqual(candidate.summary, "")
-        self.assertEqual(candidate.status, "SUMMARY_DISABLED")
-        self.assertEqual(candidate.source_file, "")
-
-    def test_rejects_non_positive_candidate_cap_and_top_k(self):
+    def test_rejects_non_positive_top_k(self):
         parser = build_parser()
         invalid_commands = [
-            ["summarize", "--candidate-cap", "0"],
             ["localize", "--config", "config.json", "--top-k", "-1"],
+            ["localize", "--config", "config.json", "--workers", "0"],
             ["aggregate", "--top-k", "0"],
         ]
         for command in invalid_commands:
@@ -1557,10 +1717,14 @@ class CliValidationTests(unittest.TestCase):
                 with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                     parser.parse_args(command)
 
-    def test_candidate_selection_rejects_non_positive_cap(self):
-        with self.assertRaisesRegex(ValueError, "candidate cap must be positive"):
-            candidate_functions({}, 0)
-
+    def test_localize_workers_default_and_alias(self):
+        parser = build_parser()
+        default = parser.parse_args(["localize", "--config", "config.json"])
+        selected = parser.parse_args([
+            "localize", "--config", "config.json", "--max-workers", "3",
+        ])
+        self.assertEqual(default.workers, 1)
+        self.assertEqual(selected.workers, 3)
 
 class ProcessTests(unittest.TestCase):
     def test_timeout_has_stable_return_code(self):
