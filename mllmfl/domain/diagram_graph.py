@@ -83,6 +83,7 @@ def plan_diagram_graph(
     max_visible_units: int,
     max_participants: int,
     entry_reason: str,
+    diagram_namespace: str = "",
 ) -> Dict[str, Any]:
     """Plan a graph of uniformly renderable diagrams using bounded BFS expansion.
 
@@ -123,7 +124,11 @@ def plan_diagram_graph(
 
     def reserve_id() -> str:
         nonlocal next_ordinal
-        diagram_id = f"D-{next_ordinal:03d}"
+        diagram_id = (
+            f"{diagram_namespace}-D{next_ordinal:03d}"
+            if diagram_namespace
+            else f"D-{next_ordinal:03d}"
+        )
         next_ordinal += 1
         return diagram_id
 

@@ -8,7 +8,6 @@
     "base_url": "https://api.openai.com/v1",
     "api_key_env": "OPENAI_API_KEY",
     "vision_model": "gpt-5.5",
-    "interaction_mode": "text_index",
     "reasoning_effort": "medium",
     "invalid_final_json_retries": 2,
     "top_k": 5,

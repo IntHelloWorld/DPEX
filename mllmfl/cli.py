@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 from typing import Sequence
 
-from mllmfl.domain.interaction import localization_interaction_mode
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.stages import aggregate, collect, evaluate, localize, summarize, trace, uml
 
@@ -89,13 +88,6 @@ def build_parser() -> argparse.ArgumentParser:
     _common(collect_parser, include_trigger=False)
     collect_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     collect_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
-    collect_parser.add_argument(
-        "--max-failing-tests",
-        type=_positive_int,
-        default=3,
-        help="maximum failing tests per bug; randomly sample when more are available",
-    )
-
     trace_parser = subparsers.add_parser(
         "trace", help="record Fullchain v3 executions and test-boundary slices"
     )
@@ -110,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     uml_parser = subparsers.add_parser(
         "uml", help="render adaptively folded runtime sequence subgraphs"
     )
-    _common(uml_parser)
+    _common(uml_parser, include_trigger=False)
     uml_parser.add_argument("--plantuml-command", default="plantuml")
     uml_parser.add_argument(
         "--config", default=str(PROJECT_ROOT / "config" / "mllm.example.json"),
@@ -148,19 +140,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     localize_parser = subparsers.add_parser("localize", help="rank candidates with an MLLM")
-    _common(localize_parser)
+    _common(localize_parser, include_trigger=False)
     localize_parser.add_argument("--config", required=True)
     localize_parser.add_argument("--top-k", type=_positive_int)
     localize_parser.add_argument("--dry-run", action="store_true")
 
     aggregate_parser = subparsers.add_parser(
-        "aggregate", help="aggregate trigger rankings per bug"
+        "aggregate", help="aggregate historical trigger-level rankings per bug"
     )
     _common(aggregate_parser, include_trigger=False, include_force=False)
     aggregate_parser.add_argument("--top-k", type=_positive_int, default=5)
 
     evaluate_parser = subparsers.add_parser(
-        "evaluate", help="evaluate aggregate rankings against Defects4J patches"
+        "evaluate", help="evaluate bug-level rankings against Defects4J patches"
     )
     _common(evaluate_parser, include_trigger=False, include_force=False)
     evaluate_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
@@ -194,7 +186,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             Path(args.java_home).expanduser() if args.java_home else None,
             args.timeout,
             args.force,
-            args.max_failing_tests,
         )
     elif args.stage == "trace":
         rows = trace.run(
@@ -211,7 +202,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     elif args.stage == "uml":
         uml_config = json.loads(Path(args.config).expanduser().read_text(encoding="utf-8"))
         uml_cfg = uml_config.get("uml") or {}
-        interaction_mode = localization_interaction_mode(uml_config)
         max_visible_units = args.max_visible_units or int(
             uml_cfg.get(
                 "max_visible_units_per_image",
@@ -228,7 +218,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             layout,
             projects,
             bugs,
-            args.trigger,
+            None,
             args.plantuml_command,
             Path(args.plantuml_jar).expanduser().resolve()
             if args.plantuml_jar
@@ -239,7 +229,6 @@ def main(argv: Sequence[str] | None = None) -> None:
             max_visible_units,
             max_participants,
             plantuml_batch_size,
-            interaction_mode,
         )
     elif args.stage == "summarize":
         rows = summarize.run(
@@ -257,7 +246,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             layout,
             projects,
             bugs,
-            args.trigger,
+            None,
             Path(args.config).expanduser().resolve(),
             args.timeout,
             args.top_k,

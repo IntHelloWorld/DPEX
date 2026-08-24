@@ -1,45 +1,117 @@
-import base64
-import json
-import os
-import re
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
-import requests
-
-from mllmfl.domain.models import Ranking
-from mllmfl.domain.failure import extract_error_stack
-from mllmfl.domain.interaction import (
-    IMAGE_ONLY_MODE,
-    TEXT_INDEX_MODE,
-    localization_interaction_mode,
-)
 from mllmfl.domain.schemas import (
     validate_candidates,
-    validate_defect_context,
     validate_localization,
     validate_uml_index,
+    validate_uml_suite,
 )
-from mllmfl.domain.test_slice import validate_slice_metadata
-from mllmfl.infrastructure.io import append_jsonl, read_json, write_csv, write_json, write_text
+from mllmfl.infrastructure.io import read_json, write_csv, write_json, write_text
 from mllmfl.infrastructure.layout import RunLayout
 
 from . import run_agent
 from .context import (
     build_prompt,
+    build_system_prompt,
     defect_output_context,
     invalid_final_json_retries,
-    system_prompt,
     test_code_context,
 )
 from .parsing import (
     attach_source_locations,
     gate_method_id_ranking,
-    gate_ranking,
     parse_model_response,
     validate_model_ranking_payload,
 )
+
+
+def _group_triggers(
+    layout: RunLayout,
+    projects: Sequence[str],
+    bugs: set[str] | None,
+) -> Dict[tuple[str, str], List[tuple[str, Path]]]:
+    grouped: Dict[tuple[str, str], List[tuple[str, Path]]] = {}
+    for project, bug, number, directory in layout.discover_triggers(projects, bugs):
+        grouped.setdefault((project, bug), []).append((number, directory))
+    return grouped
+
+
+def _runtime_bundle(
+    layout: RunLayout,
+    project: str,
+    bug: str,
+    bug_dir: Path,
+    suite: Dict[str, Any],
+) -> tuple[Dict[str, Any], List[str]]:
+    nodes = []
+    runtime_tests = []
+    candidates: List[str] = []
+    catalog_by_id = {
+        str(item["method_id"]): item for item in suite["method_catalog"]
+    }
+
+    for expected_trigger, spec in enumerate(suite["tests"], 1):
+        number = str(spec["trigger"])
+        if int(number) != expected_trigger:
+            raise ValueError("UML suite triggers are not contiguous")
+        graph_path = bug_dir / Path(*Path(str(spec["uml"])).parts)
+        trigger_dir = graph_path.parent
+        graph = validate_uml_index(read_json(graph_path), trigger_dir)
+        if (
+            graph.get("schema_version") != 3
+            or graph.get("test_id") != spec["test_id"]
+            or graph.get("entry_diagram_id") != spec["entry_diagram_id"]
+            or graph.get("method_catalog_fingerprint")
+            != suite["method_catalog_fingerprint"]
+        ):
+            raise ValueError(f"UML suite graph mismatch: {spec['test_id']}")
+        for item in graph["method_catalog"]:
+            if catalog_by_id.get(str(item["method_id"])) != item:
+                raise ValueError(f"UML graph method catalog mismatch: {spec['test_id']}")
+
+        candidate_data = validate_candidates(read_json(trigger_dir / "candidates.json"))
+        for candidate in candidate_data["candidates"]:
+            function = str(candidate["function"])
+            if function not in candidates:
+                candidates.append(function)
+
+        test = (trigger_dir / "trigger_test.txt").read_text(
+            encoding="utf-8"
+        ).strip()
+        if test != spec["test"]:
+            raise ValueError(f"failing test does not match UML suite: {spec['test_id']}")
+        test_code = test_code_context(layout, project, bug, trigger_dir, test)
+        error_stack, test_output = defect_output_context(
+            layout, project, bug, number, trigger_dir, test
+        )
+        runtime_tests.append({
+            **spec,
+            "test_code": test_code,
+            "error_stack": error_stack,
+            "test_output": test_output,
+        })
+
+        for source_node in graph["nodes"]:
+            node = dict(source_node)
+            node["image"] = (
+                trigger_dir / Path(*Path(str(source_node["image"])).parts)
+            ).relative_to(bug_dir).as_posix()
+            node["puml"] = (
+                trigger_dir / Path(*Path(str(source_node["puml"])).parts)
+            ).relative_to(bug_dir).as_posix()
+            nodes.append(node)
+
+    diagram_ids = [str(node["diagram_id"]) for node in nodes]
+    if len(diagram_ids) != len(set(diagram_ids)):
+        raise ValueError("duplicate diagram ID across failing tests")
+    if len(nodes) != int(suite["diagram_count"]):
+        raise ValueError("UML suite diagram count mismatch")
+    return {
+        "nodes": nodes,
+        "tests": runtime_tests,
+        "method_catalog": suite["method_catalog"],
+    }, candidates
 
 
 def run(
@@ -53,56 +125,70 @@ def run(
     dry_run: bool,
     force: bool = False,
 ) -> List[Dict[str, object]]:
+    if trigger is not None:
+        raise ValueError("localization runs once per bug and does not accept --trigger")
     config = read_json(config_path)
     cfg = config.get("mllm", config)
-    interaction_mode = localization_interaction_mode(config)
+    if "interaction_mode" in cfg:
+        raise ValueError("mllm.interaction_mode was removed; localization is image-only")
     selected_top_k = top_k if top_k is not None else int(cfg.get("top_k", 5))
     if selected_top_k <= 0:
         raise ValueError("top_k must be positive")
     invalid_final_json_retries(config)
-    rows = []
-    for project, bug, number, directory in layout.discover_triggers(projects, bugs, trigger):
-        result_path = directory / "localization.json"
+
+    rows: List[Dict[str, object]] = []
+    for (project, bug), _ in sorted(_group_triggers(layout, projects, bugs).items()):
+        bug_dir = layout.artifacts / project / f"bug_{bug}"
+        result_path = bug_dir / "localization.json"
         if result_path.exists() and not force:
-            rows.append({"project": project, "bug": bug, "trigger": number,
-                         "status": "SKIPPED", "top1": ""})
+            try:
+                existing = validate_localization(read_json(result_path))
+                if (
+                    existing.get("schema_version") != 5
+                    or existing.get("project") != project
+                    or existing.get("bug") != bug
+                ):
+                    raise ValueError("existing localization is not bug-level v5")
+                rows.append({
+                    "project": project,
+                    "bug": bug,
+                    "status": "SKIPPED",
+                    "top1": "",
+                })
+            except Exception as error:
+                write_text(
+                    layout.stage_log_dir("localize", project, bug) / "error.log",
+                    str(error) + "\n",
+                )
+                rows.append({
+                    "project": project, "bug": bug, "status": "ERROR", "top1": "",
+                })
             continue
+
         try:
-            data = read_json(directory / "candidates.json")
-            validate_candidates(data)
-            uml_index = read_json(directory / "uml.json")
-            validate_uml_index(uml_index, directory)
-            if uml_index.get("schema") != "execution-uml-graph":
-                raise ValueError(
-                    "legacy UML index is not supported by localization; regenerate the UML stage"
-                )
-            artifact_mode = (
-                IMAGE_ONLY_MODE
-                if uml_index.get("schema_version") == 2
-                else TEXT_INDEX_MODE
+            suite = validate_uml_suite(read_json(bug_dir / "uml_suite.json"), bug_dir)
+            if suite["project"] != project or suite["bug"] != bug:
+                raise ValueError("UML suite identity does not match its path")
+            bundle, candidates = _runtime_bundle(
+                layout, project, bug, bug_dir, suite
             )
-            if artifact_mode != interaction_mode:
-                raise ValueError(
-                    "UML interaction mode does not match mllm.interaction_mode; "
-                    "regenerate the UML stage with the same configuration"
-                )
-            candidates = data.get("candidates") or []
-            test = (directory / "trigger_test.txt").read_text(encoding="utf-8").strip()
-            test_code = test_code_context(layout, project, bug, directory, test)
-            error_stack, test_output = defect_output_context(
-                layout, project, bug, number, directory, test
-            )
-            prompt = build_prompt(
-                test, test_code, error_stack, test_output, uml_index, selected_top_k,
-                interaction_mode,
-            )
+            public_tests = [
+                {
+                    "test_id": item["test_id"],
+                    "test": item["test"],
+                    "entry_diagram_id": item["entry_diagram_id"],
+                }
+                for item in bundle["tests"]
+            ]
+            prompt = build_prompt(public_tests)
             write_text(
-                directory / "prompt.txt",
-                system_prompt(interaction_mode) + "\n\n" + prompt + "\n",
+                bug_dir / "prompt.txt",
+                build_system_prompt(selected_top_k) + "\n\n" + prompt + "\n",
             )
-            conversation_path = directory / "conversation.jsonl"
+            conversation_path = bug_dir / "conversation.jsonl"
             conversation_path.unlink(missing_ok=True)
-            (directory / "response_usage.jsonl").unlink(missing_ok=True)
+            (bug_dir / "response_usage.jsonl").unlink(missing_ok=True)
+
             if dry_run:
                 status, ranking, dropped, model = "DRY_RUN", [], [], ""
                 viewed, tool_rounds, diagram_view_count = [], 0, 0
@@ -112,8 +198,8 @@ def run(
                 raw, model, viewed, tool_rounds, diagram_view_count = run_agent(
                     config,
                     prompt,
-                    uml_index,
-                    directory,
+                    bundle,
+                    bug_dir,
                     timeout,
                     conversation_path,
                     top_k=selected_top_k,
@@ -121,78 +207,75 @@ def run(
                 parsed = parse_model_response(raw)
                 if parsed is None:
                     raise ValueError("model returned invalid final ranking JSON")
-                model_ranking = validate_model_ranking_payload(
-                    parsed, selected_top_k, interaction_mode
-                )
+                model_ranking = validate_model_ranking_payload(parsed, selected_top_k)
                 viewed_set = set(viewed)
-                if interaction_mode == IMAGE_ONLY_MODE:
-                    viewed_method_ids = [
-                        method_id
-                        for node in uml_index["nodes"]
-                        if node["diagram_id"] in viewed_set
-                        for method_id in node["method_ids"]
-                    ]
-                    ranking, dropped = gate_method_id_ranking(
-                        model_ranking,
-                        [candidate["function"] for candidate in candidates],
-                        uml_index["method_catalog"],
-                        viewed_method_ids,
-                        selected_top_k,
-                    )
-                else:
-                    viewed_signatures = [
-                        signature
-                        for node in uml_index.get("nodes") or uml_index.get("segments") or []
-                        if node["diagram_id"] in viewed_set
-                        for signature in node["method_signatures"]
-                    ]
-                    ranking, dropped = gate_ranking(
-                        model_ranking,
-                        [candidate["function"] for candidate in candidates],
-                        viewed_signatures,
-                        selected_top_k,
-                    )
+                viewed_method_ids = [
+                    method_id
+                    for node in bundle["nodes"]
+                    if node["diagram_id"] in viewed_set
+                    for method_id in node["method_ids"]
+                ]
+                ranking, dropped = gate_method_id_ranking(
+                    model_ranking,
+                    candidates,
+                    suite["method_catalog"],
+                    viewed_method_ids,
+                    selected_top_k,
+                )
                 ranking, location_dropped = attach_source_locations(
                     ranking, layout.workspace_dir(project, bug)
                 )
-                returned_method_ids = (
-                    [item.method_id for item in ranking]
-                    if interaction_mode == IMAGE_ONLY_MODE else []
-                )
+                returned_method_ids = [item.method_id for item in ranking]
                 status = "OK" if ranking else "EMPTY_RANKING"
+
+            entry_to_test = {
+                str(item["entry_diagram_id"]): str(item["test_id"])
+                for item in bundle["tests"]
+            }
+            viewed_test_ids = [
+                entry_to_test[diagram_id]
+                for diagram_id in viewed
+                if diagram_id in entry_to_test
+            ]
             output = {
                 "schema": "fault-localization",
-                "schema_version": 4,
+                "schema_version": 5,
                 "project": project,
                 "bug": bug,
-                "trigger": number,
                 "status": status,
                 "model": model,
-                "interaction_mode": interaction_mode,
+                "top_k": selected_top_k,
+                "test_count": len(public_tests),
+                "tests": public_tests,
+                "viewed_test_ids": viewed_test_ids,
                 "candidate_count": len(candidates),
-                "diagram_count": int(
-                    uml_index.get("diagram_count") or len(uml_index.get("nodes") or [])
-                ),
+                "diagram_count": int(suite["diagram_count"]),
                 "tool_rounds": tool_rounds,
                 "diagram_view_count": diagram_view_count,
                 "viewed_diagrams": viewed,
                 "ranking": [item.to_dict() for item in ranking],
-                "dropped_invalid_signatures": dropped,
+                "returned_method_ids": returned_method_ids,
+                "dropped_invalid_method_ids": dropped,
                 "dropped_unresolved_source_methods": location_dropped,
             }
-            if interaction_mode == IMAGE_ONLY_MODE:
-                output["returned_method_ids"] = returned_method_ids
-                output["dropped_invalid_method_ids"] = dropped
             validate_localization(output)
             write_json(result_path, output)
             top1 = ranking[0].function if ranking else ""
-            rows.append({"project": project, "bug": bug, "trigger": number,
-                         "status": status, "top1": top1})
+            rows.append({
+                "project": project, "bug": bug, "status": status, "top1": top1,
+            })
         except Exception as error:
-            write_text(layout.stage_log_dir("localize", project, bug, number) / "error.log",
-                       str(error) + "\n")
-            rows.append({"project": project, "bug": bug, "trigger": number,
-                         "status": "ERROR", "top1": ""})
-    write_csv(layout.logs / "localize.csv", rows,
-              ["project", "bug", "trigger", "status", "top1"])
+            write_text(
+                layout.stage_log_dir("localize", project, bug) / "error.log",
+                str(error) + "\n",
+            )
+            rows.append({
+                "project": project, "bug": bug, "status": "ERROR", "top1": "",
+            })
+
+    write_csv(
+        layout.logs / "localize.csv",
+        rows,
+        ["project", "bug", "status", "top1"],
+    )
     return rows

@@ -11,12 +11,14 @@ def validate_adaptive_uml_graph(
     value: Dict[str, Any], base_dir: Path | None
 ) -> Dict[str, Any]:
     schema_version = value.get("schema_version")
-    if schema_version not in {1, 2}:
+    if schema_version not in {1, 2, 3}:
         raise ValueError("unsupported UML graph schema")
-    image_only = schema_version == 2
+    image_only = schema_version in {2, 3}
     if image_only:
-        if value.get("interaction_mode") != IMAGE_ONLY_MODE:
+        if schema_version == 2 and value.get("interaction_mode") != IMAGE_ONLY_MODE:
             raise ValueError("invalid image-only UML graph interaction mode")
+        if schema_version == 3 and "interaction_mode" in value:
+            raise ValueError("UML graph v3 is image-only and has no interaction mode")
         catalog = value.get("method_catalog")
         if not isinstance(catalog, list):
             raise ValueError("invalid UML graph method catalog")
@@ -94,6 +96,17 @@ def validate_adaptive_uml_graph(
     entry_id = value.get("entry_diagram_id")
     if not isinstance(entry_id, str) or not entry_id:
         raise ValueError("invalid UML graph entry_diagram_id")
+    if schema_version == 3:
+        test_id = value.get("test_id")
+        fingerprint = value.get("method_catalog_fingerprint")
+        if (
+            not isinstance(test_id, str)
+            or re.fullmatch(r"T\d{3,}", test_id) is None
+            or not isinstance(fingerprint, str)
+            or re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None
+            or re.fullmatch(rf"{re.escape(test_id)}-D\d{{3,}}", entry_id) is None
+        ):
+            raise ValueError("invalid UML graph v3 identity")
 
     by_id: Dict[str, Dict[str, Any]] = {}
     for index, node in enumerate(nodes):
@@ -104,6 +117,10 @@ def validate_adaptive_uml_graph(
         diagram_id = node.get("diagram_id")
         if not isinstance(diagram_id, str) or not diagram_id:
             raise ValueError(f"invalid UML graph diagram_id at index {index}")
+        if schema_version == 3 and re.fullmatch(
+            rf"{re.escape(value['test_id'])}-D\d{{3,}}", diagram_id
+        ) is None:
+            raise ValueError(f"invalid UML graph v3 diagram_id: {diagram_id}")
         if diagram_id in by_id:
             raise ValueError(f"duplicate UML graph diagram_id: {diagram_id}")
         by_id[diagram_id] = node

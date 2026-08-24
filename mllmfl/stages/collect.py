@@ -1,4 +1,3 @@
-import random
 import shutil
 from pathlib import Path
 from typing import Dict, List, Sequence
@@ -9,15 +8,6 @@ from mllmfl.infrastructure.defects4j import (
 from mllmfl.infrastructure.io import write_csv, write_json, write_text
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.process import run_command
-
-
-def select_failing_tests(tests: Sequence[str], maximum: int) -> List[str]:
-    if maximum <= 0:
-        raise ValueError("maximum failing tests must be positive")
-    if len(tests) <= maximum:
-        return list(tests)
-    selected_indices = sorted(random.sample(range(len(tests)), maximum))
-    return [tests[index] for index in selected_indices]
 
 
 def _prepare_trigger_directories(
@@ -51,10 +41,7 @@ def run(
     java_home: Path | None,
     timeout: int,
     force: bool = False,
-    max_failing_tests: int = 3,
 ) -> List[Dict[str, object]]:
-    if max_failing_tests <= 0:
-        raise ValueError("maximum failing tests must be positive")
     layout.ensure()
     env = defects4j_environment(d4j_home, java_home)
     ensure_defects4j(env)
@@ -92,7 +79,7 @@ def run(
                 )
                 continue
             available_tests = trigger_tests(workspace, env)
-            tests = select_failing_tests(available_tests, max_failing_tests)
+            tests = list(available_tests)
             _prepare_trigger_directories(layout, project, bug, tests)
             for index, test in enumerate(tests, 1):
                 output = layout.trigger_dir(project, bug, index)
@@ -113,9 +100,11 @@ def run(
                     output / "failure.txt",
                     test_output + ("\n" if test_output else ""),
                 )
+                test_id = f"T{index:03d}"
                 write_json(output / "collect.json", {
-                    "schema": "collected-trigger", "schema_version": 1,
+                    "schema": "collected-trigger", "schema_version": 2,
                     "project": project, "bug": bug, "trigger": index,
+                    "test_id": test_id,
                     "test": test, "test_exit_code": result.returncode,
                     "test_output": test_output,
                 })

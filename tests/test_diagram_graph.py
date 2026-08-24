@@ -53,6 +53,21 @@ def root_item(children):
 
 
 class DiagramGraphPlannerTests(unittest.TestCase):
+    def test_namespaces_every_diagram_and_navigation_target_by_test(self):
+        focus = root_item([
+            call_item(1, children=[call_item(2, caller="p.Child", callee="p.Leaf")])
+        ])
+        graph = plan_diagram_graph(
+            focus, 2, 8, "synthetic_execution_root", "T007"
+        )
+        ids = {node["diagram_id"] for node in graph["nodes"]}
+        linked_ids = {
+            link["diagram_id"] for node in graph["nodes"] for link in node["links"]
+        }
+        self.assertEqual(graph["entry_diagram_id"], "T007-D001")
+        self.assertTrue(all(value.startswith("T007-D") for value in ids))
+        self.assertTrue(linked_ids.issubset(ids))
+
     def test_packs_tail_of_forty_direct_children_into_one_bundle(self):
         focus = root_item([call_item(index) for index in range(1, 41)])
 

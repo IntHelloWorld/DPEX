@@ -1,24 +1,10 @@
-import base64
-import json
-import os
-import re
-import time
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Sequence
 
-import requests
-
-from mllmfl.domain.models import Ranking
 from mllmfl.domain.failure import extract_error_stack
-from mllmfl.domain.interaction import IMAGE_ONLY_MODE, TEXT_INDEX_MODE
-from mllmfl.domain.schemas import (
-    validate_candidates,
-    validate_defect_context,
-    validate_localization,
-    validate_uml_index,
-)
+from mllmfl.domain.schemas import validate_defect_context
 from mllmfl.domain.test_slice import validate_slice_metadata
-from mllmfl.infrastructure.io import append_jsonl, read_json, write_csv, write_json, write_text
+from mllmfl.infrastructure.io import read_json
 from mllmfl.infrastructure.java_source import extract_methods, find_java_file
 from mllmfl.infrastructure.layout import RunLayout
 
@@ -42,11 +28,12 @@ def invalid_final_json_retries(config: Dict[str, Any]) -> int:
 SYSTEM_PROMPT = """You are a software defect-localization agent.
 
 ## Localization Approach
-Use the error information, failing-test code, and runtime execution order shown in the linked
-sequence subgraphs to reconstruct how the defect is triggered and identify methods that could have
-caused it. Because the execution is split across connected subgraphs, repeatedly call
-view_sequence_diagram(diagram_id) with directly linked IDs to inspect additional subgraphs
-until you have enough evidence, then return the final localization result.
+The initial user message lists every failing test and its entry sequence-diagram ID. Use
+view_sequence_diagram(diagram_id) to open whichever failing-test entry is useful. An entry image is
+returned together with that test's line-numbered code, error stack, and test output. Follow linked
+Txxx-Dxxx IDs to inspect child subgraphs until you have enough evidence, then return one bug-level
+localization result. You may explore the failing tests selectively, but base every ranked method on
+a successfully viewed image.
 
 Distinguish the caller that triggers or observes the failure from a callee whose implementation
 contains the defect. A caller's proximity to the exception is evidence about the trigger path, not
@@ -55,56 +42,18 @@ returns/throws to find the earliest callee behavior that violates the expected c
 the downstream failure. Rank a caller only when its own logic is independently implicated.
 
 ## Diagram Guide
-Each image is one runtime sequence subgraph read from top to bottom. Named participants and their
-vertical lifelines represent the classes involved. Solid arrows are method calls, dashed arrows are
-returns or throws, activation bars show nested execution, call labels show execution order and
-method signatures, repetition markers denote compressed repeated executions, and TO/FROM D-xxx
-notes link adjacent subgraphs. The initial subgraph is supplied with the first request. Each viewed
-subgraph returns its visible fully qualified method signatures and directly linked subgraph IDs.
-
-## Tool-Use Preamble
-Call view_sequence_diagram at most once in each assistant response. If multiple linked images may
-be useful, choose one now and request the others in later turns. Immediately before the tool call,
-put a brief progress update in the assistant content as one JSON object with exactly these keys:
-{"evidence":"what the viewed evidence suggests","next_action":"why this image is next"}
-
-## Output Contract
-Once you have enough evidence and do not need another tool call, return only one JSON object, with
-no Markdown fence, extra text, or extra keys:
-{"ranked":[{"signature":"...","reason":"..."}]}
-The ranked array must contain one or more evidence-supported entries in descending suspiciousness
-and must not exceed the requested maximum. Copy every signature verbatim from method_signatures
-supplied with the initial subgraph or a successful tool result. Give each entry a brief,
-method-specific reason."""
-
-IMAGE_ONLY_SYSTEM_PROMPT = """You are a software defect-localization agent.
-
-## Localization Approach
-Use the error information, failing-test code, and runtime execution order shown in the linked
-sequence subgraph images to reconstruct how the defect is triggered and identify methods that could
-have caused it. Because the execution is split across connected subgraphs, repeatedly call
-view_sequence_diagram(diagram_id) with D-xxx IDs visible in viewed images to inspect additional
-subgraphs until you have enough evidence, then return the final localization result.
-
-Distinguish the caller that triggers or observes the failure from a callee whose implementation
-contains the defect. A caller's proximity to the exception is evidence about the trigger path, not
-by itself evidence that the caller is faulty. Follow arguments, state changes, calls, and
-returns/throws to find the earliest callee behavior that violates the expected contract and explains
-the downstream failure. Rank a caller only when its own logic is independently implicated.
-
-## Diagram Guide
-Each image is one runtime sequence subgraph read from top to bottom. Its title contains the D-xxx
+Each image is one runtime sequence subgraph read from top to bottom. Its title contains a Txxx-Dxxx
 diagram ID. Named participants and their vertical lifelines represent the classes involved. Solid
 arrows are method calls, dashed arrows are returns or throws, and activation bars show nested
 execution. Each call label contains a Cxxx runtime call-occurrence ID, an Mxxx method ID reused for
-the same method across images, and the readable method signature. A repetition marker denotes
-compressed repeated executions, while TO/FROM D-xxx notes link adjacent subgraphs that can be opened
-with the tool.
+the same method across all failing-test images for this bug, and the readable method signature. A
+repetition marker denotes compressed repeated executions, while TO/FROM/VIEW Txxx-Dxxx notes link
+adjacent subgraphs that can be opened with the tool.
 
 ## Tool-Use Preamble
-Call view_sequence_diagram at most once in each assistant response. If multiple linked images may
-be useful, choose one now and request the others in later turns. Immediately before the tool call,
-put a brief progress update in the assistant content as one JSON object with exactly these keys:
+Call view_sequence_diagram at most once in each assistant response. If multiple images may be useful,
+choose one now and request the others in later turns. Immediately before the tool call, put a brief
+progress update in the assistant content as one JSON object with exactly these keys:
 {"evidence":"what the viewed evidence suggests","next_action":"why this image is next"}
 
 ## Output Contract
@@ -112,44 +61,26 @@ Once you have enough evidence and do not need another tool call, return only one
 no Markdown fence, extra text, or extra keys:
 {"ranked":[{"method_id":"M001","method_signature":"add(TickUnit)","reason":"..."}]}
 The ranked array must contain one or more evidence-supported entries in descending suspiciousness
-and must not exceed the requested maximum. For every entry, copy both the method_id and the readable
+and must not exceed __TOP_K__ entries. For every entry, copy both the method_id and the readable
 method name with parameter types verbatim from the same call label in a successfully viewed image.
 The method_signature must omit the class name, as in add(TickUnit). Give each entry a brief,
 method-specific reason."""
+
 
 DIAGRAM_TOOL = {
     "type": "function",
     "name": "view_sequence_diagram",
     "description": (
-        "Open one directly linked sequence subgraph and return its image, visible fully-qualified "
-        "method signatures, folds, and links to adjacent subgraphs."
+        "Open an accessible sequence-diagram image. Entry IDs listed in the initial message are "
+        "always accessible and also return their failing-test details. Child diagrams return only "
+        "the image and must be directly linked from a diagram already viewed."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "diagram_id": {
                 "type": "string",
-                "description": "Exact directly linked diagram ID returned by a viewed subgraph.",
-            }
-        },
-        "required": ["diagram_id"],
-        "additionalProperties": False,
-    },
-}
-
-IMAGE_ONLY_DIAGRAM_TOOL = {
-    "type": "function",
-    "name": "view_sequence_diagram",
-    "description": (
-        "Open one directly linked sequence subgraph image. The target D-xxx ID must be visible "
-        "in a subgraph image that has already been viewed."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "diagram_id": {
-                "type": "string",
-                "description": "Exact linked D-xxx diagram ID visible in a viewed image.",
+                "description": "Exact Txxx-Dxxx entry or linked diagram ID.",
             }
         },
         "required": ["diagram_id"],
@@ -158,18 +89,10 @@ IMAGE_ONLY_DIAGRAM_TOOL = {
 }
 
 
-def system_prompt(interaction_mode: str) -> str:
-    return (
-        IMAGE_ONLY_SYSTEM_PROMPT
-        if interaction_mode == IMAGE_ONLY_MODE else SYSTEM_PROMPT
-    )
-
-
-def diagram_tool(interaction_mode: str) -> Dict[str, Any]:
-    return (
-        IMAGE_ONLY_DIAGRAM_TOOL
-        if interaction_mode == IMAGE_ONLY_MODE else DIAGRAM_TOOL
-    )
+def build_system_prompt(top_k: int) -> str:
+    if top_k <= 0:
+        raise ValueError("top_k must be positive")
+    return SYSTEM_PROMPT.replace("__TOP_K__", str(top_k))
 
 
 def _numbered_code(code: str, start_line: int) -> str:
@@ -260,57 +183,24 @@ def defect_output_context(
     return error_stack, test_output
 
 
-def build_prompt(
-    test: str,
-    test_code: str,
-    error_stack: str,
-    test_output: str,
-    uml_index: Dict[str, Any],
-    top_k: int,
-    interaction_mode: str = TEXT_INDEX_MODE,
-) -> str:
-    rendered_test_output = test_output if test_output else "(empty)"
-    complete_trace = str(uml_index.get("strategy") or "").startswith("synthetic-root")
-    code_heading = (
-        "Failing-Test Code With Original Line Numbers"
-        if complete_trace else "Sliced Failing-Test Code With Original Line Numbers"
-    )
-    nodes = {item["diagram_id"]: item for item in uml_index.get("nodes") or []}
-    entry_id = str(uml_index["entry_diagram_id"])
-    entry = nodes[entry_id]
-    if interaction_mode == IMAGE_ONLY_MODE:
-        return f"""[Failing Test] {test}
+def build_prompt(tests: Sequence[Dict[str, Any]]) -> str:
+    if not tests:
+        raise ValueError("failing tests must be non-empty")
+    lines = ["[Failing Tests]"]
+    for item in tests:
+        lines.append(
+            f"{item['test_id']} | {item['test']} | Entry: {item['entry_diagram_id']}"
+        )
+    return "\n".join(lines)
 
-[{code_heading}]
-{test_code}
 
-[Error Stack]
-{error_stack}
-
-[Test Output]
-{rendered_test_output}
-
-[Task Parameters]
-Maximum ranked methods: {top_k}"""
-    return f"""[Failing Test] {test}
-
-[{code_heading}]
-{test_code}
-
-[Error Stack]
-{error_stack}
-
-[Test Output]
-{rendered_test_output}
-
-[Task Parameters]
-Maximum ranked methods: {top_k}
-
-[Initial Sequence Subgraph]
-ID: `{entry_id}`
-Entry: `{entry['entry_signature']}`
-Visible Units: {int(entry['visible_unit_count'])}
-Participants: {int(entry['participant_count'])}
-
-The initial subgraph image, its visible method signatures, folds, and direct links are supplied
-with this request."""
+def entry_failure_context(item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "diagram_id": str(item["entry_diagram_id"]),
+        "test_id": str(item["test_id"]),
+        "failing_test": str(item["test"]),
+        "test_code": str(item["test_code"]),
+        "error_stack": str(item["error_stack"]),
+        "test_output": str(item["test_output"] or "(empty)"),
+    }

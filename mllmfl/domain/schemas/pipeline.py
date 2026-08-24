@@ -72,9 +72,10 @@ def validate_defect_context(value: Any) -> Dict[str, Any]:
 def validate_localization(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("localization artifact must be a JSON object")
-    if value.get("schema") != "fault-localization" or value.get("schema_version") not in {1, 2, 3, 4}:
+    if value.get("schema") != "fault-localization" or value.get("schema_version") not in {1, 2, 3, 4, 5}:
         raise ValueError("unsupported localization schema")
-    if value.get("schema_version") in {2, 3, 4}:
+    schema_version = value["schema_version"]
+    if schema_version in {2, 3, 4, 5}:
         viewed = value.get("viewed_diagrams")
         counts = (
             value.get("diagram_count"),
@@ -91,9 +92,53 @@ def validate_localization(value: Any) -> Dict[str, Any]:
             raise ValueError("invalid localization diagram audit counts")
         if len(viewed) > value["diagram_count"] or len(viewed) > value["diagram_view_count"]:
             raise ValueError("inconsistent localization diagram audit counts")
+    if schema_version == 5:
+        if (
+            not all(
+                isinstance(value.get(field), str) and value[field].strip()
+                for field in ("project", "bug", "status")
+            )
+            or not isinstance(value.get("model"), str)
+        ):
+            raise ValueError("invalid bug-level localization identity")
+        top_k = value.get("top_k")
+        tests = value.get("tests")
+        viewed_test_ids = value.get("viewed_test_ids")
+        if not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("invalid bug-level localization top_k")
+        if not isinstance(tests, list) or not tests or value.get("test_count") != len(tests):
+            raise ValueError("invalid bug-level localization tests")
+        expected_test_ids = []
+        entry_by_test = {}
+        for index, test in enumerate(tests, 1):
+            test_id = f"T{index:03d}"
+            if (
+                not isinstance(test, dict)
+                or test.get("test_id") != test_id
+                or not isinstance(test.get("test"), str)
+                or "::" not in test["test"]
+                or not isinstance(test.get("entry_diagram_id"), str)
+                or re.fullmatch(rf"{test_id}-D\d{{3,}}", test["entry_diagram_id"])
+                is None
+            ):
+                raise ValueError(f"invalid bug-level localization test at index {index - 1}")
+            expected_test_ids.append(test_id)
+            entry_by_test[test_id] = test["entry_diagram_id"]
+        if (
+            not isinstance(viewed_test_ids, list)
+            or len(viewed_test_ids) != len(set(viewed_test_ids))
+            or not all(item in expected_test_ids for item in viewed_test_ids)
+            or any(entry_by_test[item] not in value["viewed_diagrams"] for item in viewed_test_ids)
+            or not isinstance(value.get("candidate_count"), int)
+            or value["candidate_count"] < 0
+        ):
+            raise ValueError("invalid bug-level localization test audit")
+
     ranking = value.get("ranking")
     if not isinstance(ranking, list):
         raise ValueError("ranking must be an array")
+    if schema_version == 5 and len(ranking) > value["top_k"]:
+        raise ValueError("bug-level localization ranking exceeds top_k")
     seen = set()
     seen_signatures = set()
     seen_locations = set()
@@ -101,19 +146,19 @@ def validate_localization(value: Any) -> Dict[str, Any]:
         if not isinstance(item, dict) or not str(item.get("function") or "").strip():
             raise ValueError(f"invalid ranking at index {index}")
         function = str(item["function"])
-        if value.get("schema_version") not in {3, 4} and function in seen:
+        if schema_version not in {3, 4, 5} and function in seen:
             raise ValueError(f"duplicate ranking function: {function}")
         seen.add(function)
-        if value.get("schema_version") in {3, 4}:
+        if schema_version in {3, 4, 5}:
             signature = item.get("signature")
             if not isinstance(signature, str) or not signature.strip():
                 raise ValueError(f"invalid ranking signature at index {index}")
-            if value.get("schema_version") == 3 and signature in seen_signatures:
+            if schema_version == 3 and signature in seen_signatures:
                 raise ValueError(f"duplicate ranking signature: {signature}")
             if signature.rsplit("(", 1)[0] != function:
                 raise ValueError(f"ranking signature does not match function at index {index}")
             seen_signatures.add(signature)
-        if value.get("schema_version") == 4:
+        if schema_version in {4, 5}:
             location_key = _method_location_key(item, index, "ranking")
             if location_key in seen_locations:
                 raise ValueError(f"duplicate ranking source location: {location_key}")
@@ -125,9 +170,11 @@ def validate_localization(value: Any) -> Dict[str, Any]:
         if rank != index + 1:
             raise ValueError(f"non-contiguous rank at index {index}")
     interaction_mode = value.get("interaction_mode")
-    if interaction_mode not in {None, "text_index", "image_only"}:
+    if schema_version == 5 and "interaction_mode" in value:
+        raise ValueError("bug-level localization is image-only and has no interaction mode")
+    if schema_version != 5 and interaction_mode not in {None, "text_index", "image_only"}:
         raise ValueError("invalid localization interaction_mode")
-    if interaction_mode == "image_only":
+    if schema_version == 5 or interaction_mode == "image_only":
         returned_ids = value.get("returned_method_ids")
         dropped_ids = value.get("dropped_invalid_method_ids")
         if (
@@ -145,13 +192,13 @@ def validate_localization(value: Any) -> Dict[str, Any]:
     elif "returned_method_ids" in value or "dropped_invalid_method_ids" in value:
         raise ValueError("method ID audit requires image_only interaction mode")
     source_dropped = value.get("dropped_unresolved_source_methods")
-    if value.get("schema_version") == 4:
+    if schema_version in {4, 5}:
         if not isinstance(source_dropped, list) or not all(
             isinstance(item, str) and item.strip() for item in source_dropped
         ):
             raise ValueError("invalid unresolved source method audit")
     elif source_dropped is not None:
-        raise ValueError("unresolved source method audit requires localization v4")
+        raise ValueError("unresolved source method audit requires localization v4 or v5")
     return value
 
 

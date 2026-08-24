@@ -52,7 +52,15 @@ class RunLayout:
                 bug = bug_dir.name.removeprefix("bug_")
                 if bugs and bug not in bugs:
                     continue
-                for trigger_dir in sorted((bug_dir / "triggers").glob("trigger_*")):
+                trigger_dirs = [
+                    path
+                    for path in (bug_dir / "triggers").glob("trigger_*")
+                    if path.name.removeprefix("trigger_").isdigit()
+                ]
+                for trigger_dir in sorted(
+                    trigger_dirs,
+                    key=lambda path: int(path.name.removeprefix("trigger_")),
+                ):
                     number = trigger_dir.name.removeprefix("trigger_")
                     if trigger and number != trigger:
                         continue

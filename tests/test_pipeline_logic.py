@@ -9,11 +9,7 @@ from unittest.mock import patch
 
 from mllmfl.cli import build_parser
 from mllmfl.domain.failure import extract_error_stack
-from mllmfl.domain.interaction import (
-    IMAGE_ONLY_MODE,
-    TEXT_INDEX_MODE,
-    localization_interaction_mode,
-)
+from mllmfl.domain.interaction import IMAGE_ONLY_MODE
 from mllmfl.domain.schemas import (
     validate_candidates,
     validate_defect_context,
@@ -23,16 +19,15 @@ from mllmfl.domain.schemas import (
 from mllmfl.infrastructure.java_source import extract_methods
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.process import CommandResult, run_command
-from mllmfl.stages import aggregate, collect
+from mllmfl.stages import aggregate, collect, localize
 from mllmfl.stages.aggregate import aggregate_rankings
 from mllmfl.stages.localize import (
-    IMAGE_ONLY_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     _post_response,
     build_prompt,
+    build_system_prompt,
     defect_output_context,
     gate_method_id_ranking,
-    gate_ranking,
     parse_model_response,
     run_agent,
     test_code_context,
@@ -103,102 +98,59 @@ class LocalizationTests(unittest.TestCase):
         self.assertIn("\n", SYSTEM_PROMPT)
         self.assertIn("software defect-localization agent", SYSTEM_PROMPT)
         self.assertIn("## Localization Approach", SYSTEM_PROMPT)
-        self.assertIn("reconstruct how the defect is triggered", SYSTEM_PROMPT)
         self.assertIn("until you have enough evidence", SYSTEM_PROMPT)
         self.assertIn("## Diagram Guide", SYSTEM_PROMPT)
-        self.assertIn("Solid arrows are method calls", SYSTEM_PROMPT)
-        self.assertIn("TO/FROM D-xxx", SYSTEM_PROMPT)
-        for prompt in (SYSTEM_PROMPT, IMAGE_ONLY_SYSTEM_PROMPT):
-            self.assertIn("Distinguish the caller", prompt)
-            self.assertIn("callee whose implementation", prompt)
-            self.assertIn("trigger path", prompt)
-            self.assertIn("Rank a caller only", prompt)
-            self.assertIn("## Tool-Use Preamble", prompt)
-            self.assertIn("at most once in each assistant response", prompt)
-            self.assertIn('"evidence":', prompt)
-            self.assertIn('"next_action":', prompt)
-            self.assertIn("request the others in later turns", prompt)
-            self.assertNotIn("Observation:", prompt)
-            self.assertNotIn("Hypothesis:", prompt)
+        self.assertIn("arrows are method calls", SYSTEM_PROMPT)
+        self.assertIn("TO/FROM/VIEW Txxx-Dxxx", SYSTEM_PROMPT)
+        self.assertIn("Distinguish the caller", SYSTEM_PROMPT)
+        self.assertIn("callee whose implementation", SYSTEM_PROMPT)
+        self.assertIn("trigger path", SYSTEM_PROMPT)
+        self.assertIn("Rank a caller only", SYSTEM_PROMPT)
+        self.assertIn("## Tool-Use Preamble", SYSTEM_PROMPT)
+        self.assertIn("at most once in each assistant response", SYSTEM_PROMPT)
+        self.assertIn('"evidence":', SYSTEM_PROMPT)
+        self.assertIn('"next_action":', SYSTEM_PROMPT)
+        self.assertIn("request the others in later turns", SYSTEM_PROMPT)
+        self.assertNotIn("Observation:", SYSTEM_PROMPT)
+        self.assertNotIn("Hypothesis:", SYSTEM_PROMPT)
         self.assertIn("## Output Contract", SYSTEM_PROMPT)
         self.assertNotIn("GROUP", SYSTEM_PROMPT)
         self.assertNotIn("PAGE", SYSTEM_PROMPT)
         self.assertIn("view_sequence_diagram(diagram_id)", SYSTEM_PROMPT)
-        self.assertIn('{"ranked":[{"signature":"...","reason":"..."}]}', SYSTEM_PROMPT)
-        self.assertIn("\n", IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn("## Localization Approach", IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn("## Diagram Guide", IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn("## Output Contract", IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn("Cxxx", IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn("Mxxx", IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn("runtime call-occurrence ID", IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn('"method_id":"M001"', IMAGE_ONLY_SYSTEM_PROMPT)
-        self.assertIn('"method_signature":"add(TickUnit)"', IMAGE_ONLY_SYSTEM_PROMPT)
+        self.assertIn("Cxxx", SYSTEM_PROMPT)
+        self.assertIn("Mxxx", SYSTEM_PROMPT)
+        self.assertIn("runtime call-occurrence ID", SYSTEM_PROMPT)
+        self.assertIn('"method_id":"M001"', SYSTEM_PROMPT)
+        self.assertIn('"method_signature":"add(TickUnit)"', SYSTEM_PROMPT)
+        self.assertIn("must not exceed 3 entries", build_system_prompt(3))
+        self.assertNotIn("__TOP_K__", build_system_prompt(3))
 
     def test_initial_prompt_omits_candidates_project_and_bug(self):
-        prompt = build_prompt(
-            "p.Test::testCase", "1 | run();", "p.Error: bad\n\tat p.Test.testCase(Test.java:1)",
-            "", {
-                "entry_diagram_id": "D-001",
-                "nodes": [self.graph_node("D-001")],
-            }, 1,
-        )
+        prompt = build_prompt([{
+            "test_id": "T001", "test": "p.Test::testCase",
+            "entry_diagram_id": "T001-D001",
+        }])
         self.assertNotIn("[Candidate Functions]", prompt)
         self.assertNotIn("[Project]", prompt)
         self.assertNotIn("[Bug]", prompt)
         self.assertNotIn("candidate", SYSTEM_PROMPT.lower())
-        self.assertIn("[Sliced Failing-Test Code With Original Line Numbers]\n1 | run();", prompt)
-        self.assertIn("[Error Stack]\np.Error: bad", prompt)
-        self.assertIn("[Test Output]\n(empty)", prompt)
+        self.assertIn("T001 | p.Test::testCase | Entry: T001-D001", prompt)
+        self.assertNotIn("Error Stack", prompt)
+        self.assertNotIn("Test Output", prompt)
+        self.assertNotIn("test_code", prompt)
 
-    def test_initial_prompt_identifies_preloaded_sequence_subgraph(self):
-        prompt = build_prompt(
-            "p.Test::testCase", "1 | run();", "p.Error: bad", "", {
-                "entry_diagram_id": "D-001",
-                "nodes": [self.graph_node(
-                    "D-001", entry_signature="p.Service.run(int)",
-                    visible_calls=5, visible_units=6, participants=3,
-                )],
-            }, 1,
-        )
-        self.assertIn("[Initial Sequence Subgraph]", prompt)
-        self.assertIn("ID: `D-001`", prompt)
-        self.assertIn("Entry: `p.Service.run(int)`", prompt)
-        self.assertIn("Visible Units: 6", prompt)
-        self.assertNotIn("PAGE", prompt)
-
-    def test_initial_prompt_labels_complete_trace_diagram(self):
-        prompt = build_prompt(
-            "p.Test::testCase", "1 | run();", "p.Error: bad", "",
-            {
-                "strategy": "synthetic-root-adaptive-graph",
-                "entry_diagram_id": "D-001",
-                "nodes": [self.graph_node(
-                    "D-001", entry_signature="execution root",
-                    origin_test_line=0, visible_calls=7, visible_units=7,
-                )],
-            },
-            1,
-        )
-        self.assertIn("[Failing-Test Code With Original Line Numbers]", prompt)
-        self.assertIn("[Initial Sequence Subgraph]", prompt)
-
-    def test_image_only_prompt_has_no_text_index_or_method_signature(self):
-        prompt = build_prompt(
-            "p.Test::testCase", "1 | run();", "p.Error: bad", "", {
-                "entry_diagram_id": "D-001",
-                "nodes": [self.graph_node(
-                    "D-001", entry_signature="p.Service.run(int)",
-                    signatures=["p.Service.run(int)"],
-                )],
-            }, 1, IMAGE_ONLY_MODE,
-        )
+    def test_initial_prompt_lists_all_entries_without_images_or_details(self):
+        prompt = build_prompt([
+            {"test_id": "T001", "test": "p.A::one", "entry_diagram_id": "T001-D001"},
+            {"test_id": "T002", "test": "p.B::two", "entry_diagram_id": "T002-D001"},
+        ])
         self.assertNotIn("p.Service.run", prompt)
-        self.assertNotIn("ID: `D-001`", prompt)
         self.assertNotIn("Visible Units", prompt)
         self.assertNotIn("[Initial Sequence Subgraph]", prompt)
-        self.assertNotIn("initial subgraph image is supplied", prompt.lower())
-        self.assertIn("[Task Parameters]\nMaximum ranked methods: 1", prompt)
+        self.assertIn("T001 | p.A::one | Entry: T001-D001", prompt)
+        self.assertIn("T002 | p.B::two | Entry: T002-D001", prompt)
+        self.assertNotIn("Task Parameters", prompt)
+        self.assertNotIn("Maximum ranked methods", prompt)
         self.assertNotIn('"ranked"', prompt)
         self.assertNotIn('"method_id"', prompt)
 
@@ -220,9 +172,10 @@ class LocalizationTests(unittest.TestCase):
         self.assertIsNone(parse_model_response("not json"))
 
     def test_model_ranking_payload_accepts_up_to_top_k_entries(self):
-        value = {"ranked": [
-            {"signature": "p.A.run(int)", "reason": "evidence"},
-        ]}
+        value = {"ranked": [{
+            "method_id": "M001", "method_signature": "run(int)",
+            "reason": "evidence",
+        }]}
         self.assertEqual(validate_model_ranking_payload(value, 1), value["ranked"])
         self.assertEqual(validate_model_ranking_payload(value, 2), value["ranked"])
         with self.assertRaisesRegex(ValueError, "between 1 and 2"):
@@ -233,30 +186,12 @@ class LocalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid model ranking entry"):
             validate_model_ranking_payload(value, 1)
 
-        image_value = {"ranked": [
-            {
-                "method_id": "M001", "method_signature": "run(int)",
-                "reason": "evidence",
-            },
-        ]}
-        self.assertEqual(
-            validate_model_ranking_payload(image_value, 1, IMAGE_ONLY_MODE),
-            image_value["ranked"],
-        )
-        image_value["ranked"][0]["method_id"] = "C001"
+        value["ranked"][0].pop("function")
+        value["ranked"][0]["method_id"] = "C001"
         with self.assertRaisesRegex(ValueError, "invalid model ranking method_id"):
-            validate_model_ranking_payload(image_value, 1, IMAGE_ONLY_MODE)
+            validate_model_ranking_payload(value, 1)
 
-    def test_gates_and_deduplicates_candidates(self):
-        ranking, dropped = gate_ranking([
-            {"signature": "p.A.run(int)"}, {"signature": "p.A.run(int)"},
-            {"signature": "p.A.run(Integer)"},
-        ], ["p.A.run"], ["p.A.run(int)"], 5)
-        self.assertEqual([item.function for item in ranking], ["p.A.run"])
-        self.assertEqual([item.signature for item in ranking], ["p.A.run(int)"])
-        self.assertEqual(dropped, ["p.A.run(Integer)"])
-
-    def test_gates_image_methods_in_requested_match_priority(self):
+    def test_gates_image_methods_by_exact_pair_then_unique_signature(self):
         catalog = [
             {"method_id": "M001", "function": "p.A.run",
              "signature": "p.A.run(int)", "descriptor": "(I)V"},
@@ -272,7 +207,7 @@ class LocalizationTests(unittest.TestCase):
             },
             {
                 "method_id": "M002", "method_signature": "add(TickUnit)",
-                "reason": "ID takes precedence over a conflicting signature",
+                "reason": "conflicting ID is corrected by the unique signature",
             },
             {
                 "method_id": "M999", "method_signature": "add(TickUnit)",
@@ -286,9 +221,30 @@ class LocalizationTests(unittest.TestCase):
             ["M001", "M002", "M003"], 5)
         self.assertEqual(
             [item.function for item in ranking],
-            ["p.A.run", "p.B.work", "p.C.add"],
+            ["p.A.run", "p.C.add"],
+        )
+        self.assertEqual(
+            [item.method_id for item in ranking],
+            ["M001", "M003"],
         )
         self.assertEqual(dropped, ["M998"])
+
+    def test_drops_conflicting_id_when_signature_is_not_unique(self):
+        catalog = [
+            {"method_id": "M001", "function": "p.A.run",
+             "signature": "p.A.run()", "descriptor": "()V"},
+            {"method_id": "M002", "function": "p.B.add",
+             "signature": "p.B.add(TickUnit)", "descriptor": "(Lx/TickUnit;)V"},
+            {"method_id": "M003", "function": "p.C.add",
+             "signature": "p.C.add(TickUnit)", "descriptor": "(Ly/TickUnit;)V"},
+        ]
+        ranking, dropped = gate_method_id_ranking([{
+            "method_id": "M001", "method_signature": "add(TickUnit)",
+            "reason": "conflicting and ambiguous",
+        }], ["p.A.run", "p.B.add", "p.C.add"], catalog,
+            ["M001", "M002", "M003"], 5)
+        self.assertEqual(ranking, [])
+        self.assertEqual(dropped, ["M001"])
 
     def test_signature_only_fallback_rejects_ambiguous_or_unviewed_methods(self):
         catalog = [
@@ -397,6 +353,34 @@ class LocalizationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "duplicate ranking source location"):
             validate_localization(value)
 
+    def test_localization_v5_validates_bug_level_test_and_diagram_audit(self):
+        value = {
+            "schema": "fault-localization", "schema_version": 5,
+            "project": "P", "bug": "1", "status": "OK", "model": "vision",
+            "top_k": 1, "test_count": 2,
+            "tests": [
+                {"test_id": "T001", "test": "p.A::one",
+                 "entry_diagram_id": "T001-D001"},
+                {"test_id": "T002", "test": "p.B::two",
+                 "entry_diagram_id": "T002-D001"},
+            ],
+            "viewed_test_ids": ["T002"], "candidate_count": 3,
+            "diagram_count": 3, "tool_rounds": 2, "diagram_view_count": 2,
+            "viewed_diagrams": ["T002-D001", "T002-D002"],
+            "returned_method_ids": ["M007"],
+            "dropped_invalid_method_ids": [],
+            "dropped_unresolved_source_methods": [],
+            "ranking": [{
+                "function": "p.Service.work", "signature": "p.Service.work()",
+                "rank": 1, "source_file": "src/p/Service.java",
+                "start_line": 3, "end_line": 7,
+            }],
+        }
+        self.assertIs(validate_localization(value), value)
+        value["tests"][1]["entry_diagram_id"] = "T001-D002"
+        with self.assertRaisesRegex(ValueError, "test at index 1"):
+            validate_localization(value)
+
     def test_test_code_requires_and_uses_slice(self):
         with tempfile.TemporaryDirectory() as directory:
             layout = RunLayout(Path(directory))
@@ -484,8 +468,8 @@ class LocalizationTests(unittest.TestCase):
             }]}, "resp-1"),
             self.agent_response(
                 {"content": (
-                    '{"ranked":[{"signature":"p.Service.run()",'
-                    '"reason":"evidence"}]}'
+                    '{"ranked":[{"method_id":"M001",'
+                    '"method_signature":"run()","reason":"evidence"}]}'
                 )},
                 "resp-2",
             ),
@@ -515,24 +499,23 @@ class LocalizationTests(unittest.TestCase):
                 {}, "prompt", index, root, 30, conversation
             )
             conversation_text = conversation.read_text()
-        self.assertIn("p.Service.run", raw)
+        self.assertIn('"method_id":"M001"', raw)
         self.assertEqual(model, "vision")
         self.assertEqual(viewed, ["D-001", "D-002"])
         self.assertEqual((rounds, views), (1, 2))
         initial_content = post.call_args_list[0].args[1][0]["content"]
         self.assertEqual(
             [part["type"] for part in initial_content],
-            ["text", "text", "image_url"],
+            ["text", "image_url"],
         )
         second_input = post.call_args_list[1].args[1]
         self.assertEqual(second_input[-1]["role"], "user")
-        self.assertEqual(second_input[-1]["content"][1]["type"], "image_url")
+        self.assertEqual(second_input[-1]["content"][0]["type"], "image_url")
         tool_output = second_input[-2]
-        self.assertIn("p.Helper.work(int)", second_input[-1]["content"][0]["text"])
-        self.assertIn("Visible Units: 2 | Participants: 2", second_input[-1]["content"][0]["text"])
         self.assertEqual(tool_output["role"], "tool")
-        self.assertEqual(json.loads(tool_output["content"])["origin_test_line"], 42)
-        self.assertEqual(json.loads(tool_output["content"])["visible_calls"], 2)
+        self.assertEqual(json.loads(tool_output["content"]), {
+            "ok": True, "diagram_id": "D-002",
+        })
         self.assertEqual(
             [item.get("type") or item.get("role") for item in second_input],
             ["user", "message", "function_call", "tool", "user"],
@@ -545,7 +528,7 @@ class LocalizationTests(unittest.TestCase):
             ],
         )
         self.assertIn("setup-state inconsistency", records[2]["content"])
-        self.assertEqual(records[4]["content"][1], {
+        self.assertEqual(records[4]["content"][0], {
             "type": "image_ref", "diagram_id": "D-002",
         })
         self.assertEqual(post.call_count, 2)
@@ -556,6 +539,69 @@ class LocalizationTests(unittest.TestCase):
         self.assertNotIn("json_output", post.call_args_list[1].kwargs)
         self.assertNotIn("enable_tools", post.call_args_list[1].kwargs)
         self.assertNotIn("data:image", conversation_text)
+
+    @patch("mllmfl.stages.localize._post_response")
+    def test_bug_level_agent_opens_entries_with_details_and_children_without_them(
+        self, post
+    ):
+        post.side_effect = [
+            self.agent_response({"tool_calls": [{"id": "entry", "function": {
+                "name": "view_sequence_diagram",
+                "arguments": '{"diagram_id":"T002-D001"}',
+            }}]}, "resp-1"),
+            self.agent_response({"tool_calls": [{"id": "child", "function": {
+                "name": "view_sequence_diagram",
+                "arguments": '{"diagram_id":"T002-D002"}',
+            }}]}, "resp-2"),
+            self.agent_response({"content": (
+                '{"ranked":[{"method_id":"M007",'
+                '"method_signature":"work()","reason":"evidence"}]}'
+            )}, "resp-3"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("one.png", "two.png", "child.png"):
+                (root / name).write_bytes(b"png")
+            bundle = {
+                "tests": [
+                    {
+                        "test_id": "T001", "test": "p.A::one",
+                        "entry_diagram_id": "T001-D001", "test_code": "1 | one();",
+                        "error_stack": "p.Error: one", "test_output": "one output",
+                    },
+                    {
+                        "test_id": "T002", "test": "p.B::two",
+                        "entry_diagram_id": "T002-D001", "test_code": "2 | two();",
+                        "error_stack": "p.Error: two", "test_output": "two output",
+                    },
+                ],
+                "nodes": [
+                    self.graph_node("T001-D001", image="one.png"),
+                    self.graph_node("T002-D001", image="two.png", links=[{
+                        "direction": "TO", "diagram_id": "T002-D002",
+                        "relation": "EXPAND_CALL", "invocation_ids": [2],
+                    }]),
+                    self.graph_node("T002-D002", image="child.png", links=[{
+                        "direction": "FROM", "diagram_id": "T002-D001",
+                        "relation": "EXPAND_CALL", "invocation_ids": [2],
+                    }]),
+                ],
+            }
+            raw, _, viewed, rounds, views = run_agent(
+                {}, "prompt", bundle, root, 30
+            )
+
+        first_content = post.call_args_list[0].args[1][0]["content"]
+        self.assertEqual([part["type"] for part in first_content], ["text"])
+        entry_output = json.loads(post.call_args_list[1].args[1][-2]["content"])
+        self.assertEqual(entry_output["test_id"], "T002")
+        self.assertEqual(entry_output["error_stack"], "p.Error: two")
+        self.assertEqual(entry_output["test_code"], "2 | two();")
+        child_output = json.loads(post.call_args_list[2].args[1][-2]["content"])
+        self.assertEqual(child_output, {"ok": True, "diagram_id": "T002-D002"})
+        self.assertEqual(viewed, ["T002-D001", "T002-D002"])
+        self.assertEqual((rounds, views), (2, 2))
+        self.assertIn('"method_id":"M007"', raw)
 
     @patch("mllmfl.stages.localize._post_response")
     def test_agent_replays_complete_local_history_every_turn(self, post):
@@ -826,8 +872,8 @@ class LocalizationTests(unittest.TestCase):
                 "arguments": '{"diagram_id":"missing"}',
             }}]}, "resp-1"),
             self.agent_response({"content": (
-                '{"ranked":[{"signature":"p.Service.run()",'
-                '"reason":"evidence"}]}'
+                '{"ranked":[{"method_id":"M001",'
+                '"method_signature":"run()","reason":"evidence"}]}'
             )}, "resp-2"),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -839,7 +885,7 @@ class LocalizationTests(unittest.TestCase):
                     "nodes": [self.graph_node("D-001", image="entry.png")],
                 }, root, 30,
             )
-        self.assertIn('"signature":"p.Service.run()"', raw)
+        self.assertIn('"method_id":"M001"', raw)
         self.assertEqual((viewed, rounds, views), (["D-001"], 1, 1))
         second_input = post.call_args_list[1].args[1]
         self.assertIn("unknown diagram_id", second_input[-1]["content"])
@@ -858,8 +904,8 @@ class LocalizationTests(unittest.TestCase):
                  "arguments": '{"diagram_id":"L1-004"}'}},
             ]}, "resp-1"),
             self.agent_response({"content": (
-                '{"ranked":[{"signature":"p.A.one()",'
-                '"reason":"evidence"}]}'
+                '{"ranked":[{"method_id":"M001",'
+                '"method_signature":"one()","reason":"evidence"}]}'
             )}, "resp-2"),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -902,7 +948,7 @@ class LocalizationTests(unittest.TestCase):
         image_message = post.call_args_list[1].args[1][-1]
         self.assertEqual(
             [part["type"] for part in image_message["content"]],
-            ["text", "image_url"],
+            ["image_url"],
         )
         tool_results = [
             item for item in post.call_args_list[1].args[1]
@@ -1123,6 +1169,26 @@ class UMLIndexTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid UML graph method IDs"):
             validate_uml_index(value)
 
+    def test_validates_v3_test_namespaced_diagram_ids(self):
+        value = self._graph_index()
+        value.update({
+            "schema_version": 3,
+            "test_id": "T001",
+            "method_catalog_fingerprint": "a" * 64,
+            "entry_diagram_id": "T001-D001",
+            "method_catalog": [{
+                "method_id": "M007", "function": "p.Service.run",
+                "signature": "p.Service.run()", "descriptor": "()V",
+            }],
+        })
+        value["nodes"][0].update({
+            "diagram_id": "T001-D001", "method_ids": ["M007"],
+        })
+        self.assertIs(validate_uml_index(value), value)
+        value["nodes"][0]["diagram_id"] = "T002-D001"
+        with self.assertRaisesRegex(ValueError, "v3 diagram_id"):
+            validate_uml_index(value)
+
     def test_validates_files_and_rejects_unsafe_paths(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1218,6 +1284,106 @@ class UMLIndexTests(unittest.TestCase):
             validate_uml_index(value)
 
 
+class BugLevelLocalizationStageTests(unittest.TestCase):
+    def test_dry_run_processes_all_tests_once_and_writes_v5(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            bug_dir = layout.artifacts / "P" / "bug_1"
+            catalog = [{
+                "method_id": "M001", "function": "p.Service.run",
+                "signature": "p.Service.run()", "descriptor": "()V",
+            }]
+            fingerprint = "a" * 64
+            suite_tests = []
+            for number, test in enumerate(("p.A::one", "p.B::two"), 1):
+                test_id = f"T{number:03d}"
+                entry_id = f"{test_id}-D001"
+                trigger = layout.trigger_dir("P", "1", number)
+                diagrams = trigger / "sequence_diagrams"
+                diagrams.mkdir(parents=True)
+                (diagrams / f"{entry_id}.puml").write_text(
+                    "@startuml\n@enduml\n", encoding="utf-8"
+                )
+                (diagrams / f"{entry_id}.png").write_bytes(b"png")
+                graph = {
+                    "schema": "execution-uml-graph", "schema_version": 3,
+                    "test_id": test_id,
+                    "method_catalog_fingerprint": fingerprint,
+                    "source_schema": "fullchain-execution",
+                    "strategy": "test-root-adaptive-graph",
+                    "entry_reason": "test_invocation", "slice_applied": True,
+                    "test": {"class": test.split("::")[0], "method": test.split("::")[1]},
+                    "root_invocation_id": 1, "max_visible_units": 24,
+                    "max_participants_per_image": 8, "trace_call_count": 1,
+                    "layout_root_call_count": 0, "source_call_count": 1,
+                    "partitioned_call_count": 1, "excluded_call_count": 0,
+                    "entry_diagram_id": entry_id, "node_count": 1,
+                    "diagram_count": 1, "method_catalog": catalog,
+                    "nodes": [{
+                        "diagram_id": entry_id, "focus_invocation_id": 1,
+                        "entry_signature": "p.Service.run()", "origin_test_line": 1,
+                        "represented_call_count": 1, "visible_call_count": 1,
+                        "visible_unit_count": 1, "participant_count": 2,
+                        "method_signatures": ["p.Service.run()"],
+                        "method_ids": ["M001"], "folds": [], "links": [],
+                        "puml": f"sequence_diagrams/{entry_id}.puml",
+                        "image": f"sequence_diagrams/{entry_id}.png",
+                    }],
+                }
+                (trigger / "uml.json").write_text(json.dumps(graph), encoding="utf-8")
+                (trigger / "trigger_test.txt").write_text(test + "\n", encoding="utf-8")
+                (trigger / "candidates.json").write_text(json.dumps({
+                    "schema": "fault-candidates", "schema_version": 1,
+                    "summary_generation": "disabled",
+                    "candidates": [{
+                        "function": "p.Service.run", "summary": "",
+                        "status": "SUMMARY_DISABLED",
+                    }],
+                }), encoding="utf-8")
+                (trigger / "test_slice.json").write_text(json.dumps({
+                    "schema": "test-boundary-slice", "schema_version": 2,
+                    "applied": True, "selected_statements": [{
+                        "kind": "statement", "start_line": 1, "end_line": 1,
+                        "definitions": [], "references": [], "code": "run();",
+                    }],
+                }), encoding="utf-8")
+                (trigger / "defect_context.json").write_text(json.dumps({
+                    "schema": "defect-context", "schema_version": 1,
+                    "test": test, "error_stack": "p.Error\n\tat p.Service.run",
+                    "test_output": f"failure {number}",
+                }), encoding="utf-8")
+                suite_tests.append({
+                    "test_id": test_id, "test": test, "trigger": number,
+                    "entry_diagram_id": entry_id,
+                    "uml": f"triggers/trigger_{number}/uml.json",
+                })
+            (bug_dir / "uml_suite.json").write_text(json.dumps({
+                "schema": "execution-uml-suite", "schema_version": 1,
+                "project": "P", "bug": "1",
+                "method_catalog_fingerprint": fingerprint,
+                "method_catalog": catalog, "test_count": 2,
+                "diagram_count": 2, "tests": suite_tests,
+            }), encoding="utf-8")
+            config = layout.root / "config.json"
+            config.write_text("{}", encoding="utf-8")
+
+            rows = localize.run(
+                layout, ["P"], {"1"}, None, config, 30, 1, True
+            )
+            result = json.loads((bug_dir / "localization.json").read_text())
+            prompt = (bug_dir / "prompt.txt").read_text()
+
+        self.assertEqual(rows, [{
+            "project": "P", "bug": "1", "status": "DRY_RUN", "top1": "",
+        }])
+        self.assertEqual(result["schema_version"], 5)
+        self.assertEqual(result["test_count"], 2)
+        self.assertNotIn("[Error Stack]", prompt)
+        self.assertIn("T001 | p.A::one | Entry: T001-D001", prompt)
+        self.assertIn("T002 | p.B::two | Entry: T002-D001", prompt)
+
+
 class AggregateTests(unittest.TestCase):
     def test_frequency_only_ranking_preserves_natural_order_for_ties(self):
         results = [
@@ -1287,18 +1453,43 @@ class AggregateTests(unittest.TestCase):
 
 
 class CollectTests(unittest.TestCase):
-    @patch("mllmfl.stages.collect.random.sample", return_value=[3, 0, 2])
-    def test_randomly_limits_failing_tests_and_preserves_export_order(self, sample_mock):
-        tests = ["p.T::one", "p.T::two", "p.T::three", "p.T::four"]
-        selected = collect.select_failing_tests(tests, 3)
-        self.assertEqual(selected, ["p.T::one", "p.T::three", "p.T::four"])
-        sample_mock.assert_called_once_with(range(4), 3)
+    @patch("mllmfl.stages.collect.run_command", return_value=CommandResult(1, "", "failed"))
+    @patch("mllmfl.stages.collect.trigger_tests", return_value=[
+        "p.T::one", "p.T::two", "p.T::three", "p.T::four",
+    ])
+    @patch("mllmfl.stages.collect.compile_project", return_value=CommandResult(0, "", ""))
+    @patch("mllmfl.stages.collect.checkout", return_value=CommandResult(0, "", ""))
+    @patch("mllmfl.stages.collect.ensure_defects4j")
+    @patch("mllmfl.stages.collect.defects4j_environment", return_value={})
+    def test_collects_every_failing_test_with_stable_test_ids(
+        self, _environment, _ensure, _checkout, _compile, _tests, _run
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            rows = collect.run(layout, ["P"], {"1"}, None, None, 30)
+            collected = [
+                json.loads(
+                    (layout.trigger_dir("P", "1", number) / "collect.json").read_text()
+                )
+                for number in range(1, 5)
+            ]
+        self.assertEqual(rows[0]["trigger_count"], 4)
+        self.assertEqual(
+            [item["test_id"] for item in collected],
+            ["T001", "T002", "T003", "T004"],
+        )
+        self.assertTrue(all(item["schema_version"] == 2 for item in collected))
 
-    def test_failing_test_limit_keeps_short_input_and_rejects_non_positive_limit(self):
-        tests = ["p.T::one", "p.T::two"]
-        self.assertEqual(collect.select_failing_tests(tests, 3), tests)
-        with self.assertRaisesRegex(ValueError, "maximum failing tests must be positive"):
-            collect.select_failing_tests(tests, 0)
+    def test_trigger_discovery_uses_numeric_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            for number in (10, 2, 1):
+                layout.trigger_dir("P", "1", number).mkdir(parents=True)
+            discovered = [
+                number
+                for _, _, number, _ in layout.discover_triggers(["P"], {"1"})
+            ]
+        self.assertEqual(discovered, ["1", "2", "10"])
 
     def test_trigger_preparation_removes_unselected_and_changed_cached_artifacts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1343,22 +1534,9 @@ class CollectTests(unittest.TestCase):
 
 
 class CliValidationTests(unittest.TestCase):
-    def test_interaction_mode_defaults_and_rejects_unknown_values(self):
-        self.assertEqual(localization_interaction_mode({}), TEXT_INDEX_MODE)
-        self.assertEqual(
-            localization_interaction_mode({
-                "mllm": {"interaction_mode": IMAGE_ONLY_MODE},
-            }),
-            IMAGE_ONLY_MODE,
-        )
-        with self.assertRaisesRegex(ValueError, "interaction_mode"):
-            localization_interaction_mode({
-                "mllm": {"interaction_mode": "unsupported"},
-            })
-
-    def test_collect_defaults_to_three_failing_tests(self):
+    def test_collect_has_no_random_failing_test_cap(self):
         args = build_parser().parse_args(["collect"])
-        self.assertEqual(args.max_failing_tests, 3)
+        self.assertFalse(hasattr(args, "max_failing_tests"))
 
     def test_method_summary_generation_is_disabled(self):
         candidate = candidate_without_summary("p.Service.run")
@@ -1370,7 +1548,6 @@ class CliValidationTests(unittest.TestCase):
     def test_rejects_non_positive_candidate_cap_and_top_k(self):
         parser = build_parser()
         invalid_commands = [
-            ["collect", "--max-failing-tests", "0"],
             ["summarize", "--candidate-cap", "0"],
             ["localize", "--config", "config.json", "--top-k", "-1"],
             ["aggregate", "--top-k", "0"],

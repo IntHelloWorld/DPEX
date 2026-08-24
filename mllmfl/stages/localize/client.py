@@ -7,9 +7,7 @@ from typing import Any, Dict, List, Sequence
 
 import requests
 
-from mllmfl.domain.interaction import localization_interaction_mode
-
-from .context import diagram_tool, system_prompt
+from .context import DIAGRAM_TOOL, build_system_prompt
 
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -139,6 +137,7 @@ def _post_response(
     *,
     previous_response_id: str | None = None,
     prompt_cache_key: str | None = None,
+    instructions: str | None = None,
 ) -> tuple[Dict[str, Any], str, str, List[Dict[str, Any]], Dict[str, Any]]:
     """Post one stateless OpenAI-compatible Responses request.
 
@@ -146,7 +145,6 @@ def _post_response(
     this import path. The fourth item contains the complete response output for replay.
     """
     cfg = config.get("mllm", config)
-    interaction_mode = localization_interaction_mode(config)
     if cfg.get("api_key"):
         raise ValueError("inline api_key is forbidden; configure api_key_env")
     env_name = str(cfg.get("api_key_env") or DEFAULT_API_KEY_ENV)
@@ -165,7 +163,7 @@ def _post_response(
 
     payload: Dict[str, Any] = {
         "model": model,
-        "instructions": system_prompt(interaction_mode),
+        "instructions": instructions or build_system_prompt(int(cfg.get("top_k", 5))),
         "input": _response_input(input_items),
         "reasoning": {"effort": reasoning_effort},
         "parallel_tool_calls": False,
@@ -175,7 +173,7 @@ def _post_response(
     }
     if prompt_cache_key:
         payload["prompt_cache_key"] = prompt_cache_key
-    payload["tools"] = [copy.deepcopy(diagram_tool(interaction_mode))]
+    payload["tools"] = [copy.deepcopy(DIAGRAM_TOOL)]
     payload["tool_choice"] = "auto"
 
     retry = cfg.get("retry") or {}

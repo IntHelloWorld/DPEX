@@ -306,6 +306,47 @@ class EvaluateStageTests(unittest.TestCase):
         self.assertEqual(output["bugs"][0]["relevant_ranks"], [1])
         self.assertEqual(output["metrics"]["top_1"], 1.0)
 
+    def test_evaluates_bug_level_v5_without_aggregate_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = RunLayout(root / "run")
+            layout.ensure()
+            source = layout.workspace_dir("P", "1") / "src/p/A.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(SOURCE, encoding="utf-8")
+            patch = root / "d4j/framework/projects/P/patches/1.src.patch"
+            patch.parent.mkdir(parents=True)
+            patch.write_text(PATCH, encoding="utf-8")
+            result = layout.artifacts / "P/bug_1/localization.json"
+            result.parent.mkdir(parents=True)
+            result.write_text(json.dumps({
+                "schema": "fault-localization", "schema_version": 5,
+                "project": "P", "bug": "1", "status": "OK", "model": "vision",
+                "top_k": 5, "test_count": 1,
+                "tests": [{
+                    "test_id": "T001", "test": "p.Test::fails",
+                    "entry_diagram_id": "T001-D001",
+                }],
+                "viewed_test_ids": ["T001"], "candidate_count": 1,
+                "diagram_count": 1, "tool_rounds": 1, "diagram_view_count": 1,
+                "viewed_diagrams": ["T001-D001"],
+                "returned_method_ids": ["M001"],
+                "dropped_invalid_method_ids": [],
+                "dropped_unresolved_source_methods": [],
+                "ranking": [{
+                    "function": "p.A.broken", "signature": "p.A.broken()",
+                    "source_file": "src/p/A.java", "start_line": 4,
+                    "end_line": 6, "rank": 1,
+                }],
+            }), encoding="utf-8")
+
+            rows = evaluate.run(layout, ["P"], {"1"}, root / "d4j")
+            output = json.loads((layout.summaries / "evaluation.json").read_text())
+
+        self.assertEqual(rows[0]["status"], "OK")
+        self.assertEqual(output["bugs"][0]["identity_mode"], "source_range")
+        self.assertEqual(output["metrics"]["top_1"], 1.0)
+
     def test_evaluation_schema_rejects_inconsistent_counts(self):
         value = {
             "schema": "fault-localization-evaluation",

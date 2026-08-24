@@ -1,21 +1,12 @@
-import hashlib
-import re
-import shutil
-from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence
 
-from mllmfl.domain.interaction import IMAGE_ONLY_MODE, TEXT_INDEX_MODE
 from mllmfl.domain.trace import EXECUTION_SCHEMA, validate_trace
 from mllmfl.domain.diagram_graph import (
     EXPAND_CALL,
     plan_diagram_graph,
 )
-from mllmfl.domain.schemas import validate_uml_index
-from mllmfl.domain.test_slice import validate_slice_metadata
-from mllmfl.infrastructure.io import read_json, write_csv, write_json, write_text
-from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.infrastructure.plantuml import render
+from mllmfl.infrastructure.io import write_text
 
 from .rendering import (
     _diagram_filename,
@@ -40,18 +31,18 @@ def adaptive_graph_diagram_nodes(
     max_visible_units: int,
     max_participants: int,
     batch_size: int,
-    interaction_mode: str = TEXT_INDEX_MODE,
+    diagram_namespace: str = "",
+    global_method_ids: Dict[tuple[str, str, str], str] | None = None,
 ) -> tuple[
     List[Dict[str, Any]], str, List[Dict[str, str]], List[Dict[str, str]]
 ]:
     """Plan and render uniformly viewable bounded nodes for one execution root."""
-    if interaction_mode not in {TEXT_INDEX_MODE, IMAGE_ONLY_MODE}:
-        raise ValueError("interaction_mode must be text_index or image_only")
     planned = plan_diagram_graph(
         focus,
         max_visible_units,
         max_participants,
         entry_reason,
+        diagram_namespace,
     )
 
     numbered_items: Dict[int, Dict[str, Any]] = {}
@@ -101,10 +92,19 @@ def adaptive_graph_diagram_nodes(
             ),
         )
     ))
-    method_id_by_key = {
-        key: f"M{ordinal:03d}"
-        for ordinal, key in enumerate(ordered_method_keys, 1)
-    }
+    method_id_by_key = (
+        dict(global_method_ids)
+        if global_method_ids is not None
+        else {
+            key: f"M{ordinal:03d}"
+            for ordinal, key in enumerate(ordered_method_keys, 1)
+        }
+    )
+    missing_method_keys = [
+        key for key in ordered_method_keys if key not in method_id_by_key
+    ]
+    if missing_method_keys:
+        raise ValueError("global method catalog is missing visible runtime methods")
     invocation_method_ids = {
         invocation_id: method_id_by_key[key]
         for invocation_id, key in method_keys.items()
@@ -120,7 +120,7 @@ def adaptive_graph_diagram_nodes(
         }
         for class_name, method, descriptor in ordered_method_keys
     ]
-    call_prefix = "C" if interaction_mode == IMAGE_ONLY_MODE else "M"
+    call_prefix = "C"
 
     def message_id(invocation_id: int) -> str:
         return f"{call_prefix}{int(message_numbers[invocation_id]):03d}"
@@ -303,10 +303,7 @@ def adaptive_graph_diagram_nodes(
             references=incoming_refs,
             graph_folds=graph_folds,
             message_prefix=call_prefix,
-            method_ids=(
-                invocation_method_ids
-                if interaction_mode == IMAGE_ONLY_MODE else None
-            ),
+            method_ids=invocation_method_ids,
         )
         write_text(puml_path, puml)
         puml_paths.append(puml_path)
@@ -346,25 +343,24 @@ def adaptive_graph_diagram_nodes(
             "puml": puml_path.relative_to(directory.parent).as_posix(),
             "image": puml_path.with_suffix(".png").relative_to(directory.parent).as_posix(),
         }
-        if interaction_mode == IMAGE_ONLY_MODE:
-            visible_invocation_ids = [
-                int(call["invocation_id"])
-                for call in sorted(
-                    value["calls"],
-                    key=lambda item: (
-                        int(item.get("enter_seq") or 0),
-                        int(item["invocation_id"]),
-                    ),
-                )
-            ]
-            focus_id = int(focus_item["representative_invocation_id"])
-            if not synthetic and focus_id in invocation_method_ids:
-                visible_invocation_ids.insert(0, focus_id)
-            output["method_ids"] = list(dict.fromkeys(
-                invocation_method_ids[invocation_id]
-                for invocation_id in visible_invocation_ids
-                if invocation_id in invocation_method_ids
-            ))
+        visible_invocation_ids = [
+            int(call["invocation_id"])
+            for call in sorted(
+                value["calls"],
+                key=lambda item: (
+                    int(item.get("enter_seq") or 0),
+                    int(item["invocation_id"]),
+                ),
+            )
+        ]
+        focus_id = int(focus_item["representative_invocation_id"])
+        if not synthetic and focus_id in invocation_method_ids:
+            visible_invocation_ids.insert(0, focus_id)
+        output["method_ids"] = list(dict.fromkeys(
+            invocation_method_ids[invocation_id]
+            for invocation_id in visible_invocation_ids
+            if invocation_id in invocation_method_ids
+        ))
         output_nodes.append(output)
         node_by_puml[puml_path] = output
 
@@ -385,6 +381,4 @@ def adaptive_graph_diagram_nodes(
         }
         for path, error in sorted(failed_paths.items(), key=lambda item: str(item[0]))
     ]
-    return output_nodes, str(planned["entry_diagram_id"]), failures, (
-        method_catalog if interaction_mode == IMAGE_ONLY_MODE else []
-    )
+    return output_nodes, str(planned["entry_diagram_id"]), failures, method_catalog

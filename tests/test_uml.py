@@ -1,11 +1,11 @@
 import copy
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from mllmfl.domain.schemas import validate_compressed_execution, validate_uml_index
-from mllmfl.domain.interaction import IMAGE_ONLY_MODE
 from mllmfl.domain.trace import build_trace, project_execution
 from mllmfl.infrastructure.io import write_json
 from mllmfl.infrastructure.layout import RunLayout
@@ -20,10 +20,37 @@ from mllmfl.stages.uml import (
     readable_signature,
     recursive_compressed_diagram_nodes,
 )
+from mllmfl.stages.uml.stage import _bug_method_catalog
 from tests.test_trace_domain import events
 
 
 class UMLTests(unittest.TestCase):
+    def test_bug_method_catalog_is_shared_and_order_independent_across_tests(self):
+        execution = project_execution(build_trace(events()), "p.Test", "testCase")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            items = []
+            for number in (1, 2):
+                trigger = root / f"trigger_{number}"
+                trigger.mkdir()
+                write_json(trigger / "execution.json", execution)
+                items.append(("P", "1", str(number), trigger))
+            catalog, method_ids, fingerprint = _bug_method_catalog(items)
+            reversed_catalog, reversed_ids, reversed_fingerprint = (
+                _bug_method_catalog(list(reversed(items)))
+            )
+        self.assertEqual(catalog, reversed_catalog)
+        self.assertEqual(method_ids, reversed_ids)
+        self.assertEqual(fingerprint, reversed_fingerprint)
+        self.assertEqual(len({item["method_id"] for item in catalog}), len(catalog))
+        self.assertEqual(
+            method_ids[("p.Service", "run", "(I)V")],
+            next(
+                item["method_id"]
+                for item in catalog if item["function"] == "p.Service.run"
+            ),
+        )
+
     def test_uml_stage_rejects_invalid_sliced_trace_metadata(self):
         execution = project_execution(build_trace(events()), "p.Test", "testCase")
         execution["slice"] = {"schema": "invalid", "schema_version": 2}
@@ -55,6 +82,67 @@ class UMLTests(unittest.TestCase):
             "segment_count": 0,
         }])
         self.assertIn("unsupported test slice schema", error)
+
+    def test_uml_stage_builds_test_namespaced_suite_with_shared_method_ids(self):
+        first = project_execution(build_trace(events()), "p.Test", "testCase")
+        second_events = copy.deepcopy(events())
+        for event in second_events:
+            if event.get("method") == "testCase":
+                event["method"] = "testOther"
+        second = project_execution(build_trace(second_events), "p.Test", "testOther")
+
+        def render_graph(paths, *_args):
+            successes = {}
+            for puml_path in paths:
+                png_path = puml_path.with_suffix(".png")
+                png_path.write_bytes(b"png")
+                successes[puml_path] = png_path
+            return successes, {}
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "mllmfl.infrastructure.plantuml.render_many", side_effect=render_graph
+        ):
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            for number, (execution, test) in enumerate((
+                (first, "p.Test::testCase"),
+                (second, "p.Test::testOther"),
+            ), 1):
+                trigger = layout.trigger_dir("P", "1", number)
+                trigger.mkdir(parents=True)
+                write_json(trigger / "execution.json", execution)
+                (trigger / "trigger_test.txt").write_text(test + "\n", encoding="utf-8")
+
+            rows = uml.run(
+                layout, ["P"], {"1"}, None, "plantuml", None, 30
+            )
+            bug_dir = layout.artifacts / "P" / "bug_1"
+            suite = json.loads(
+                (bug_dir / "uml_suite.json").read_text(encoding="utf-8")
+            )
+            graphs = [
+                json.loads(
+                    (layout.trigger_dir("P", "1", number) / "uml.json").read_text(
+                        encoding="utf-8"
+                    )
+                )
+                for number in (1, 2)
+            ]
+
+        self.assertTrue(all(row["status"] == "OK" for row in rows))
+        self.assertEqual(
+            [item["entry_diagram_id"] for item in suite["tests"]],
+            ["T001-D001", "T002-D001"],
+        )
+        self.assertTrue(all(graph["schema_version"] == 3 for graph in graphs))
+        shared_ids = [
+            next(
+                item["method_id"] for item in graph["method_catalog"]
+                if item["function"] == "p.Service.run"
+            )
+            for graph in graphs
+        ]
+        self.assertEqual(shared_ids[0], shared_ids[1])
 
     def test_adaptive_graph_renders_symmetric_sibling_views(self):
         nested = [
@@ -123,12 +211,12 @@ class UMLTests(unittest.TestCase):
 
         self.assertEqual(entry_id, "D-001")
         self.assertEqual(failures, [])
-        self.assertEqual(method_catalog, [])
+        self.assertEqual(len(method_catalog), 41)
         self.assertEqual(sum(node["represented_call_count"] for node in nodes), 41)
         self.assertEqual(nodes[1]["visible_unit_count"], 24)
         self.assertEqual(nodes[1]["folds"][0]["kind"], "SIBLING_BUNDLE")
-        self.assertIn("M025-M041: 17 calls / VIEW D-003", first_peer_puml)
-        self.assertIn("M002-M024: 23 calls / VIEW D-002", second_peer_puml)
+        self.assertIn("C025-C041: 17 calls / VIEW D-003", first_peer_puml)
+        self.assertIn("C002-C024: 23 calls / VIEW D-002", second_peer_puml)
         self.assertIn("TO D-002", entry_puml)
         self.assertIn("FROM D-001", first_peer_puml)
         self.assertNotIn("FROM D-002", second_peer_puml)
@@ -141,14 +229,14 @@ class UMLTests(unittest.TestCase):
         self.assertIn(
             f"{first_parent_alias} -> {first_parent_alias}: SIBLING VIEWS\n"
             "note right #DCEFF8\n"
-            "M025-M041: 17 calls / VIEW D-003\n"
+            "C025-C041: 17 calls / VIEW D-003\n"
             "end note",
             first_peer_puml,
         )
         self.assertIn(
             f"{second_parent_alias} -> {second_parent_alias}: SIBLING VIEWS\n"
             "note right #DCEFF8\n"
-            "M002-M024: 23 calls / VIEW D-002\n"
+            "C002-C024: 23 calls / VIEW D-002\n"
             "end note",
             second_peer_puml,
         )
@@ -162,7 +250,8 @@ class UMLTests(unittest.TestCase):
         self.assertEqual(nodes[1]["links"][1]["direction"], "PEER")
         self.assertEqual(nodes[2]["links"][0]["direction"], "PEER")
         index = {
-            "schema": "execution-uml-graph", "schema_version": 1,
+            "schema": "execution-uml-graph", "schema_version": 2,
+            "interaction_mode": "image_only",
             "source_schema": "fullchain-execution",
             "strategy": "test-root-adaptive-graph",
             "entry_reason": "test_invocation", "slice_applied": True,
@@ -174,6 +263,7 @@ class UMLTests(unittest.TestCase):
             "excluded_call_count": 0, "entry_diagram_id": entry_id,
             "node_count": len(nodes), "diagram_count": len(nodes),
             "nodes": nodes,
+            "method_catalog": method_catalog,
         }
         self.assertIs(validate_uml_index(index), index)
         all_puml = entry_puml + first_peer_puml + second_peer_puml
@@ -520,7 +610,7 @@ class UMLTests(unittest.TestCase):
             nodes, _, failures, method_catalog = adaptive_graph_diagram_nodes(
                 execution, focus, "test_invocation", diagram_dir,
                 "P", "1", "trigger", "plantuml", None, 30, 4096,
-                24, 8, 100, IMAGE_ONLY_MODE,
+                24, 8, 100,
             )
             puml = (diagram_dir / "D-001.puml").read_text(encoding="utf-8")
 
