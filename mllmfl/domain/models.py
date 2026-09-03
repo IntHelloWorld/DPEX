@@ -20,6 +20,8 @@ class Invocation:
     duration_ns: Optional[int] = None
     exception_class: str = ""
     message: str = ""
+    arguments: Optional[Dict[str, Any]] = None
+    return_value: Optional[Dict[str, Any]] = None
 
     @property
     def function(self) -> str:
@@ -28,6 +30,10 @@ class Invocation:
     def to_dict(self) -> Dict[str, Any]:
         value = asdict(self)
         value["class"] = value.pop("class_name")
+        if value["arguments"] is None:
+            value.pop("arguments")
+        if value["return_value"] is None:
+            value.pop("return_value")
         return value
 
 
@@ -53,16 +59,6 @@ class Call:
     context: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class Failure:
-    exception_class: str = ""
-    message: str = ""
-    stack_trace: str = ""
-
-    def to_dict(self) -> Dict[str, str]:
         return asdict(self)
 
 

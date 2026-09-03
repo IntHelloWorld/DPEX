@@ -5,6 +5,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .coverage
+tests/generated/focus_viewport/
+tests/generated/value_capture/
 
 # Pipeline runtime data (for any --root inside the repository)
 workspace/
@@ -22,7 +24,8 @@ fullchain_tracer/target/
 .env
 *.local.json
 **/raw_model_output*
-**/conversation.jsonl
+**/*conversation.jsonl
+**/*response_usage.jsonl
 
 # Local export archives
 *.tar

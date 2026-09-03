@@ -246,16 +246,3 @@ def ground_truth_locations(
             ),
         )
     ]
-
-
-def ground_truth_methods(
-    d4j_home: Path,
-    workspace: Path,
-    project: str,
-    bug: str,
-) -> List[str]:
-    """Compatibility view of source-range ground truth as unique function names."""
-    return sorted({
-        str(item["function"])
-        for item in ground_truth_locations(d4j_home, workspace, project, bug)
-    })

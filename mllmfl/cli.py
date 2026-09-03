@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.stages import aggregate, collect, evaluate, localize, trace, uml
+from mllmfl.stages import collect, evaluate, refine, trace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROJECTS = [
@@ -78,7 +78,7 @@ def _common(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m mllmfl",
-        description="MLLM fault-localization pipeline",
+        description="MLLM fault-localization and refinement pipeline",
     )
     subparsers = parser.add_subparsers(dest="stage", required=True)
 
@@ -89,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     collect_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
     trace_parser = subparsers.add_parser(
-        "trace", help="record Fullchain v3 executions and test-boundary slices"
+        "trace", help="record Fullchain v4 executions and refinement indexes"
     )
     _common(trace_parser)
     trace_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
@@ -98,49 +98,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--agent-jar",
         default=str(PROJECT_ROOT / "lib" / "fullchain-tracer.jar"),
     )
-
-    uml_parser = subparsers.add_parser(
-        "uml", help="render adaptively folded runtime sequence subgraphs"
+    capture_group = trace_parser.add_mutually_exclusive_group()
+    capture_group.add_argument(
+        "--capture-values", dest="capture_values", action="store_true",
+        help="capture bounded entry arguments and normal return values (default)",
     )
-    _common(uml_parser, include_trigger=False)
-    uml_parser.add_argument("--plantuml-command")
-    uml_parser.add_argument(
-        "--config", default=str(PROJECT_ROOT / "config" / "mllm.example.json"),
-        help="configuration file containing UML image limits",
+    capture_group.add_argument(
+        "--no-capture-values", dest="capture_values", action="store_false",
+        help="disable argument and return-value capture",
     )
-    uml_parser.add_argument(
-        "--max-visible-units", "--max-calls",
-        dest="max_visible_units", type=_positive_int,
-        help="maximum visible calls plus sibling bundles per subgraph",
-    )
-    uml_parser.add_argument("--max-participants", type=_positive_int)
-    uml_parser.add_argument("--plantuml-batch-size", type=_positive_int)
-    uml_parser.add_argument("--plantuml-jar")
-    uml_parser.add_argument(
-        "--plantuml-limit-size",
-        type=_positive_int,
-        help="maximum fragment PNG width/height before rendering fails",
+    trace_parser.set_defaults(capture_values=True)
+    trace_parser.add_argument("--value-max-chars", type=_positive_int, default=120)
+    trace_parser.add_argument("--value-max-items", type=_positive_int, default=8)
+    trace_parser.add_argument("--value-max-depth", type=int, default=2)
+    trace_parser.add_argument(
+        "--value-max-arguments-chars", type=_positive_int, default=480
     )
 
-    localize_parser = subparsers.add_parser("localize", help="rank methods with an MLLM")
-    _common(localize_parser, include_trigger=False)
-    localize_parser.add_argument("--config", required=True)
-    localize_parser.add_argument("--top-k", type=_positive_int)
-    localize_parser.add_argument("--dry-run", action="store_true")
-    localize_parser.add_argument(
-        "--workers",
-        "--max-workers",
-        dest="workers",
-        type=_positive_int,
+    refine_parser = subparsers.add_parser(
+        "refine", help="audit and optimize an external fault-localization ranking"
+    )
+    _common(refine_parser, include_trigger=False)
+    refine_parser.add_argument(
+        "--locator-results",
+        required=True,
+        help="canonical locator result or supported adapter input such as AutoFL XFL",
+    )
+    refine_parser.add_argument("--config", required=True)
+    refine_parser.add_argument("--top-k", type=_positive_int)
+    refine_parser.add_argument("--dry-run", action="store_true")
+    refine_parser.add_argument("--max-upstream-calls", type=_positive_int, default=6)
+    refine_parser.add_argument("--max-downstream-calls", type=_positive_int, default=6)
+    refine_parser.add_argument("--max-internal-calls", type=_positive_int, default=10)
+    refine_parser.add_argument(
+        "--workers", "--max-workers", dest="workers", type=_positive_int,
         default=1,
-        help="maximum number of bugs localized concurrently (default: 1)",
+        help="maximum number of bugs refined concurrently (default: 1)",
     )
-
-    aggregate_parser = subparsers.add_parser(
-        "aggregate", help="aggregate historical trigger-level rankings per bug"
-    )
-    _common(aggregate_parser, include_trigger=False, include_force=False)
-    aggregate_parser.add_argument("--top-k", type=_positive_int, default=5)
 
     evaluate_parser = subparsers.add_parser(
         "evaluate", help="evaluate bug-level rankings against Defects4J patches"
@@ -160,6 +154,8 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
+    if args.stage == "trace" and args.value_max_depth < 0:
+        parser.error("--value-max-depth must be non-negative")
     try:
         bugs = _bugs(args.bugs)
     except ValueError as error:
@@ -189,66 +185,29 @@ def main(argv: Sequence[str] | None = None) -> None:
             Path(args.java_home).expanduser() if args.java_home else None,
             args.timeout,
             args.force,
+            args.capture_values,
+            args.value_max_chars,
+            args.value_max_items,
+            args.value_max_depth,
+            args.value_max_arguments_chars,
         )
-    elif args.stage == "uml":
-        uml_config = json.loads(Path(args.config).expanduser().read_text(encoding="utf-8"))
-        uml_cfg = uml_config.get("uml") or {}
-        max_visible_units = args.max_visible_units or int(
-            uml_cfg.get(
-                "max_visible_units_per_image",
-                uml_cfg.get("max_calls_per_image", 24),
-            )
-        )
-        max_participants = (
-            args.max_participants or int(uml_cfg.get("max_participants_per_image", 8))
-        )
-        plantuml_batch_size = (
-            args.plantuml_batch_size or int(uml_cfg.get("plantuml_batch_size", 100))
-        )
-        plantuml_command = (
-            args.plantuml_command
-            or str(uml_cfg.get("plantuml_command") or "plantuml")
-        )
-        plantuml_jar_value = (
-            args.plantuml_jar
-            if args.plantuml_jar is not None
-            else uml_cfg.get("plantuml_jar", str(PROJECT_ROOT / "lib" / "plantuml.jar"))
-        )
-        plantuml_limit_size = (
-            args.plantuml_limit_size
-            or int(uml_cfg.get("plantuml_limit_size", 32768))
-        )
-        rows = uml.run(
+    elif args.stage == "refine":
+        rows = refine.run(
             layout,
             projects,
             bugs,
             None,
-            plantuml_command,
-            Path(str(plantuml_jar_value)).expanduser().resolve()
-            if plantuml_jar_value
-            else None,
-            args.timeout,
-            args.force,
-            plantuml_limit_size,
-            max_visible_units,
-            max_participants,
-            plantuml_batch_size,
-        )
-    elif args.stage == "localize":
-        rows = localize.run(
-            layout,
-            projects,
-            bugs,
-            None,
+            Path(args.locator_results).expanduser().resolve(),
             Path(args.config).expanduser().resolve(),
             args.timeout,
             args.top_k,
             args.dry_run,
             args.force,
             args.workers,
+            args.max_upstream_calls,
+            args.max_downstream_calls,
+            args.max_internal_calls,
         )
-    elif args.stage == "aggregate":
-        rows = aggregate.run(layout, projects, bugs, args.top_k)
     else:
         if not args.d4j_home:
             parser.error("evaluate requires --d4j-home or D4J_HOME")

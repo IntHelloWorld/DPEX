@@ -82,11 +82,6 @@ def validate_png(png: Path, limit_size: int) -> None:
         raise RuntimeError(f"invalid PlantUML image {png}: {error}")
 
 
-def renderer_available(command: str, jar: Path | None) -> None:
-    """Validate that the configured renderer can be resolved without rendering."""
-    _command_args(command, jar, [])
-
-
 def _renderer_identity(command: str, jar: Path | None) -> dict[str, object]:
     executable = shutil.which(command)
     if executable:

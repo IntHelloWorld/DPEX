@@ -47,13 +47,6 @@ def _evaluate_identities(
     }
 
 
-def evaluate_ranking(
-    ranking: Sequence[str],
-    ground_truth: Set[str],
-) -> Dict[str, Any]:
-    return _evaluate_identities(ranking, ground_truth)
-
-
 def evaluate_location_ranking(
     ranking: Sequence[Dict[str, Any]],
     ground_truth: Sequence[Dict[str, Any]],

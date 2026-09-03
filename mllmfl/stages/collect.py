@@ -96,11 +96,7 @@ def run(
                 test_output = "\n".join(
                     part.rstrip() for part in (result.stdout, result.stderr) if part
                 )
-                write_text(
-                    output / "failure.txt",
-                    test_output + ("\n" if test_output else ""),
-                )
-                test_id = f"T{index:03d}"
+                test_id = f"T{index}"
                 write_json(output / "collect.json", {
                     "schema": "collected-trigger", "schema_version": 2,
                     "project": project, "bug": bug, "trigger": index,

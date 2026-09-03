@@ -6,8 +6,13 @@ from .models import Call, Invocation
 
 FULL_TRACE_SCHEMA = "fullchain-trace"
 EXECUTION_SCHEMA = "fullchain-execution"
-SCHEMA_VERSION = 3
-ALLOWED_EVENTS = {"ENTER", "RETURN", "THROW", "TEST_START", "TEST_FAILURE", "TEST_END"}
+SCHEMA_VERSION = 4
+LEGACY_SCHEMA_VERSION = 3
+ASSERTION_EVENTS = {"ASSERT_START", "ASSERT_PASS", "ASSERT_FAIL"}
+ALLOWED_EVENTS = {
+    "ENTER", "RETURN", "THROW", "TEST_START", "TEST_FAILURE", "TEST_END",
+    *ASSERTION_EVENTS,
+}
 NOISE_PREFIXES = (
     "org.junit.",
     "junit.",
@@ -100,6 +105,8 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     test_start = None
     test_end = None
     failures: List[Dict[str, Any]] = []
+    assertions: List[Dict[str, Any]] = []
+    unmatched_exits: List[Dict[str, Any]] = []
     for event in events:
         event_type = event.get("type")
         if event_type == "ENTER":
@@ -117,12 +124,17 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 enter_seq=int(event.get("seq") or 0),
                 enter_ns=int(event.get("ts_ns") or 0),
                 origin_test_line=int(event.get("origin_test_line") or 0),
+                arguments=(
+                    dict(event["arguments"])
+                    if isinstance(event.get("arguments"), dict) else None
+                ),
             )
         elif event_type in {"RETURN", "THROW"}:
             invocation_id = int(event["invocation_id"])
             current = invocations.get(invocation_id)
             if current is None:
-                raise ValueError(f"exit without ENTER: invocation {invocation_id}")
+                unmatched_exits.append(dict(event))
+                continue
             if current.exit_type is not None:
                 raise ValueError(f"duplicate exit: invocation {invocation_id}")
             invocations[invocation_id] = Invocation(
@@ -134,19 +146,67 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                     "duration_ns": int(event.get("duration_ns") or 0),
                     "exception_class": str(event.get("exception_class") or ""),
                     "message": str(event.get("message") or ""),
+                    "return_value": (
+                        dict(event["return_value"])
+                        if isinstance(event.get("return_value"), dict) else None
+                    ),
                 }
             )
         elif event_type == "TEST_START":
             test_start = dict(event)
         elif event_type == "TEST_FAILURE":
             failures.append(dict(event))
+        elif event_type in ASSERTION_EVENTS:
+            assertions.append(dict(event))
         elif event_type == "TEST_END":
             test_end = dict(event)
 
     ordered = sorted(invocations.values(), key=lambda item: item.enter_seq)
     unclosed = [item.invocation_id for item in ordered if item.exit_type is None]
-    if unclosed:
-        raise ValueError(f"unclosed invocations: {unclosed[:20]}")
+    terminal_stack_overflow = (
+        isinstance(test_end, dict)
+        and test_end.get("successful") is False
+        and any(
+            failure.get("exception_class") == "java.lang.StackOverflowError"
+            for failure in failures
+        )
+    )
+    recovery = None
+    if unmatched_exits or unclosed:
+        if not terminal_stack_overflow:
+            if unmatched_exits:
+                raise ValueError(
+                    "exit without ENTER: invocation "
+                    f"{int(unmatched_exits[0]['invocation_id'])}"
+                )
+            raise ValueError(f"unclosed invocations: {unclosed[:20]}")
+        failure = next(
+            item for item in failures
+            if item.get("exception_class") == "java.lang.StackOverflowError"
+        )
+        terminal_seq = int(failure.get("seq") or test_end.get("seq") or 0)
+        terminal_ns = int(failure.get("ts_ns") or test_end.get("ts_ns") or 0)
+        for invocation_id in unclosed:
+            current = invocations[invocation_id]
+            invocations[invocation_id] = Invocation(
+                **{
+                    **current.__dict__,
+                    "exit_seq": terminal_seq,
+                    "exit_ns": terminal_ns,
+                    "exit_type": "THROW",
+                    "duration_ns": max(0, terminal_ns - current.enter_ns),
+                    "exception_class": "java.lang.StackOverflowError",
+                    "message": str(failure.get("message") or ""),
+                }
+            )
+        recovery = {
+            "reason": "terminal_stack_overflow",
+            "ignored_exit_without_enter_ids": [
+                int(item["invocation_id"]) for item in unmatched_exits
+            ],
+            "synthesized_throw_invocation_ids": unclosed,
+        }
+        ordered = sorted(invocations.values(), key=lambda item: item.enter_seq)
     by_id = {item.invocation_id: item for item in ordered}
     calls: List[Call] = []
     for child in ordered:
@@ -173,18 +233,23 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 origin_test_line=child.origin_test_line,
             )
         )
+    protocol_version = int((test_start or {}).get("agent_protocol_version") or 3)
+    schema_version = SCHEMA_VERSION if protocol_version == 4 else LEGACY_SCHEMA_VERSION
     result = {
         "schema": FULL_TRACE_SCHEMA,
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": schema_version,
         "event_count": len(events),
         "invocation_count": len(ordered),
         "call_count": len(calls),
         "test_start": test_start,
         "test_end": test_end,
         "test_failures": failures,
+        "assertions": assertions,
         "invocations": [item.to_dict() for item in ordered],
         "calls": [item.to_dict() for item in calls],
     }
+    if recovery is not None:
+        result["event_recovery"] = recovery
     validate_trace(result, FULL_TRACE_SCHEMA)
     return result
 
@@ -197,7 +262,8 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
         raise ValueError(f"unsupported trace schema: {schema!r}")
     if expected_schema and schema != expected_schema:
         raise ValueError(f"expected schema {expected_schema}, got {schema}")
-    if value.get("schema_version") != SCHEMA_VERSION:
+    schema_version = value.get("schema_version")
+    if schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
         raise ValueError(f"unsupported schema_version: {value.get('schema_version')!r}")
     if not isinstance(value.get("calls"), list) or not isinstance(value.get("invocations"), list):
         raise ValueError("trace calls and invocations must be arrays")
@@ -208,6 +274,222 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
     for index, call in enumerate(value["calls"]):
         if not isinstance(call, dict) or not required.issubset(call):
             raise ValueError(f"invalid call at index {index}")
+    invocations = value["invocations"]
+    seen_invocations = set()
+    capture_values = False
+    config = None
+    if schema_version == SCHEMA_VERSION:
+        test_start = value.get("test_start")
+        if not isinstance(test_start, dict):
+            raise ValueError("fullchain v4 requires TEST_START metadata")
+        if test_start.get("agent_protocol_version") != 4:
+            raise ValueError("fullchain v4 requires agent protocol version 4")
+        config = _validate_value_capture_config(test_start.get("value_capture"))
+        capture_values = config["capture_values"]
+    for index, invocation in enumerate(invocations):
+        if not isinstance(invocation, dict):
+            raise ValueError(f"invalid invocation at index {index}")
+        invocation_id = invocation.get("invocation_id")
+        if (
+            not isinstance(invocation_id, int)
+            or isinstance(invocation_id, bool)
+            or invocation_id <= 0
+            or invocation_id in seen_invocations
+            or invocation.get("exit_type") not in {"RETURN", "THROW"}
+        ):
+            raise ValueError(f"invalid invocation at index {index}")
+        seen_invocations.add(invocation_id)
+        if schema_version == SCHEMA_VERSION:
+            has_arguments = "arguments" in invocation
+            has_return = "return_value" in invocation
+            if capture_values != has_arguments:
+                raise ValueError(
+                    f"inconsistent arguments capture: invocation {invocation_id}"
+                )
+            if capture_values:
+                expected_count = _descriptor_argument_count(
+                    str(invocation.get("descriptor") or "")
+                )
+                _validate_arguments(invocation["arguments"], expected_count, config)
+            if invocation["exit_type"] == "RETURN":
+                if capture_values != has_return:
+                    raise ValueError(
+                        f"inconsistent return capture: invocation {invocation_id}"
+                    )
+                if capture_values:
+                    returned = _validate_value_item(
+                        invocation["return_value"], allow_index=False,
+                        max_chars=config["value_max_chars"],
+                    )
+                    descriptor_void = str(invocation.get("descriptor") or "").endswith(
+                        ")V"
+                    )
+                    if (returned["kind"] == "void") != descriptor_void:
+                        raise ValueError(
+                            f"inconsistent void return: invocation {invocation_id}"
+                        )
+            elif has_return:
+                raise ValueError(
+                    f"THROW invocation has return value: invocation {invocation_id}"
+                )
+    assertions = value.get("assertions", [])
+    if not isinstance(assertions, list):
+        raise ValueError("trace assertions must be an array")
+    previous_seq = 0
+    for index, event in enumerate(assertions):
+        if (
+            not isinstance(event, dict)
+            or event.get("type") not in ASSERTION_EVENTS
+            or not isinstance(event.get("assertion_id"), str)
+            or not event["assertion_id"]
+            or not isinstance(event.get("seq"), int)
+            or isinstance(event["seq"], bool)
+            or event["seq"] <= previous_seq
+            or not isinstance(event.get("source_start_line"), int)
+            or isinstance(event["source_start_line"], bool)
+            or event["source_start_line"] <= 0
+            or not isinstance(event.get("source_end_line"), int)
+            or isinstance(event["source_end_line"], bool)
+            or event["source_end_line"] < event["source_start_line"]
+        ):
+            raise ValueError(f"invalid assertion event at index {index}")
+        previous_seq = event["seq"]
+    instrumentation = value.get("assertion_instrumentation")
+    if instrumentation is not None and (
+        not isinstance(instrumentation, dict)
+        or instrumentation.get("schema") != "assertion-instrumentation"
+        or instrumentation.get("schema_version") != 1
+        or not isinstance(instrumentation.get("configured_ranges"), str)
+    ):
+        raise ValueError("invalid assertion instrumentation metadata")
+    return value
+
+
+VALUE_KINDS = {
+    "null", "boolean", "number", "string", "char", "enum", "array",
+    "collection", "map", "object", "cycle", "error", "void",
+}
+
+
+def _validate_value_capture_config(value: Any) -> Dict[str, Any]:
+    required = {
+        "capture_values", "value_max_chars", "value_max_items",
+        "value_max_depth", "value_max_arguments_chars",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError("invalid value capture configuration")
+    if not isinstance(value["capture_values"], bool):
+        raise ValueError("invalid value capture enabled flag")
+    for field in ("value_max_chars", "value_max_items", "value_max_arguments_chars"):
+        if (
+            not isinstance(value[field], int)
+            or isinstance(value[field], bool)
+            or value[field] <= 0
+        ):
+            raise ValueError(f"invalid value capture setting: {field}")
+    if (
+        not isinstance(value["value_max_depth"], int)
+        or isinstance(value["value_max_depth"], bool)
+        or value["value_max_depth"] < 0
+    ):
+        raise ValueError("invalid value capture setting: value_max_depth")
+    return value
+
+
+def _descriptor_argument_count(descriptor: str) -> int:
+    if not descriptor.startswith("(") or ")" not in descriptor:
+        raise ValueError(f"invalid JVM method descriptor: {descriptor!r}")
+    index = 1
+    count = 0
+    try:
+        while descriptor[index] != ")":
+            while descriptor[index] == "[":
+                index += 1
+            if descriptor[index] == "L":
+                index = descriptor.index(";", index) + 1
+            elif descriptor[index] in "ZBCSIJFD":
+                index += 1
+            else:
+                raise ValueError
+            count += 1
+    except (IndexError, ValueError) as error:
+        raise ValueError(f"invalid JVM method descriptor: {descriptor!r}") from error
+    return count
+
+
+def _validate_value_item(
+    value: Any, allow_index: bool, max_chars: int | None = None
+) -> Dict[str, Any]:
+    required = {"declared_type", "runtime_type", "kind", "text", "truncated"}
+    allowed = required | ({"index"} if allow_index else set())
+    if not isinstance(value, dict) or set(value) != allowed:
+        raise ValueError("invalid captured value structure")
+    if allow_index and (
+        not isinstance(value["index"], int)
+        or isinstance(value["index"], bool)
+        or value["index"] < 0
+    ):
+        raise ValueError("invalid captured value index")
+    if (
+        not isinstance(value["declared_type"], str)
+        or not value["declared_type"]
+        or not isinstance(value["runtime_type"], str)
+        or value["kind"] not in VALUE_KINDS
+        or not isinstance(value["text"], str)
+        or not isinstance(value["truncated"], bool)
+    ):
+        raise ValueError("invalid captured value metadata")
+    if max_chars is not None and len(value["text"]) > max_chars:
+        raise ValueError("captured value exceeds configured character limit")
+    if value["kind"] == "null" and (
+        value["runtime_type"] or value["text"] != "null"
+    ):
+        raise ValueError("invalid captured null value")
+    if value["kind"] == "void" and (
+        value["runtime_type"] or value["text"] or value["truncated"]
+    ):
+        raise ValueError("invalid captured void value")
+    return value
+
+
+def _validate_arguments(
+    value: Any, expected_count: int, config: Dict[str, Any]
+) -> Dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != {
+        "count", "items", "omitted_count", "truncated"
+    }:
+        raise ValueError("invalid captured arguments structure")
+    count = value["count"]
+    omitted = value["omitted_count"]
+    items = value["items"]
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count != expected_count
+        or not isinstance(items, list)
+        or not isinstance(omitted, int)
+        or isinstance(omitted, bool)
+        or omitted < 0
+        or omitted != count - len(items)
+        or not isinstance(value["truncated"], bool)
+    ):
+        raise ValueError("invalid captured argument counts")
+    if len(items) > config["value_max_items"]:
+        raise ValueError("captured arguments exceed configured item limit")
+    for index, item in enumerate(items):
+        _validate_value_item(
+            item, allow_index=True, max_chars=config["value_max_chars"]
+        )
+        if item["index"] != index:
+            raise ValueError("captured argument indexes are not contiguous")
+    expected_truncated = omitted > 0 or any(item["truncated"] for item in items)
+    if value["truncated"] != expected_truncated:
+        raise ValueError("inconsistent captured arguments truncation")
+    text_chars = sum(
+        len(f"arg{item['index']}=") + len(item["text"]) for item in items
+    ) + 2 * max(0, len(items) - 1)
+    if text_chars > config["value_max_arguments_chars"]:
+        raise ValueError("captured arguments exceed configured total limit")
     return value
 
 
@@ -235,7 +517,7 @@ def project_execution(
         projected_calls.append(call)
     result = {
         "schema": EXECUTION_SCHEMA,
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": full_trace["schema_version"],
         "test": {"class": test_class, "method": test_method},
         "original_call_count": len(full_trace["calls"]),
         "filtered_call_count": len(calls),
@@ -243,6 +525,8 @@ def project_execution(
         "test_start": full_trace.get("test_start"),
         "test_end": full_trace.get("test_end"),
         "test_failures": full_trace.get("test_failures", []),
+        "assertions": list(full_trace.get("assertions") or []),
+        "assertion_instrumentation": full_trace.get("assertion_instrumentation"),
         "invocations": list(full_trace["invocations"]),
         "calls": projected_calls,
     }

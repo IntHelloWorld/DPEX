@@ -1,0 +1,26 @@
+{
+  "schema": "fault-localization-input",
+  "schema_version": 1,
+  "project": "Chart",
+  "bug": "1",
+  "locator": {
+    "name": "example-locator",
+    "version": "1"
+  },
+  "failing_tests": [
+    "org.example.ServiceTest::testCompute"
+  ],
+  "ranking": [
+    {
+      "candidate_id": "L001",
+      "function": "org.example.Service.compute",
+      "signature": "org.example.Service.compute(int)",
+      "source_file": "src/main/java/org/example/Service.java",
+      "start_line": 40,
+      "end_line": 63,
+      "rank": 1,
+      "score": 0.91,
+      "reason": "Optional evidence supplied by the upstream locator."
+    }
+  ]
+}

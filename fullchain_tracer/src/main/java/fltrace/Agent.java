@@ -89,7 +89,7 @@ public final class Agent {
         private void instrumentBehavior(CtBehavior behavior, String className, CtClass throwable) {
             try {
                 int modifiers = behavior.getModifiers();
-                if (Modifier.isAbstract(modifiers) || Modifier.isNative(modifiers) || behavior.isEmpty()) return;
+                if (Modifier.isAbstract(modifiers) || Modifier.isNative(modifiers)) return;
 
                 String methodName;
                 if (behavior instanceof CtConstructor) {
@@ -101,9 +101,10 @@ public final class Agent {
                 String descriptor = behavior.getSignature();
                 String enter = "{ fltrace.TraceRuntime.enter(\"" + javaLiteral(className) +
                         "\",\"" + javaLiteral(methodName) + "\",\"" +
-                        javaLiteral(descriptor) + "\"); }";
+                        javaLiteral(descriptor) + "\", $args, $sig); }";
                 behavior.insertBefore(enter);
-                behavior.insertAfter("{ fltrace.TraceRuntime.exitNormal(); }", false);
+                behavior.insertAfter(
+                        "{ fltrace.TraceRuntime.exitNormal(($w)$_, $type); }", false);
                 behavior.addCatch("{ fltrace.TraceRuntime.exitThrow($e); throw $e; }", throwable);
                 if (className.equals(TEST_CLASS) && methodName.equals(TEST_METHOD)) {
                     instrumentTestLines(behavior, className, methodName);

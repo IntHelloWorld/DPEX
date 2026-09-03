@@ -33,6 +33,7 @@ PRIMITIVE_DESCRIPTORS = {
 class JavaExecutable:
     function: str
     parameter_types: tuple[str, ...]
+    declaration_line: int
     start_line: int
     end_line: int
 
@@ -145,11 +146,13 @@ def java_executables(java_text: str) -> List[JavaExecutable]:
             if node.type == "constructor_declaration"
             else _text(source, node.child_by_field_name("name"))
         )
+        name_node = node.child_by_field_name("name")
         if not method:
             continue
         result.append(JavaExecutable(
             function=f"{class_name}.{method}",
             parameter_types=_parameter_types(source, node),
+            declaration_line=(name_node or node).start_point.row + 1,
             start_line=node.start_point.row + 1,
             end_line=node.end_point.row + 1,
         ))
@@ -268,3 +271,68 @@ def resolve_method_location(
         start_line=selected.start_line,
         end_line=selected.end_line,
     )
+
+
+def resolve_source_method_reference(
+    workspace: Path,
+    source_file: str,
+    declaration_line: int,
+    method_name: str = "",
+) -> tuple[MethodLocation, str]:
+    """Resolve an agent-friendly source anchor to one canonical Java method."""
+    relative = Path(source_file)
+    if (
+        not source_file
+        or relative.is_absolute()
+        or ".." in relative.parts
+        or "\\" in source_file
+        or relative.suffix != ".java"
+    ):
+        raise ValueError("invalid method source_file")
+    if (
+        not isinstance(declaration_line, int)
+        or isinstance(declaration_line, bool)
+        or declaration_line <= 0
+    ):
+        raise ValueError("invalid method declaration line")
+    source_path = (workspace / relative).resolve()
+    try:
+        source_path.relative_to(workspace.resolve())
+    except ValueError as error:
+        raise ValueError("method source_file escapes project root") from error
+    if not source_path.is_file():
+        raise ValueError(f"method source file not found: {source_file}")
+    matches = [
+        item for item in java_executables(
+            source_path.read_text(encoding="utf-8", errors="replace")
+        )
+        if item.declaration_line == declaration_line
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            "method reference must point to exactly one declaration-name line: "
+            f"{source_file}:{declaration_line}"
+        )
+    selected = matches[0]
+    canonical_name = selected.function.rsplit(".", 1)[-1]
+    declared_name = (
+        selected.function.rsplit(".", 2)[-2].rsplit("$", 1)[-1]
+        if canonical_name == "<init>"
+        else canonical_name
+    )
+    if method_name and method_name != declared_name:
+        raise ValueError(
+            f"method name does not match declaration at {source_file}:"
+            f"{declaration_line}: expected {declared_name}, got {method_name}"
+        )
+    canonical_file = source_path.relative_to(workspace.resolve()).as_posix()
+    location = MethodLocation(
+        function=selected.function,
+        source_file=canonical_file,
+        start_line=selected.start_line,
+        end_line=selected.end_line,
+    )
+    signature = (
+        selected.function + "(" + ", ".join(selected.parameter_types) + ")"
+    )
+    return location, signature

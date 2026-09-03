@@ -7,7 +7,7 @@ def validate_compressed_execution(value: Any) -> Dict[str, Any]:
     schema_version = value.get("schema_version")
     if (
         value.get("schema") != "fullchain-compressed-execution"
-        or schema_version not in {1, 2}
+        or schema_version not in {1, 2, 3}
         or value.get("source_schema") != "fullchain-execution"
     ):
         raise ValueError("unsupported compressed execution schema")
@@ -21,6 +21,11 @@ def validate_compressed_execution(value: Any) -> Dict[str, Any]:
     groups = value.get("root_groups")
     if not isinstance(groups, list):
         raise ValueError("compressed execution root_groups must be an array")
+    value_capture_enabled = False
+    if schema_version == 3:
+        if not isinstance(value.get("value_capture_enabled"), bool):
+            raise ValueError("invalid compressed execution value capture metadata")
+        value_capture_enabled = value["value_capture_enabled"]
     seen_representatives = set()
     seen_occurrence_roots = set()
     seen_sequence_ids = set()
@@ -43,6 +48,8 @@ def validate_compressed_execution(value: Any) -> Dict[str, Any]:
         displayed_count = node.get("displayed_subtree_call_count")
         if not isinstance(repeat_count, int) or repeat_count <= 0:
             raise ValueError(f"invalid compressed repeat count: {invocation_id}")
+        if value_capture_enabled and repeat_count != 1:
+            raise ValueError(f"captured values cannot be repeated: {invocation_id}")
         occurrences = node.get("occurrence_invocation_ids")
         if schema_version >= 2 and (
             not isinstance(occurrences, list)
@@ -96,6 +103,8 @@ def validate_compressed_execution(value: Any) -> Dict[str, Any]:
             if sequence is None:
                 index += 1
                 continue
+            if value_capture_enabled:
+                raise ValueError("captured values cannot use repeat sequences")
             if not isinstance(sequence, dict):
                 raise ValueError("invalid compressed repeat sequence")
             sequence_id = sequence.get("sequence_id")
@@ -140,4 +149,6 @@ def validate_compressed_execution(value: Any) -> Dict[str, Any]:
         raise ValueError("compressed root coverage does not match source calls")
     if sum(item[1] for item in totals) != displayed:
         raise ValueError("compressed root display count is inconsistent")
+    if value_capture_enabled and displayed != represented:
+        raise ValueError("captured values must remain fully expanded")
     return value
