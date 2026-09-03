@@ -3,6 +3,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from mllmfl.domain.trace import build_trace, load_events, project_execution, validate_trace
 from mllmfl.domain.assertion_folding import (
@@ -10,11 +11,18 @@ from mllmfl.domain.assertion_folding import (
     validate_assertion_folding,
 )
 from mllmfl.stages.trace import (
-    _ensure_assertion_artifacts,
+    TRACE_WORK_NAME,
+    _suite_only_targets,
+    _write_trace_suites,
+    archive_failed_raw_trace,
     assertion_range_argument,
     classpath_has_class,
     java_xml_compatibility_arguments,
+    run as run_trace,
 )
+from mllmfl.domain.refinement_trace import validate_refinement_trace
+from mllmfl.infrastructure.io import read_zstd_json, write_zstd_json
+from mllmfl.infrastructure.layout import RunLayout
 
 
 def events(exit_type="RETURN"):
@@ -236,22 +244,127 @@ class EventParsingTests(unittest.TestCase):
 
 
 class ExecutionProjectionTests(unittest.TestCase):
-    def test_assertion_artifacts_do_not_duplicate_an_unfolded_execution(self):
+    def test_trace_suite_consolidates_one_lean_normalized_trace(self):
         execution = project_execution(build_trace(events()), "p.Test", "testCase")
-        pruned, metadata = fold_successful_assertions(execution)
-        self.assertIs(pruned, execution)
-        self.assertEqual(metadata["folded_call_count"], 0)
+        execution.update({"project": "P", "process_exit_code": 1})
+        pruned, folding = fold_successful_assertions(execution)
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            trigger = layout.trigger_dir("P", "1", 1)
+            trigger.mkdir(parents=True)
+            (trigger / "collect.json").write_text("collected")
+            (trigger / "trigger_test.txt").write_text("p.Test::testCase\n")
+            legacy_duplicates = [
+                trigger / "execution.json",
+                trigger / "execution_assertion_pruned.json",
+                trigger / "trace_index.json",
+                trigger / "raw_events.jsonl",
+            ]
+            for path in legacy_duplicates:
+                path.write_text("obsolete")
+            write_zstd_json(trigger / TRACE_WORK_NAME, {
+                "schema": "refinement-trace-work",
+                "schema_version": 1,
+                "test": "p.Test::testCase",
+                "execution": pruned,
+                "assertion_folding": folding,
+                "defect_context": {
+                    "schema": "defect-context",
+                    "schema_version": 1,
+                    "test": "p.Test::testCase",
+                    "error_stack": "AssertionError",
+                    "test_output": "failed",
+                },
+            })
+            grouped = {("P", "1"): [("P", "1", "1", trigger)]}
+            _write_trace_suites(
+                layout, grouped, retain_debug_artifacts=False
+            )
+            suite = json.loads((
+                layout.artifacts / "P/bug_1/trace_suite.json"
+            ).read_text())
+            trace_path = (
+                layout.artifacts / "P/bug_1" / suite["tests"][0]["trace"]
+            )
+            trace = validate_refinement_trace(read_zstd_json(trace_path))
+            self.assertEqual(suite["schema_version"], 2)
+            self.assertEqual(trace["failure"]["error_stack"], "AssertionError")
+            self.assertEqual(trace["call_count"], 1)
+            self.assertFalse((trigger / TRACE_WORK_NAME).exists())
+            self.assertFalse((trigger / "collect.json").exists())
+            self.assertFalse((trigger / "trigger_test.txt").exists())
+            self.assertFalse(any(path.exists() for path in legacy_duplicates))
+            suite_path = layout.artifacts / "P/bug_1/trace_suite.json"
+            old_suite = {**suite, "schema_version": 1}
+            suite_path.write_text(json.dumps(old_suite))
+            self.assertEqual(
+                _suite_only_targets(layout, ["P"], {"1"}, None), []
+            )
+            suite_path.write_text(json.dumps(suite))
+            recovered = _suite_only_targets(
+                layout, ["P"], {"1"}, None
+            )
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0][0:3], ("P", "1", "1"))
+            self.assertEqual(recovered[0][4], "p.Test::testCase")
+            self.assertEqual(recovered[0][5]["call_count"], 1)
+
+            agent_jar = layout.root / "agent.jar"
+            agent_jar.write_bytes(b"jar")
+
+            def retrace(*args, **kwargs):
+                output = args[1]
+                recovered_collect = json.loads(
+                    (output / "collect.json").read_text()
+                )
+                self.assertEqual(recovered_collect["test_id"], "T1")
+                self.assertEqual(recovered_collect["test_output"], "failed")
+                work = {
+                    "schema": "refinement-trace-work",
+                    "schema_version": 1,
+                    "test": "p.Test::testCase",
+                    "execution": pruned,
+                    "assertion_folding": folding,
+                    "defect_context": {
+                        "schema": "defect-context",
+                        "schema_version": 1,
+                        "test": "p.Test::testCase",
+                        "error_stack": "AssertionError",
+                        "test_output": "failed",
+                    },
+                }
+                write_zstd_json(output / TRACE_WORK_NAME, work)
+                return work
+
+            with (
+                patch(
+                    "mllmfl.stages.trace.defects4j_environment",
+                    return_value={},
+                ),
+                patch("mllmfl.stages.trace.trace_trigger", side_effect=retrace),
+            ):
+                rerun = run_trace(
+                    layout, ["P"], {"1"}, None, agent_jar,
+                    None, None, 5, force=True,
+                )
+            self.assertEqual(rerun[0]["status"], "OK")
+            self.assertTrue((
+                layout.artifacts / "P/bug_1/trace_suite.json"
+            ).is_file())
+            self.assertFalse(trigger.exists())
+
+    def test_failed_raw_trace_is_stream_compressed(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
-            (output / "execution_assertion_pruned.json").write_text(
-                json.dumps(execution), encoding="utf-8"
-            )
-            _ensure_assertion_artifacts(output, execution)
-            folding = json.loads(
-                (output / "assertion_folding.json").read_text(encoding="utf-8")
-            )
-            self.assertEqual(folding["folded_call_count"], 0)
-            self.assertFalse((output / "execution_assertion_pruned.json").exists())
+            raw = output / "raw_events.jsonl"
+            raw.write_text('{"type":"TEST_START"}\n', encoding="utf-8")
+            target = archive_failed_raw_trace(output)
+            self.assertEqual(target, output / "raw_events.failed.jsonl.zst")
+            self.assertFalse(raw.exists())
+            import zstandard
+            with zstandard.open(target, "rb") as handle:
+                self.assertEqual(handle.read(), b'{"type":"TEST_START"}\n')
 
     def test_folds_only_complete_passed_assertion_subtrees(self):
         raw = [
@@ -352,7 +465,9 @@ class ExecutionProjectionTests(unittest.TestCase):
         repeated[7]["seq"] = 8
         execution = project_execution(build_trace(repeated), "p.Test", "testCase")
         self.assertEqual(execution["call_count"], 2)
-        self.assertEqual([call["count"] for call in execution["calls"]], [1, 1])
-        self.assertEqual(
-            [call["invocation_ids"] for call in execution["calls"]], [[2], [3]]
-        )
+        self.assertTrue(all(
+            "count" not in call
+            and "context" not in call
+            and "invocation_ids" not in call
+            for call in execution["calls"]
+        ))

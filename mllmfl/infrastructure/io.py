@@ -1,7 +1,10 @@
 import csv
+import io
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
+
+import zstandard
 
 
 def read_json(path: Path) -> Any:
@@ -25,6 +28,54 @@ def write_compact_json(path: Path, value: Any) -> None:
         encoding="utf-8",
     )
     temporary.replace(path)
+
+
+def read_zstd_json(path: Path) -> Any:
+    try:
+        with path.open("rb") as source:
+            with zstandard.ZstdDecompressor().stream_reader(source) as compressed:
+                return json.load(compressed)
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zstandard.ZstdError,
+    ) as error:
+        raise ValueError(f"cannot read zstd JSON {path}: {error}") from error
+
+
+def write_zstd_json(path: Path, value: Any, *, level: int = 1) -> None:
+    """Atomically write compact UTF-8 JSON using fast zstd compression."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temporary.open("wb") as target:
+            with zstandard.ZstdCompressor(level=level).stream_writer(target) as compressed:
+                with io.TextIOWrapper(compressed, encoding="utf-8") as text:
+                    json.dump(
+                        value,
+                        text,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+        temporary.replace(path)
+    except (OSError, TypeError, ValueError, zstandard.ZstdError):
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def compress_zstd_file(source: Path, target: Path, *, level: int = 1) -> None:
+    """Atomically compress one file without loading it into memory."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".tmp")
+    try:
+        with source.open("rb") as input_handle, temporary.open("wb") as output_handle:
+            compressor = zstandard.ZstdCompressor(level=level)
+            compressor.copy_stream(input_handle, output_handle)
+        temporary.replace(target)
+    except (OSError, zstandard.ZstdError):
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def write_text(path: Path, value: str) -> None:

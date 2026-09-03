@@ -92,6 +92,12 @@ class RefinementEvaluationTests(unittest.TestCase):
                     "name": "f", "line": "src/p/A.java:10",
                 }],
             })
+            (bug_dir / "traces").mkdir()
+            (bug_dir / "traces/intermediate.bin").write_bytes(b"trace")
+            (bug_dir / "trace_suite.json").write_text("suite")
+            workspace = layout.workspace_dir("Chart", "1")
+            workspace.mkdir(parents=True)
+            (workspace / "source.txt").write_text("source")
             truth = [{
                 "function": "p.A.f",
                 "source_file": "src/p/A.java",
@@ -100,7 +106,17 @@ class RefinementEvaluationTests(unittest.TestCase):
             }]
             with patch.object(evaluate, "ground_truth_locations", return_value=truth):
                 rows = evaluate.run(layout, ["Chart"], {"1"}, Path("/d4j"))
+                self.assertTrue((bug_dir / "traces/intermediate.bin").is_file())
+                self.assertTrue(workspace.is_dir())
+                final_rows = evaluate.run(
+                    layout, ["Chart"], {"1"}, Path("/d4j"), final_only=True
+                )
             self.assertEqual(rows[0]["status"], "OK")
+            self.assertEqual(final_rows[0]["status"], "OK")
+            self.assertFalse((bug_dir / "traces").exists())
+            self.assertFalse((bug_dir / "trace_suite.json").exists())
+            self.assertFalse(workspace.exists())
+            self.assertTrue((bug_dir / "refinement.json").is_file())
             report = validate_evaluation(
                 read_json(layout.summaries / "evaluation.json")
             )

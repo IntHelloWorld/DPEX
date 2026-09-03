@@ -4,9 +4,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 from mllmfl.domain.focus_viewport import plan_focus_viewport
-from mllmfl.domain.schemas import validate_trace_index, validate_trace_suite
-from mllmfl.domain.trace import EXECUTION_SCHEMA, validate_trace
-from mllmfl.infrastructure.io import append_jsonl, read_json
+from mllmfl.domain.refinement_trace import (
+    RefinementTraceTopology,
+)
+from mllmfl.domain.schemas import validate_trace_suite
+from mllmfl.infrastructure.io import append_jsonl, read_json, read_zstd_json
 from mllmfl.infrastructure.method_location import (
     java_executables,
     resolve_method_location,
@@ -15,9 +17,6 @@ from mllmfl.infrastructure.method_location import (
     signature_parameter_types,
 )
 from mllmfl.infrastructure.plantuml import ensure_rendered, runtime_settings
-from mllmfl.domain.execution_compression import compress_execution
-from mllmfl.stages.trace import compression_recursion_limit
-
 from .focus_graph import focus_graph_diagram_nodes
 
 
@@ -75,7 +74,7 @@ EXECUTION_GRAPH_TOOL = {
         "Generate and render one local graph around one exact runtime invocation "
         "identified by a test-scoped invocation ID. IDs returned by "
         "find_method_invocation_id and IDs visible on a graph are both accepted. "
-        "The result includes concise visible/omitted call counts and the focused "
+        "The result reports the exact omitted dynamic-call count and the focused "
         "source method anchor."
     ),
     "parameters": {
@@ -99,9 +98,8 @@ class _TraceRecord:
     test_id: str
     test: str
     trigger: str
-    execution_path: Path
-    default_execution_path: Path
-    methods: Dict[str, list[Dict[str, Any]]]
+    trace_path: Path
+    topology: RefinementTraceTopology
 
 
 @dataclass(frozen=True)
@@ -112,8 +110,8 @@ class _Invocation:
     test_id: str
     test: str
     trigger: str
-    context: Dict[str, Any]
-    execution_path: Path
+    raw_invocation_id: int
+    topology: RefinementTraceTopology
 
 
 def _normalized_function(signature: str) -> str:
@@ -141,6 +139,7 @@ class MethodExecutionGraphs:
         max_internal_calls: int = 10,
         workspace: Path | None = None,
         allowed_test_ids: list[str] | None = None,
+        retain_debug_artifacts: bool = False,
     ) -> None:
         if max_upstream_calls < 1:
             raise ValueError("max_upstream_calls must be positive")
@@ -155,6 +154,7 @@ class MethodExecutionGraphs:
         self.max_downstream_calls = max_downstream_calls
         self.max_internal_calls = max_internal_calls
         self.workspace = workspace
+        self.retain_debug_artifacts = retain_debug_artifacts
         self.suite = validate_trace_suite(
             read_json(bug_dir / "trace_suite.json")
         )
@@ -184,7 +184,6 @@ class MethodExecutionGraphs:
             for item in self.catalog
         }
         self._records = self._load_trace_records()
-        self._invocation_by_id = self._index_invocations()
         self._nodes: Dict[str, Dict[str, Any]] = {}
         self._node_roots: Dict[str, Path] = {}
         self._entry_cache: Dict[str, str] = {}
@@ -201,36 +200,28 @@ class MethodExecutionGraphs:
             test_id = str(spec["test_id"])
             if test_id not in self.allowed_test_ids:
                 continue
-            index_path = self.bug_dir / Path(
-                *Path(str(spec["trace_index"])).parts
-            )
-            index = validate_trace_index(read_json(index_path), index_path.parent)
+            trace_path = self.bug_dir / Path(*Path(str(spec["trace"])).parts)
+            topology = RefinementTraceTopology.build(read_zstd_json(trace_path))
+            trace = topology.trace
             if (
-                index["test_id"] != test_id
-                or index["test"] != spec["test"]
-                or index["method_catalog_fingerprint"]
+                trace["test_id"] != test_id
+                or trace["test"] != spec["test"]
+                or trace["fingerprint"] != spec["trace_fingerprint"]
+                or trace["method_catalog_fingerprint"]
                 != self.suite["method_catalog_fingerprint"]
                 or any(
-                    method["method_id"] not in self.catalog_by_id
-                    for method in index["methods"]
+                    method[0] not in self.catalog_by_id
+                    for method in trace["methods"]
+                    if str(method[0]).startswith("M")
                 )
             ):
-                raise ValueError(f"trace suite index mismatch for {test_id}")
-            methods = {
-                str(item["method_id"]): [
-                    dict(occurrence) for occurrence in item["occurrences"]
-                ]
-                for item in index["methods"]
-            }
+                raise ValueError(f"trace suite payload mismatch for {test_id}")
             record = _TraceRecord(
                 test_id=test_id,
-                test=str(index["test"]),
+                test=str(trace["test"]),
                 trigger=str(spec["trigger"]),
-                execution_path=index_path.parent / str(index["execution"]),
-                default_execution_path=(
-                    index_path.parent / str(index["default_execution"])
-                ),
-                methods=methods,
+                trace_path=trace_path,
+                topology=topology,
             )
             if test_id in records:
                 raise ValueError(f"duplicate failing-test ID: {test_id}")
@@ -241,38 +232,24 @@ class MethodExecutionGraphs:
         return {
             method_id
             for record in self._records.values()
-            for method_id in record.methods
+            for method_id in record.topology.method_invocations
         }
 
-    def _index_invocations(self) -> Dict[str, _Invocation]:
-        result: Dict[str, _Invocation] = {}
-        for test_id, record in self._records.items():
-            for method_id, contexts in record.methods.items():
-                catalog = self.catalog_by_id.get(method_id)
-                if catalog is None:
-                    raise ValueError(f"trace index references unknown method: {method_id}")
-                for context in contexts:
-                    raw_id = int(context["invocation_id"])
-                    invocation_id = f"{test_id}-C{raw_id}"
-                    selected = _Invocation(
-                        invocation_id=invocation_id,
-                        method_id=method_id,
-                        signature=str(catalog["signature"]),
-                        test_id=test_id,
-                        test=record.test,
-                        trigger=record.trigger,
-                        context=dict(context),
-                        execution_path=(
-                            record.execution_path
-                            if context.get("successful_assertion_fold_id") is not None
-                            else record.default_execution_path
-                        ),
-                    )
-                    if invocation_id in result:
-                        raise ValueError(
-                            f"duplicate runtime invocation ID: {invocation_id}"
-                        )
-                    result[invocation_id] = selected
+    def failure_evidence(
+        self, test_ids: list[str]
+    ) -> list[Dict[str, str]]:
+        result = []
+        for test_id in test_ids:
+            record = self._records.get(test_id)
+            if record is None:
+                raise ValueError(f"unknown selected failing test: {test_id}")
+            failure = record.topology.trace["failure"]
+            result.append({
+                "test_id": test_id,
+                "test": record.test,
+                "error_stack": str(failure["error_stack"]),
+                "test_output": str(failure["test_output"]),
+            })
         return result
 
     def _matching_method_ids(self, signature: str) -> list[str]:
@@ -371,21 +348,8 @@ class MethodExecutionGraphs:
                     + ", ".join(matches)
                 )
             method_id = method_ids[0]
-            all_values = record.methods.get(method_id) or []
-            folded_values = [
-                item for item in all_values
-                if item.get("successful_assertion_fold_id") is not None
-            ]
-            values = [
-                item for item in all_values
-                if item.get("successful_assertion_fold_id") is None
-            ]
+            values = record.topology.method_invocations.get(method_id) or ()
             if not values:
-                if folded_values:
-                    raise ValueError(
-                        "method occurs only inside passed-assertion folds for "
-                        f"{test_id} and is hidden from refinement"
-                    )
                 raise ValueError(
                     f"source method has no invocation in failing test {test_id}"
                 )
@@ -397,11 +361,10 @@ class MethodExecutionGraphs:
             self.queried_methods.append(queried_method)
         page = values[offset:offset + limit]
         invocations = []
-        for context in page:
-            raw_id = int(context["invocation_id"])
+        for raw_id in page:
             invocations.append({
                 "invocation_id": f"{test_id}-C{raw_id}",
-                "caller": str(context["caller_signature"]),
+                "caller": record.topology.caller_signature(raw_id),
             })
         return {
             "ok": True,
@@ -413,30 +376,37 @@ class MethodExecutionGraphs:
         }
 
     def _build_start(self, invocation_id: str) -> tuple[str, _Invocation]:
-        selected = self._invocation_by_id.get(invocation_id)
-        if selected is None:
+        match = re.fullmatch(r"(T[1-9]\d*)-C([1-9]\d*)", invocation_id)
+        record = self._records.get(match.group(1)) if match is not None else None
+        raw_id = int(match.group(2)) if match is not None else 0
+        if record is None or not record.topology.has_call(raw_id):
             raise ValueError(
                 "unknown invocation_id; use an ID returned by "
                 "find_method_invocation_id or visible in an execution graph"
             )
+        method_id = record.topology.method_id(raw_id)
+        catalog = self.catalog_by_id.get(method_id)
+        if catalog is None:
+            raise ValueError("runtime invocation method is absent from suite catalog")
+        selected = _Invocation(
+            invocation_id=invocation_id,
+            method_id=method_id,
+            signature=str(catalog["signature"]),
+            test_id=record.test_id,
+            test=record.test,
+            trigger=record.trigger,
+            raw_invocation_id=raw_id,
+            topology=record.topology,
+        )
         existing = self._entry_cache.get(invocation_id)
         if existing is not None:
             return existing, selected
 
-        execution = validate_trace(read_json(selected.execution_path), EXECUTION_SCHEMA)
-        focus_id = int(selected.context["invocation_id"])
-        if not any(
-            int(call["invocation_id"]) == focus_id
-            for call in execution["calls"]
-        ):
-            raise ValueError("runtime invocation is absent from its execution trace")
-        with compression_recursion_limit(execution):
-            compressed = compress_execution(
-                execution, protected_invocation_ids=frozenset({focus_id})
-            )
+        topology = selected.topology
+        focus_id = selected.raw_invocation_id
         namespace = (
             f"{selected.test_id}-{selected.method_id}-C"
-            f"{int(selected.context['invocation_id'])}"
+            f"{focus_id}"
         )
         root = self.bug_dir / "inspection_graphs"
         directory = root / namespace
@@ -450,18 +420,15 @@ class MethodExecutionGraphs:
             "limit_size": limit_size,
         }
         entry_id = f"{namespace}-D1"
-        with compression_recursion_limit(execution):
-            planned_node = plan_focus_viewport(
-                diagram_id=entry_id,
-                focus_invocation_id=focus_id,
-                execution=execution,
-                compressed=compressed,
-                max_upstream_calls=self.max_upstream_calls,
-                max_downstream_calls=self.max_downstream_calls,
-                max_internal_calls=self.max_internal_calls,
-            )
+        planned_node = plan_focus_viewport(
+            diagram_id=entry_id,
+            focus_invocation_id=focus_id,
+            topology=topology,
+            max_upstream_calls=self.max_upstream_calls,
+            max_downstream_calls=self.max_downstream_calls,
+            max_internal_calls=self.max_internal_calls,
+        )
         nodes, rendered_entry_id, failures, _ = focus_graph_diagram_nodes(
-            execution,
             directory,
             planned_graph={
                 "entry_diagram_id": entry_id,
@@ -566,7 +533,7 @@ class MethodExecutionGraphs:
             focus_method = self._focus_method(selected)
             image_path = self._image_path(diagram_id)
         except (OSError, RuntimeError, ValueError) as error:
-            if diagram_id in self._nodes:
+            if diagram_id in self._nodes and self.retain_debug_artifacts:
                 append_jsonl(self.bug_dir / "refine_render_errors.jsonl", {
                     "schema": "on-demand-render-error",
                     "schema_version": 1,
@@ -582,7 +549,9 @@ class MethodExecutionGraphs:
             "ok": True,
             "invocation_id": invocation_id,
             "visible_call_count": int(node["visible_call_count"]),
-            "omitted_call_count": int(node.get("omitted_call_count") or 0),
+            "omitted_call_count": int(node["omitted_call_count"]),
+            "has_omitted_calls": bool(node["has_omitted_calls"]),
+            "omitted_region_count": int(node["omitted_region_count"]),
             "focus_method": focus_method,
         }
         if selected.method_id not in self.inspected_method_ids:

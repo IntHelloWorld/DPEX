@@ -2,9 +2,6 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
-from mllmfl.domain.schemas import validate_defect_context
-from mllmfl.infrastructure.io import read_json
-from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.method_location import (
     java_executables,
     resolve_method_location,
@@ -30,7 +27,8 @@ tests listed in the prompt; tests excluded by the upstream locator are outside t
 An execution graph is a sequence diagram read from top to bottom. Participants are runtime classes;
 solid arrows are method calls, and dashed arrows are returns or throws. Each call arrow starts with
 an exact test-scoped invocation_id such as T1-C32, and the highlighted call is the selected focus.
-A self-directed `... omit N calls ...` arrow represents N hidden dynamic calls.
+A self-directed `... omit N calls ...` arrow marks a hidden execution region; N is the exact
+number of dynamic calls represented by that region.
 
 Do not overthink. Call at most one tool in each assistant response.
 
@@ -44,19 +42,6 @@ with bash. Give a concise, candidate-specific reason grounded in runtime
 behavior and relevant source evidence."""
 
 
-def defect_output_context(
-    directory: Path,
-    test: str,
-) -> tuple[str, str]:
-    context_path = directory / "defect_context.json"
-    if not context_path.is_file():
-        raise ValueError("defect_context.json is required before refinement")
-    context = validate_defect_context(read_json(context_path))
-    if context["test"] != test:
-        raise ValueError("defect context test does not match trigger test")
-    return str(context["error_stack"]), str(context["test_output"])
-
-
 def build_system_prompt(top_k: int) -> str:
     if top_k <= 0:
         raise ValueError("top_k must be positive")
@@ -68,65 +53,44 @@ def runtime_method_ids(
     catalog: Sequence[Dict[str, Any]],
     workspace: Path,
 ) -> Dict[str, str]:
-    locations: Dict[tuple[str, int, int], list[str]] = {}
     signatures: Dict[str, list[str]] = {}
+    functions: Dict[str, list[Dict[str, Any]]] = {}
     for item in catalog:
         method_id = str(item["method_id"])
         signature = str(item["signature"])
         signatures.setdefault(signature, []).append(method_id)
-        try:
-            location = resolve_method_location(
-                workspace,
-                str(item["function"]),
-                descriptor=str(item.get("descriptor") or ""),
-                signature=signature,
-            )
-        except (OSError, UnicodeError, ValueError):
-            continue
-        locations.setdefault((
-            location.source_file, location.start_line, location.end_line,
-        ), []).append(method_id)
+        functions.setdefault(str(item["function"]), []).append(item)
     result = {}
     for candidate in candidates:
-        location = (
+        candidate_location = (
             str(candidate["source_file"]),
             int(candidate["start_line"]),
             int(candidate["end_line"]),
         )
-        matches = locations.get(location, [])
-        if len(matches) != 1:
-            matches = signatures.get(str(candidate["signature"]), [])
+        matches = signatures.get(str(candidate["signature"]), [])
         if len(matches) == 1:
             result[str(candidate["candidate_id"])] = matches[0]
-    return result
-
-
-def defect_evidence(
-    layout: RunLayout,
-    project: str,
-    bug: str,
-    suite: Dict[str, Any],
-    test_ids: Sequence[str] | None = None,
-) -> list[Dict[str, str]]:
-    result = []
-    bug_dir = layout.artifacts / project / f"bug_{bug}"
-    specs = suite["tests"]
-    if test_ids is not None:
-        by_id = {str(item["test_id"]): item for item in specs}
-        specs = [by_id[test_id] for test_id in test_ids]
-    for spec in specs:
-        index_path = bug_dir / Path(*Path(str(spec["trace_index"])).parts)
-        trigger_dir = index_path.parent
-        test = (trigger_dir / "trigger_test.txt").read_text(
-            encoding="utf-8"
-        ).strip()
-        stack, output = defect_output_context(trigger_dir, test)
-        result.append({
-            "test_id": str(spec["test_id"]),
-            "test": test,
-            "error_stack": stack,
-            "test_output": output,
-        })
+            continue
+        narrowed = functions.get(str(candidate["function"]), [])
+        location_matches = []
+        for item in narrowed:
+            try:
+                location = resolve_method_location(
+                    workspace,
+                    str(item["function"]),
+                    descriptor=str(item.get("descriptor") or ""),
+                    signature=str(item["signature"]),
+                )
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if (
+                location.source_file,
+                location.start_line,
+                location.end_line,
+            ) == candidate_location:
+                location_matches.append(str(item["method_id"]))
+        if len(location_matches) == 1:
+            result[str(candidate["candidate_id"])] = location_matches[0]
     return result
 
 

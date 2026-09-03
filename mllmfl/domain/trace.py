@@ -25,17 +25,22 @@ NOISE_PREFIXES = (
 
 def load_events(path: Path) -> List[Dict[str, Any]]:
     events: List[Dict[str, Any]] = []
-    lines = path.read_text(encoding="utf-8", errors="strict").splitlines()
-    for line_number, line in enumerate(lines, 1):
-        if not line.strip():
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ValueError(f"invalid event JSON at line {line_number}: {error}") from error
-        if not isinstance(event, dict):
-            raise ValueError(f"event at line {line_number} is not an object")
-        events.append(event)
+    try:
+        with path.open("r", encoding="utf-8", errors="strict") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"invalid event JSON at line {line_number}: {error}"
+                    ) from error
+                if not isinstance(event, dict):
+                    raise ValueError(f"event at line {line_number} is not an object")
+                events.append(event)
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"cannot stream trace events {path}: {error}") from error
     events.sort(key=lambda item: int(item.get("seq") or 0))
     return events
 
@@ -510,25 +515,20 @@ def project_execution(
     ]
     if not calls:
         raise ValueError("no calls remain after noise filtering")
-    projected_calls = []
-    for raw in calls:
-        call = dict(raw)
-        call.update({"count": 1, "context": False, "invocation_ids": [call["invocation_id"]]})
-        projected_calls.append(call)
     result = {
         "schema": EXECUTION_SCHEMA,
         "schema_version": full_trace["schema_version"],
         "test": {"class": test_class, "method": test_method},
         "original_call_count": len(full_trace["calls"]),
         "filtered_call_count": len(calls),
-        "call_count": len(projected_calls),
+        "call_count": len(calls),
         "test_start": full_trace.get("test_start"),
         "test_end": full_trace.get("test_end"),
         "test_failures": full_trace.get("test_failures", []),
         "assertions": list(full_trace.get("assertions") or []),
         "assertion_instrumentation": full_trace.get("assertion_instrumentation"),
         "invocations": list(full_trace["invocations"]),
-        "calls": projected_calls,
+        "calls": calls,
     }
     validate_trace(result, EXECUTION_SCHEMA)
     return result

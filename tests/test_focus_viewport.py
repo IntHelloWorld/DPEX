@@ -6,10 +6,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from mllmfl.domain.assertion_folding import fold_successful_assertions
 from mllmfl.domain.focus_viewport import plan_focus_viewport
+from mllmfl.domain.refinement_trace import (
+    RefinementTraceTopology,
+    build_method_catalog,
+    build_refinement_trace,
+)
+from mllmfl.infrastructure.io import write_zstd_json
 from mllmfl.stages.refine.graphs import MethodExecutionGraphs
-from mllmfl.stages.trace_index import build_method_catalog, build_trace_index
-from mllmfl.domain.execution_compression import compress_execution
 
 
 GENERATED_ROOT = Path(__file__).resolve().parent / "generated/focus_viewport"
@@ -51,8 +56,7 @@ def execution_from_tree(root: dict[str, Any]) -> dict[str, Any]:
             "thread_name": "main",
             "enter_seq": enter_seq,
             "enter_ns": enter_seq * 100,
-            # Repeated calls to the same method deliberately share a source line,
-            # allowing the production compressor to recognize identical patterns.
+            # Repeated calls to the same method deliberately share a source line.
             "origin_test_line": 10 + sum(
                 ord(value) for value in f"{spec['class']}.{spec['method']}"
             ) % 200,
@@ -82,9 +86,6 @@ def execution_from_tree(root: dict[str, Any]) -> dict[str, Any]:
                 "exit_seq": 0,
                 "exit_type": "RETURN",
                 "origin_test_line": invocation["origin_test_line"],
-                "count": 1,
-                "context": False,
-                "invocation_ids": [invocation_id],
             })
         for child in spec["children"]:
             visit(child, invocation)
@@ -129,6 +130,31 @@ def invocation_id(execution: dict[str, Any], method: str) -> int:
     return matches[0]
 
 
+def normalized_trace(
+    execution: dict[str, Any], *, test_id: str = "T1", test: str = "p.T::test",
+    project: str = "ViewportFixtures",
+) -> tuple[dict[str, Any], list[dict[str, str]], str]:
+    pruned, folding = fold_successful_assertions(execution)
+    catalog, method_ids, fingerprint = build_method_catalog([pruned])
+    trace = build_refinement_trace(
+        pruned,
+        project=project,
+        test_id=test_id,
+        test=test,
+        method_ids=method_ids,
+        catalog_fingerprint=fingerprint,
+        assertion_folding=folding,
+        error_stack="",
+        test_output="",
+    )
+    return trace, catalog, fingerprint
+
+
+def topology(execution: dict[str, Any]) -> RefinementTraceTopology:
+    trace, _, _ = normalized_trace(execution)
+    return RefinementTraceTopology.build(trace)
+
+
 def write_fixture_sources(
     workspace: Path, execution: dict[str, Any]
 ) -> dict[str, str]:
@@ -171,33 +197,23 @@ class FocusViewportSplitTests(unittest.TestCase):
         case_dir = GENERATED_ROOT / scenario
         if case_dir.exists():
             shutil.rmtree(case_dir)
-        trigger_dir = case_dir / "triggers/trigger_1"
-        trigger_dir.mkdir(parents=True)
+        trace_dir = case_dir / "traces"
+        trace_dir.mkdir(parents=True)
         execution = execution_from_tree(call_tree)
         if execution_mutator is not None:
             execution_mutator(execution)
         workspace = case_dir / "workspace"
         references = write_fixture_sources(workspace, execution)
-        catalog, method_ids, fingerprint = build_method_catalog([execution])
-        index = build_trace_index(
-            execution,
-            test_id="T1",
-            test=f"{call_tree['class']}::{call_tree['method']}",
-            method_ids=method_ids,
-            catalog_fingerprint=fingerprint,
+        test = f"{call_tree['class']}::{call_tree['method']}"
+        trace, catalog, fingerprint = normalized_trace(
+            execution, test=test,
         )
-        for name, value in (
-            ("execution.json", execution),
-            ("trace_index.json", index),
-        ):
-            (trigger_dir / name).write_text(
-                json.dumps(value, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+        trace_path = trace_dir / "T1.refinement-trace.json.zst"
+        write_zstd_json(trace_path, trace)
         (case_dir / "trace_suite.json").write_text(
             json.dumps({
                 "schema": "execution-trace-suite",
-                "schema_version": 1,
+                "schema_version": 2,
                 "project": "ViewportFixtures",
                 "bug": scenario,
                 "method_catalog_fingerprint": fingerprint,
@@ -205,9 +221,10 @@ class FocusViewportSplitTests(unittest.TestCase):
                 "test_count": 1,
                 "tests": [{
                     "test_id": "T1",
-                    "test": f"{call_tree['class']}::{call_tree['method']}",
+                    "test": test,
                     "trigger": 1,
-                    "trace_index": "triggers/trigger_1/trace_index.json",
+                    "trace": "traces/T1.refinement-trace.json.zst",
+                    "trace_fingerprint": trace["fingerprint"],
                 }],
             }, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -428,11 +445,9 @@ class FocusViewportSplitTests(unittest.TestCase):
                 "fold_kinds": [
                     fold["kind"] for fold in value["node"]["folds"]
                 ],
-                "omitted_call_count": value["node"]["omitted_call_count"],
+                "has_omitted_calls": value["node"]["has_omitted_calls"],
+                "omitted_region_count": value["node"]["omitted_region_count"],
                 "links": value["node"]["links"],
-                "semantic_child_coverage": value["node"][
-                    "semantic_child_coverage"
-                ],
             } for diagram_id, value in sorted(rendered.items())],
         }
         (GENERATED_ROOT / scenario / "manifest.json").write_text(
@@ -441,23 +456,23 @@ class FocusViewportSplitTests(unittest.TestCase):
         )
         return entry_id, rendered
 
-    def _assert_every_child_covered_once(
+    def _assert_omission_regions_consistent(
         self,
         rendered: dict[str, dict[str, Any]],
     ) -> None:
         for value in rendered.values():
-            for coverage in value["node"]["semantic_child_coverage"]:
-                expected = coverage["child_invocation_ids"]
-                covered = [
-                    *coverage["visible_child_invocation_ids"],
-                    *(
-                        child_id
-                        for child_range in coverage["omitted_child_ranges"]
-                        for child_id in child_range
-                    ),
-                ]
-                self.assertEqual(set(covered), set(expected))
-                self.assertEqual(len(covered), len(set(covered)))
+            node = value["node"]
+            self.assertEqual(node["has_omitted_calls"], bool(node["folds"]))
+            self.assertEqual(node["omitted_region_count"], len(node["folds"]))
+            self.assertEqual(
+                node["visible_represented_call_count"]
+                + node["omitted_call_count"],
+                node["represented_call_count"],
+            )
+            self.assertEqual(
+                sum(fold["represented_call_count"] for fold in node["folds"]),
+                node["omitted_call_count"],
+            )
 
     def test_small_graph_fits_one_image_without_navigation(self):
         graphs, _ = self._make_graphs(
@@ -486,7 +501,7 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertIn("title Invocation ID: T1-C2", puml)
         self.assertIn("T1-C2 focus()", puml)
         self.assertNotRegex(puml, r"\b[TMCD]0\d")
-        self._assert_every_child_covered_once(rendered)
+        self._assert_omission_regions_consistent(rendered)
 
     def test_deep_chain_uses_one_omission_self_arrow(self):
         graphs, _ = self._make_graphs(
@@ -512,18 +527,19 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertEqual(set(rendered), {entry_id})
         entry = rendered[entry_id]["node"]
         self.assertEqual(entry["links"], [])
-        self.assertEqual(entry["omitted_call_count"], 1)
+        self.assertTrue(entry["has_omitted_calls"])
+        self.assertEqual(entry["omitted_region_count"], 1)
         self.assertEqual([fold["kind"] for fold in entry["folds"]], [
             "OMITTED_CALLS"
         ])
         puml = rendered[entry_id]["puml"].read_text(encoding="utf-8")
-        self.assertEqual(puml.count("... omit 1 calls ..."), 1)
+        self.assertEqual(puml.count("... omit "), 1)
         self.assertNotIn("note ", puml)
         self.assertNotIn("Note", puml)
         self.assertNotIn("TO ", puml)
         self.assertNotIn("FROM ", puml)
         self.assertNotIn("VIEW ", puml)
-        self._assert_every_child_covered_once(rendered)
+        self._assert_omission_regions_consistent(rendered)
 
     def test_call_budget_marks_prefix_and_suffix_omissions(self):
         graphs, execution = self._make_graphs(
@@ -558,27 +574,16 @@ class FocusViewportSplitTests(unittest.TestCase):
             rendered[entry_id]["node"]["downstream_visible_call_count"], 1
         )
         self.assertEqual(rendered[entry_id]["node"]["links"], [])
-        self.assertEqual(rendered[entry_id]["node"]["omitted_call_count"], 2)
-        root_id = invocation_id(execution, "fails")
-        expected_children = [
-            int(call["invocation_id"])
-            for call in execution["calls"]
-            if int(call["parent_invocation_id"]) == root_id
-        ]
+        self.assertTrue(rendered[entry_id]["node"]["has_omitted_calls"])
+        self.assertEqual(rendered[entry_id]["node"]["omitted_region_count"], 2)
         value = rendered[entry_id]
         puml = value["puml"].read_text(encoding="utf-8")
-        self.assertEqual(puml.count("... omit 1 calls ..."), 2)
+        self.assertEqual(puml.count("... omit "), 2)
         self.assertNotIn("note right of ", puml)
         self.assertNotIn("note left of ", puml)
         self.assertNotIn("VIEW ", puml)
         self.assertNotIn("    Padding 5", puml)
-        coverage = next(
-            item for item in value["node"]["semantic_child_coverage"]
-            if item["parent_invocation_id"] == root_id
-        )
-        self.assertEqual(coverage["child_invocation_ids"], expected_children)
-        self.assertEqual(coverage["omitted_child_ranges"], [[2], [6]])
-        self._assert_every_child_covered_once(rendered)
+        self._assert_omission_regions_consistent(rendered)
 
     def test_call_budget_is_independent_of_participant_count(self):
         graphs, _ = self._make_graphs(
@@ -604,7 +609,7 @@ class FocusViewportSplitTests(unittest.TestCase):
             rendered[entry_id]["node"]["downstream_visible_call_count"], 3
         )
         self.assertGreater(rendered[entry_id]["node"]["participant_count"], 3)
-        self._assert_every_child_covered_once(rendered)
+        self._assert_omission_regions_consistent(rendered)
 
     def test_context_search_moves_to_higher_level_after_siblings_are_exhausted(self):
         graphs, _ = self._make_graphs(
@@ -640,7 +645,7 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertEqual(
             rendered[entry_id]["node"]["upstream_visible_call_count"], 3
         )
-        self._assert_every_child_covered_once(rendered)
+        self._assert_omission_regions_consistent(rendered)
 
     def test_parent_chain_consumes_upstream_budget(self):
         current = tree("p.Service", "focus")
@@ -669,15 +674,13 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertEqual(node["downstream_visible_call_count"], 0)
         self.assertEqual(node["internal_visible_call_count"], 0)
         self.assertEqual(node["visible_unit_count"], 7)
-        self.assertEqual(
-            node["visible_represented_call_count"] + node["omitted_call_count"],
-            execution["call_count"],
-        )
-        self.assertGreater(node["omitted_call_count"], 0)
+        self.assertTrue(node["has_omitted_calls"])
+        self.assertEqual(node["omitted_region_count"], 1)
         boundary_fold = next(
             fold for fold in node["folds"]
-            if fold.get("boundary_context") is True
+            if fold["scope"] == "OUTER_CONTEXT"
         )
+        self.assertEqual(boundary_fold["anchor_invocation_id"], 8)
         self.assertEqual(boundary_fold["represented_call_count"], 7)
         self.assertEqual(boundary_fold["leading_call_count"], 6)
         self.assertEqual(boundary_fold["trailing_call_count"], 1)
@@ -687,11 +690,9 @@ class FocusViewportSplitTests(unittest.TestCase):
         trailing = "... omit 1 calls ..."
         self.assertEqual(puml.count(leading), 1)
         self.assertEqual(puml.count(trailing), 1)
-        self.assertRegex(puml, rf"\[-> p_[0-9a-f]+: {re.escape(leading)}")
-        self.assertRegex(puml, rf"p_[0-9a-f]+ -->\]: {re.escape(trailing)}")
         self.assertLess(puml.index(leading), puml.index(" level6()"))
         self.assertGreater(puml.index(trailing), puml.rindex(": return"))
-        self._assert_every_child_covered_once(rendered)
+        self._assert_omission_regions_consistent(rendered)
 
     def test_near_siblings_are_selected_before_higher_level_siblings(self):
         graphs, _ = self._make_graphs(
@@ -734,11 +735,12 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertEqual(
             rendered[entry_id]["node"]["upstream_visible_call_count"], 2
         )
-        self.assertEqual(rendered[entry_id]["node"]["omitted_call_count"], 2)
+        self.assertTrue(rendered[entry_id]["node"]["has_omitted_calls"])
+        self.assertEqual(rendered[entry_id]["node"]["omitted_region_count"], 1)
 
-    def test_unfittable_near_repeat_blocks_farther_context(self):
+    def test_bounded_context_marks_unselected_nearby_calls(self):
         graphs, _ = self._make_graphs(
-            "atomic_near_context_first",
+            "bounded_near_context_first",
             tree(
                 "p.RootTest", "fails",
                 tree("p.Outer", "outerBefore"),
@@ -755,7 +757,7 @@ class FocusViewportSplitTests(unittest.TestCase):
         )
 
         entry_id, rendered = self._render_all(
-            "atomic_near_context_first", graphs
+            "bounded_near_context_first", graphs
         )
 
         node = rendered[entry_id]["node"]
@@ -763,11 +765,11 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertNotIn("p.Outer.outerBefore()", node["method_signatures"])
         self.assertNotIn("p.WorkerA.stepA()", node["method_signatures"])
         self.assertNotIn("p.WorkerB.stepB()", node["method_signatures"])
-        self.assertEqual(node["omitted_call_count"], 5)
+        self.assertTrue(node["has_omitted_calls"])
+        self.assertEqual(node["omitted_region_count"], 2)
         puml = rendered[entry_id]["puml"].read_text(encoding="utf-8")
-        self.assertIn("... omit 1 calls ...", puml)
-        self.assertIn("... omit 4 calls ...", puml)
-        self._assert_every_child_covered_once(rendered)
+        self.assertEqual(puml.count("... omit "), 2)
+        self._assert_omission_regions_consistent(rendered)
 
     def test_internal_calls_are_selected_in_breadth_first_order(self):
         graphs, _ = self._make_graphs(
@@ -796,12 +798,12 @@ class FocusViewportSplitTests(unittest.TestCase):
             rendered[entry_id]["node"]["method_signatures"],
             ["p.Service.focus()", "p.First.first()", "p.Second.second()"],
         )
-        self.assertEqual(rendered[entry_id]["node"]["omitted_call_count"], 2)
-        self.assertEqual(
-            [fold["represented_call_count"]
-             for fold in rendered[entry_id]["node"]["folds"]],
-            [1, 1],
-        )
+        self.assertTrue(rendered[entry_id]["node"]["has_omitted_calls"])
+        self.assertEqual(rendered[entry_id]["node"]["omitted_region_count"], 2)
+        self.assertTrue(all(
+            fold["scope"] == "CHILDREN"
+            for fold in rendered[entry_id]["node"]["folds"]
+        ))
 
     def test_complex_graph_respects_three_six_call_windows(self):
         downstream_specs = [
@@ -863,12 +865,8 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertEqual(node["upstream_visible_call_count"], 6)
         self.assertEqual(node["downstream_visible_call_count"], 3)
         self.assertEqual(node["internal_visible_call_count"], 6)
-        self.assertEqual(node["represented_call_count"], execution["call_count"])
-        self.assertEqual(
-            node["visible_represented_call_count"] + node["omitted_call_count"],
-            execution["call_count"],
-        )
-        self.assertGreater(node["omitted_call_count"], 0)
+        self.assertTrue(node["has_omitted_calls"])
+        self.assertGreater(node["omitted_region_count"], 0)
         self.assertTrue(all(
             fold["kind"] == "OMITTED_CALLS" for fold in node["folds"]
         ))
@@ -878,10 +876,10 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertNotIn("TO ", puml)
         self.assertNotIn("FROM ", puml)
         self.assertNotIn("VIEW ", puml)
-        self.assertIn("... omit 14 calls ...", puml)
-        self._assert_every_child_covered_once(rendered)
+        self.assertRegex(puml, r"\.\.\. omit \d+ calls \.\.\.")
+        self._assert_omission_regions_consistent(rendered)
 
-    def test_repeated_sequence_remains_atomic_in_one_focus_image(self):
+    def test_repeated_sequence_uses_nearest_raw_calls(self):
         call_tree = tree(
             "p.RootTest", "fails",
             tree("p.WorkerA", "stepA"),
@@ -900,17 +898,12 @@ class FocusViewportSplitTests(unittest.TestCase):
 
         self.assertEqual(set(rendered), {entry_id})
         sibling = rendered[entry_id]["node"]
-        visible = next(
-            item["visible_child_invocation_ids"]
-            for item in sibling["semantic_child_coverage"]
-            if item["parent_invocation_id"] == invocation_id(execution, "fails")
-        )
-        self.assertEqual(len(visible), 3)
         self.assertEqual(sibling["upstream_visible_call_count"], 3)
-        self.assertEqual(sibling["represented_call_count"], 5)
-        self._assert_every_child_covered_once(rendered)
+        self.assertEqual(sibling["visible_unit_count"], 4)
+        self.assertEqual(sibling["omitted_region_count"], 1)
+        self._assert_omission_regions_consistent(rendered)
 
-    def test_omission_count_scales_with_repeated_parent_subtrees(self):
+    def test_repeated_parent_subtrees_are_not_compressed(self):
         graphs, execution = self._make_graphs(
             "repeated_parent_omission",
             tree(
@@ -935,17 +928,15 @@ class FocusViewportSplitTests(unittest.TestCase):
         )
 
         node = rendered[entry_id]["node"]
-        self.assertEqual(node["represented_call_count"], execution["call_count"])
-        self.assertEqual(node["visible_represented_call_count"], 3)
-        self.assertEqual(node["omitted_call_count"], 2)
-        self.assertEqual(len(node["folds"]), 1)
-        self.assertEqual(node["folds"][0]["represented_call_count"], 2)
+        self.assertTrue(node["has_omitted_calls"])
+        self.assertEqual(node["omitted_region_count"], 2)
+        self.assertEqual(len(node["folds"]), 2)
         puml = rendered[entry_id]["puml"].read_text(encoding="utf-8")
-        self.assertIn("work() ×2", puml)
-        self.assertIn("... omit 2 calls ...", puml)
-        self._assert_every_child_covered_once(rendered)
+        self.assertNotIn("work() ×2", puml)
+        self.assertEqual(puml.count("... omit "), 2)
+        self._assert_omission_regions_consistent(rendered)
 
-    def test_atomic_repeated_sequence_is_omitted_when_budget_is_too_small(self):
+    def test_repeated_sequence_budget_selects_nearest_raw_call(self):
         execution = execution_from_tree(tree(
             "p.RootTest", "fails",
             tree("p.WorkerA", "stepA"),
@@ -955,26 +946,21 @@ class FocusViewportSplitTests(unittest.TestCase):
             tree("p.Service", "focus"),
         ))
         focus_id = invocation_id(execution, "focus")
-        compressed = compress_execution(
-            execution,
-            protected_invocation_ids=frozenset({focus_id}),
-        )
-
         plan = plan_focus_viewport(
             diagram_id="D1",
             focus_invocation_id=focus_id,
-            execution=execution,
-            compressed=compressed,
+            topology=topology(execution),
             max_upstream_calls=2,
             max_downstream_calls=2,
             max_internal_calls=8,
         )
 
         self.assertEqual(plan["links"], [])
-        self.assertEqual(plan["upstream_visible_call_count"], 1)
-        self.assertEqual(plan["omitted_call_count"], 4)
+        self.assertEqual(plan["upstream_visible_call_count"], 2)
+        self.assertTrue(plan["has_omitted_calls"])
+        self.assertEqual(plan["omitted_region_count"], 1)
         self.assertEqual(len(plan["folds"]), 1)
-        self.assertEqual(plan["folds"][0]["represented_call_count"], 4)
+        self.assertEqual(plan["folds"][0]["scope"], "CHILDREN")
 
     def test_disconnected_trace_root_is_explicitly_omitted(self):
         execution = execution_from_tree(tree(
@@ -1072,9 +1058,6 @@ class FocusViewportSplitTests(unittest.TestCase):
             "exit_seq": 7,
             "exit_type": "RETURN",
             "origin_test_line": 0,
-            "count": 1,
-            "context": False,
-            "invocation_ids": [4],
         }, {
             "caller": "p.SecondAsyncRoot.run",
             "callee": "p.SecondAsyncWorker.tick",
@@ -1092,35 +1075,25 @@ class FocusViewportSplitTests(unittest.TestCase):
             "exit_seq": 11,
             "exit_type": "RETURN",
             "origin_test_line": 0,
-            "count": 1,
-            "context": False,
-            "invocation_ids": [6],
         }])
         execution["original_call_count"] = 3
         execution["filtered_call_count"] = 3
         execution["call_count"] = 3
-        compressed = compress_execution(
-            execution, protected_invocation_ids=frozenset({2})
-        )
-
         plan = plan_focus_viewport(
             diagram_id="D1",
             focus_invocation_id=2,
-            execution=execution,
-            compressed=compressed,
+            topology=topology(execution),
             max_upstream_calls=1,
             max_downstream_calls=1,
             max_internal_calls=1,
         )
 
-        self.assertEqual(plan["represented_call_count"], 3)
-        self.assertEqual(plan["visible_represented_call_count"], 1)
-        self.assertEqual(plan["omitted_call_count"], 2)
+        self.assertTrue(plan["has_omitted_calls"])
+        self.assertEqual(plan["omitted_region_count"], 1)
         self.assertEqual(len(plan["folds"]), 1)
         async_fold = plan["folds"][0]
         self.assertEqual(async_fold["anchor_invocation_id"], 1)
-        self.assertEqual(async_fold["invocation_ids"], [4, 6])
-        self.assertEqual(async_fold["represented_call_count"], 2)
+        self.assertEqual(async_fold["scope"], "OUTER_CONTEXT")
         self.assertNotIn("p.AsyncRoot", plan["participant_classes"])
         self.assertNotIn("p.SecondAsyncRoot", plan["participant_classes"])
 

@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
-from mllmfl.domain.trace import EXECUTION_SCHEMA, validate_trace
 from mllmfl.infrastructure.io import write_text
 
 from mllmfl.infrastructure.sequence_diagram import (
@@ -13,7 +12,6 @@ from mllmfl.infrastructure.sequence_diagram import (
 
 
 def focus_graph_diagram_nodes(
-    execution: Dict[str, Any],
     directory: Path,
     planned_graph: Dict[str, Any],
     global_method_ids: Dict[tuple[str, str, str], str],
@@ -98,7 +96,6 @@ def focus_graph_diagram_nodes(
         )
         if caller_class:
             boundary["caller_class"] = caller_class
-        boundary["repeat_count"] = int(item.get("repeat_count") or 1)
         if item.get("call") is None:
             boundary["layout_root"] = True
         return boundary
@@ -110,12 +107,8 @@ def focus_graph_diagram_nodes(
             call = dict(item.get("call") or {})
             if not call:
                 continue
-            call["count"] = int(item.get("repeat_count") or 1)
-            if item.get("repeat_sequence") is not None:
-                call["repeat_sequence"] = dict(item["repeat_sequence"])
             calls.append(call)
             invocation = dict(item["invocation"])
-            invocation["repeat_count"] = int(item.get("repeat_count") or 1)
             invocations.append(invocation)
         if int(boundary["invocation_id"]) > 0 and all(
             int(item["invocation_id"]) != int(boundary["invocation_id"])
@@ -128,12 +121,19 @@ def focus_graph_diagram_nodes(
         invocations.sort(key=lambda item: (
             int(item.get("enter_seq") or 0), int(item["invocation_id"])
         ))
-        value = dict(execution)
-        value["calls"] = calls
-        value["invocations"] = invocations
-        value["call_count"] = len(calls)
-        validate_trace(value, EXECUTION_SCHEMA)
-        return value
+        return {
+            "schema": "fullchain-execution",
+            "schema_version": 3,
+            "test": {},
+            "original_call_count": len(calls),
+            "filtered_call_count": len(calls),
+            "call_count": len(calls),
+            "test_start": None,
+            "test_end": None,
+            "test_failures": [],
+            "invocations": invocations,
+            "calls": calls,
+        }
 
     internal_nodes = planned["nodes"]
     by_id = {str(node["diagram_id"]): node for node in internal_nodes}
@@ -192,28 +192,8 @@ def focus_graph_diagram_nodes(
         graph_folds: List[Dict[str, Any]] = []
         serialized_folds: List[Dict[str, Any]] = []
         for fold in node["folds"]:
-            invocation_ids = [int(value) for value in fold["invocation_ids"]]
-            first_item = numbered_items[invocation_ids[0]]
-            last_item = numbered_items[invocation_ids[-1]]
-            anchor_item = numbered_items[int(fold["anchor_invocation_id"])]
-            anchor_class = str(anchor_item["invocation"]["class"])
-            message_range = (
-                call_id(invocation_ids[0])
-                if len(invocation_ids) == 1
-                else f"{call_id(invocation_ids[0])}-{call_id(invocation_ids[-1])}"
-            )
-            render_fold = {
-                **fold,
-                "anchor_class": anchor_class,
-                "message_range": message_range,
-            }
-            graph_folds.append(render_fold)
-            serialized_folds.append({
-                **fold,
-                "message_range": message_range,
-                "first_signature": invocation_signature(first_item["invocation"]),
-                "last_signature": invocation_signature(last_item["invocation"]),
-            })
+            graph_folds.append(dict(fold))
+            serialized_folds.append(dict(fold))
 
         puml_path = directory / _diagram_filename(diagram_id, "puml")
         puml = make_puml(
@@ -236,6 +216,13 @@ def focus_graph_diagram_nodes(
             focus_signature = invocation_signature(focus_invocation)
             if focus_signature not in signatures:
                 signatures.insert(0, focus_signature)
+            if (
+                focus_item.get("call") is not None
+                and boundary_context_fold is None
+            ):
+                boundary_signature = invocation_signature(boundary)
+                if boundary_signature not in signatures:
+                    signatures.insert(0, boundary_signature)
         call = focus_item.get("call") or {}
         output = {
             "diagram_id": diagram_id,
@@ -247,10 +234,16 @@ def focus_graph_diagram_nodes(
                 if synthetic else invocation_signature(focus_invocation)
             ),
             "origin_test_line": int(call.get("origin_test_line") or 0),
-            "represented_call_count": int(node["represented_call_count"]),
-            "visible_call_count": len(node["visible_items"]),
+            "visible_call_count": int(node["visible_represented_call_count"]),
             "visible_unit_count": int(node["visible_unit_count"]),
             "participant_count": len(node["participant_classes"]),
+            "represented_call_count": int(node["represented_call_count"]),
+            "visible_represented_call_count": int(
+                node["visible_represented_call_count"]
+            ),
+            "omitted_call_count": int(node["omitted_call_count"]),
+            "has_omitted_calls": bool(node["has_omitted_calls"]),
+            "omitted_region_count": int(node["omitted_region_count"]),
             "method_signatures": signatures,
             "folds": serialized_folds,
             "links": [],
@@ -263,15 +256,9 @@ def focus_graph_diagram_nodes(
             "downstream_visible_call_count",
             "internal_visible_call_count",
             "structural_context_call_count",
-            "visible_represented_call_count",
-            "omitted_call_count",
         ):
             if field in node:
                 output[field] = node[field]
-        if "_child_coverage" in node:
-            output["semantic_child_coverage"] = [
-                dict(item) for item in node["_child_coverage"]
-            ]
         visible_invocation_ids = [
             int(call["invocation_id"])
             for call in sorted(

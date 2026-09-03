@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 
 from mllmfl.domain.trace import build_trace, load_events, validate_trace
-from mllmfl.domain.execution_compression import compress_execution
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,7 +126,7 @@ class FullchainValueCaptureTests(unittest.TestCase):
         scenario = enters["scenario"]
         self.assertEqual(exits[scenario["invocation_id"]]["return_value"]["kind"], "number")
 
-    def test_capture_preserves_topology_and_disables_repetition(self):
+    def test_capture_preserves_topology_and_records_bounded_values(self):
         _, captured, captured_seconds, captured_size, _, captured_outcome = (
             self.run_workload(True)
         )
@@ -141,42 +140,14 @@ class FullchainValueCaptureTests(unittest.TestCase):
             for item in trace["invocations"]
         ]
         self.assertEqual(topology(captured), topology(plain))
-        captured_execution = self._execution(captured)
-        plain_execution = self._execution(plain)
         repeat_arguments = [
             item["arguments"]["items"][0]["text"]
             for item in captured["invocations"] if item["method"] == "repeat"
         ]
         self.assertEqual(repeat_arguments, ["1", "1", "2"])
-        captured_compressed = compress_execution(captured_execution)
-        plain_compressed = compress_execution(plain_execution)
-        self.assertEqual(captured_compressed["schema_version"], 3)
-        self.assertTrue(captured_compressed["value_capture_enabled"])
-        self.assertEqual(
-            captured_compressed["displayed_call_count"],
-            captured_compressed["represented_call_count"],
-        )
-        self.assertFalse(plain_compressed["value_capture_enabled"])
-        self.assertLess(
-            plain_compressed["displayed_call_count"],
-            plain_compressed["represented_call_count"],
-        )
         self.assertGreater(captured_size, plain_size)
         self.assertGreater(captured_seconds, 0)
         self.assertGreater(plain_seconds, 0)
-
-    @staticmethod
-    def _execution(trace):
-        value = dict(trace)
-        value["schema"] = "fullchain-execution"
-        value["test"] = {"class": "valuefixture.ValueWorkload", "method": "scenario"}
-        value["calls"] = [
-            {**call, "count": 1, "context": False, "invocation_ids": [call["invocation_id"]]}
-            for call in trace["calls"]
-        ]
-        value["call_count"] = len(value["calls"])
-        return value
-
 
 if __name__ == "__main__":
     unittest.main()

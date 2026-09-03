@@ -80,6 +80,22 @@ def _ranking(value: Any, context: str, *, refined: bool) -> list[Dict[str, Any]]
     return value
 
 
+def _aggregate_usage(value: Any) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("invalid refinement aggregate usage audit")
+    for key, item in value.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("invalid refinement aggregate usage audit")
+        if isinstance(item, dict):
+            _aggregate_usage(item)
+        elif (
+            not isinstance(item, (int, float))
+            or isinstance(item, bool)
+            or item < 0
+        ):
+            raise ValueError("invalid refinement aggregate usage audit")
+
+
 def validate_localization_input(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError("localization input must be a JSON object")
@@ -118,7 +134,7 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
         raise ValueError("refinement artifact must be a JSON object")
     if (
         value.get("schema") != "fault-localization-refinement"
-        or value.get("schema_version") not in {4, 5}
+        or value.get("schema_version") not in {4, 5, 6}
     ):
         raise ValueError("unsupported refinement schema")
     _identity(value, "refinement")
@@ -152,7 +168,7 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
         value.get("input_ranking"), "refinement input", refined=False
     )
     selected_test_ids: set[str] | None = None
-    if value["schema_version"] == 5:
+    if value["schema_version"] in {5, 6}:
         tests = value.get("tests")
         test_count = value.get("test_count")
         if (
@@ -225,35 +241,63 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
     ):
         if not isinstance(value.get(field), int) or value[field] < 0:
             raise ValueError(f"invalid refinement {field}")
-    finalization_attempts = value.get("finalization_attempts")
-    if (
-        not isinstance(finalization_attempts, list)
-        or not finalization_attempts
-        or any(
-            not isinstance(item, dict)
-            or set(item) != {
-                "response_id", "max_tokens", "finish_reason",
-                "content_empty", "usage",
-            }
-            or not isinstance(item["response_id"], str)
-            or not item["response_id"].strip()
-            or not isinstance(item["max_tokens"], int)
-            or isinstance(item["max_tokens"], bool)
-            or item["max_tokens"] <= 0
+    if value["schema_version"] == 6:
+        request_count = value.get("request_count")
+        finalization_count = value.get("finalization_attempt_count")
+        length_retry_count = value.get("final_length_retry_count")
+        finish_reason = value.get("final_finish_reason")
+        if (
+            not isinstance(request_count, int)
+            or isinstance(request_count, bool)
+            or request_count <= 0
+            or not isinstance(finalization_count, int)
+            or isinstance(finalization_count, bool)
+            or not 1 <= finalization_count <= request_count
+            or not isinstance(length_retry_count, int)
+            or isinstance(length_retry_count, bool)
+            or not 0 <= length_retry_count < finalization_count
+            or not isinstance(value.get("usage"), dict)
             or (
-                item["finish_reason"] is not None
+                finish_reason is not None
                 and (
-                    not isinstance(item["finish_reason"], str)
-                    or not item["finish_reason"].strip()
+                    not isinstance(finish_reason, str)
+                    or not finish_reason.strip()
                 )
             )
-            or not isinstance(item["content_empty"], bool)
-            or not isinstance(item["usage"], dict)
-            for item in finalization_attempts
-        )
-        or finalization_attempts[-1]["content_empty"]
-    ):
-        raise ValueError("invalid refinement finalization audit")
+            or "finalization_attempts" in value
+        ):
+            raise ValueError("invalid refinement aggregate usage audit")
+        _aggregate_usage(value["usage"])
+    else:
+        finalization_attempts = value.get("finalization_attempts")
+        if (
+            not isinstance(finalization_attempts, list)
+            or not finalization_attempts
+            or any(
+                not isinstance(item, dict)
+                or set(item) != {
+                    "response_id", "max_tokens", "finish_reason",
+                    "content_empty", "usage",
+                }
+                or not isinstance(item["response_id"], str)
+                or not item["response_id"].strip()
+                or not isinstance(item["max_tokens"], int)
+                or isinstance(item["max_tokens"], bool)
+                or item["max_tokens"] <= 0
+                or (
+                    item["finish_reason"] is not None
+                    and (
+                        not isinstance(item["finish_reason"], str)
+                        or not item["finish_reason"].strip()
+                    )
+                )
+                or not isinstance(item["content_empty"], bool)
+                or not isinstance(item["usage"], dict)
+                for item in finalization_attempts
+            )
+            or finalization_attempts[-1]["content_empty"]
+        ):
+            raise ValueError("invalid refinement finalization audit")
     viewed = value.get("viewed_diagrams")
     inspected = value.get("inspected_candidate_ids")
     method_ids = value.get("candidate_runtime_method_ids")

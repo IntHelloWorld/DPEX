@@ -2,15 +2,22 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import patch
 
 from mllmfl.domain.schemas import (
     validate_localization_input,
     validate_refinement,
-    validate_trace_index,
 )
+from mllmfl.domain.assertion_folding import fold_successful_assertions
 from mllmfl.domain.focus_viewport import plan_focus_viewport
+from mllmfl.domain.refinement_trace import (
+    RefinementTraceTopology,
+    build_method_catalog,
+    build_refinement_trace,
+    validate_refinement_trace,
+)
+from mllmfl.infrastructure.io import write_zstd_json
+from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.stages.refine.agent import run_agent
 from mllmfl.stages.refine.adapters import _autofl_diagnosis
 from mllmfl.stages.refine.context import (
@@ -25,14 +32,13 @@ from mllmfl.stages.refine.graphs import (
     MethodExecutionGraphs,
 )
 from mllmfl.stages.refine.parsing import validate_model_refinement
-from mllmfl.stages.trace_index import build_method_catalog, build_trace_index
-from mllmfl.domain.execution_compression import compress_execution
 from mllmfl.stages.refine.shell import (
     BASH_TOOL,
     execute_bash,
     validate_bash_command,
     validate_max_output_chars,
 )
+from mllmfl.stages.refine.stage import _refine_bug
 from mllmfl.infrastructure.method_location import resolve_source_method_reference
 
 
@@ -124,9 +130,6 @@ def execution_fixture() -> dict:
             "exit_seq": invocation["exit_seq"],
             "exit_type": "RETURN",
             "origin_test_line": invocation["origin_test_line"],
-            "count": 1,
-            "context": False,
-            "invocation_ids": [invocation["invocation_id"]],
         })
     return {
         "schema": "fullchain-execution",
@@ -196,9 +199,6 @@ def semantic_sibling_execution_fixture() -> dict:
             "exit_seq": invocation["exit_seq"],
             "exit_type": "RETURN",
             "origin_test_line": invocation["origin_test_line"],
-            "count": 1,
-            "context": False,
-            "invocation_ids": [invocation["invocation_id"]],
         })
     return {
         "schema": "fullchain-execution",
@@ -213,6 +213,65 @@ def semantic_sibling_execution_fixture() -> dict:
         "invocations": invocations,
         "calls": calls,
     }
+
+
+def write_trace_suite(
+    bug_dir: Path,
+    entries: list[tuple[str, str, int, dict]],
+    *,
+    project: str = "P",
+    bug: str = "1",
+) -> tuple[list[dict[str, str]], dict[tuple[str, str, str], str], str]:
+    pruned_entries = []
+    for test_id, test, trigger, execution in entries:
+        pruned, folding = fold_successful_assertions(execution)
+        pruned_entries.append((test_id, test, trigger, pruned, folding))
+    catalog, method_ids, fingerprint = build_method_catalog(
+        item[3] for item in pruned_entries
+    )
+    tests = []
+    for test_id, test, trigger, execution, folding in pruned_entries:
+        trace = build_refinement_trace(
+            execution,
+            project=project,
+            test_id=test_id,
+            test=test,
+            method_ids=method_ids,
+            catalog_fingerprint=fingerprint,
+            assertion_folding=folding,
+            error_stack="",
+            test_output="",
+        )
+        relative = f"traces/{test_id}.refinement-trace.json.zst"
+        write_zstd_json(bug_dir / relative, trace)
+        tests.append({
+            "test_id": test_id,
+            "test": test,
+            "trigger": trigger,
+            "trace": relative,
+            "trace_fingerprint": trace["fingerprint"],
+        })
+    (bug_dir / "trace_suite.json").write_text(json.dumps({
+        "schema": "execution-trace-suite",
+        "schema_version": 2,
+        "project": project,
+        "bug": bug,
+        "method_catalog_fingerprint": fingerprint,
+        "method_catalog": catalog,
+        "test_count": len(tests),
+        "tests": tests,
+    }), encoding="utf-8")
+    return catalog, method_ids, fingerprint
+
+
+def normalized_topology(execution: dict) -> RefinementTraceTopology:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        write_trace_suite(root, [("T1", "p.T::test", 1, execution)])
+        suite = json.loads((root / "trace_suite.json").read_text())
+        trace_path = root / suite["tests"][0]["trace"]
+        from mllmfl.infrastructure.io import read_zstd_json
+        return RefinementTraceTopology.build(read_zstd_json(trace_path))
 
 
 class RefinementSchemaTests(unittest.TestCase):
@@ -270,6 +329,7 @@ class RefinementSchemaTests(unittest.TestCase):
         self.assertIn("dashed arrows are returns or throws", paragraphs[3])
         self.assertIn("invocation_id", paragraphs[3])
         self.assertIn("omit N calls", paragraphs[3])
+        self.assertIn("exact", paragraphs[3])
 
     def test_input_source_range_must_match_buggy_java_ast(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -369,6 +429,24 @@ class RefinementSchemaTests(unittest.TestCase):
             }],
         }
         self.assertIs(validate_refinement(refined_v5), refined_v5)
+        refined_v6 = {
+            key: value for key, value in refined_v5.items()
+            if key != "finalization_attempts"
+        }
+        refined_v6.update({
+            "schema_version": 6,
+            "request_count": 3,
+            "usage": {"input_tokens": 20, "output_tokens": 5},
+            "finalization_attempt_count": 1,
+            "final_length_retry_count": 0,
+            "final_finish_reason": "stop",
+        })
+        self.assertIs(validate_refinement(refined_v6), refined_v6)
+        with self.assertRaisesRegex(ValueError, "aggregate usage audit"):
+            validate_refinement({
+                **refined_v6,
+                "usage": {"input_tokens": "20"},
+            })
         with self.assertRaisesRegex(ValueError, "inspection audit"):
             validate_refinement({
                 **refined_v5,
@@ -722,48 +800,14 @@ class GraphToolContractTests(unittest.TestCase):
             execution = execution_fixture()
             workspace = bug_dir / "workspace"
             references = write_fixture_sources(workspace, execution)
-            catalog, method_ids, fingerprint = build_method_catalog([
-                execution, execution,
+            write_trace_suite(bug_dir, [
+                ("T1", "p.ServiceTest::fails1", 1, execution),
+                ("T2", "p.ServiceTest::fails2", 2, execution),
             ])
-            tests = []
-            for trigger, test_id in ((1, "T1"), (2, "T2")):
-                trigger_dir = bug_dir / f"triggers/trigger_{trigger}"
-                trigger_dir.mkdir(parents=True)
-                test = f"p.ServiceTest::fails{trigger}"
-                index = build_trace_index(
-                    execution,
-                    test_id=test_id,
-                    test=test,
-                    method_ids=method_ids,
-                    catalog_fingerprint=fingerprint,
-                )
-                for name, value in (
-                    ("execution.json", execution),
-                    ("trace_index.json", index),
-                ):
-                    (trigger_dir / name).write_text(
-                        json.dumps(value), encoding="utf-8"
-                    )
-                tests.append({
-                    "test_id": test_id,
-                    "test": test,
-                    "trigger": trigger,
-                    "trace_index": f"triggers/trigger_{trigger}/trace_index.json",
-                })
-            (bug_dir / "trace_suite.json").write_text(json.dumps({
-                "schema": "execution-trace-suite",
-                "schema_version": 1,
-                "project": "P",
-                "bug": "1",
-                "method_catalog_fingerprint": fingerprint,
-                "method_catalog": catalog,
-                "test_count": 2,
-                "tests": tests,
-            }), encoding="utf-8")
             # Excluded tests are not part of this Agent task and their large
             # indexes must not be loaded merely to initialize the selected one.
-            (bug_dir / "triggers/trigger_2/trace_index.json").write_text(
-                "not json", encoding="utf-8"
+            (bug_dir / "traces/T2.refinement-trace.json.zst").write_bytes(
+                b"not zstd"
             )
             graphs = MethodExecutionGraphs(
                 bug_dir,
@@ -789,40 +833,12 @@ class GraphToolContractTests(unittest.TestCase):
     def test_puml_is_created_only_after_inspecting_a_selected_occurrence(self):
         with tempfile.TemporaryDirectory() as directory:
             bug_dir = Path(directory)
-            trigger_dir = bug_dir / "triggers/trigger_1"
-            trigger_dir.mkdir(parents=True)
             execution = execution_fixture()
             workspace = bug_dir / "workspace"
             references = write_fixture_sources(workspace, execution)
-            catalog, method_ids, fingerprint = build_method_catalog([execution])
-            index = build_trace_index(
-                execution,
-                test_id="T1",
-                test="p.ServiceTest::fails",
-                method_ids=method_ids,
-                catalog_fingerprint=fingerprint,
-            )
-            (trigger_dir / "execution.json").write_text(
-                json.dumps(execution), encoding="utf-8"
-            )
-            (trigger_dir / "trace_index.json").write_text(
-                json.dumps(index), encoding="utf-8"
-            )
-            (bug_dir / "trace_suite.json").write_text(json.dumps({
-                "schema": "execution-trace-suite",
-                "schema_version": 1,
-                "project": "P",
-                "bug": "1",
-                "method_catalog_fingerprint": fingerprint,
-                "method_catalog": catalog,
-                "test_count": 1,
-                "tests": [{
-                    "test_id": "T1",
-                    "test": "p.ServiceTest::fails",
-                    "trigger": 1,
-                    "trace_index": "triggers/trigger_1/trace_index.json",
-                }],
-            }), encoding="utf-8")
+            write_trace_suite(bug_dir, [
+                ("T1", "p.ServiceTest::fails", 1, execution),
+            ])
             graphs = MethodExecutionGraphs(
                 bug_dir,
                 {"uml": {}},
@@ -850,7 +866,8 @@ class GraphToolContractTests(unittest.TestCase):
             self.assertEqual(direct_result["invocation_id"], "T1-C3")
             self.assertEqual(set(result), {
                 "ok", "invocation_id", "visible_call_count",
-                "omitted_call_count", "focus_method",
+                "omitted_call_count", "has_omitted_calls",
+                "omitted_region_count", "focus_method",
             })
             self.assertEqual(result["focus_method"], {
                 "name": "run",
@@ -860,47 +877,19 @@ class GraphToolContractTests(unittest.TestCase):
                 "name": "first",
                 "line": references["p.Helper.first()"],
             })
+            self.assertEqual(len(graphs._records), 1)
             self.assertEqual(image, fake_image)
             self.assertTrue(list(bug_dir.rglob("*.puml")))
 
-    def test_semantic_omissions_are_complete_and_render_one_png(self):
+    def test_semantic_omissions_use_regions_and_render_one_png(self):
         with tempfile.TemporaryDirectory() as directory:
             bug_dir = Path(directory)
-            trigger_dir = bug_dir / "triggers/trigger_1"
-            trigger_dir.mkdir(parents=True)
             execution = semantic_sibling_execution_fixture()
             workspace = bug_dir / "workspace"
             references = write_fixture_sources(workspace, execution)
-            catalog, method_ids, fingerprint = build_method_catalog([execution])
-            index = build_trace_index(
-                execution,
-                test_id="T1",
-                test="p.RootTest::fails",
-                method_ids=method_ids,
-                catalog_fingerprint=fingerprint,
-            )
-            for name, value in (
-                ("execution.json", execution),
-                ("trace_index.json", index),
-            ):
-                (trigger_dir / name).write_text(
-                    json.dumps(value), encoding="utf-8"
-                )
-            (bug_dir / "trace_suite.json").write_text(json.dumps({
-                "schema": "execution-trace-suite",
-                "schema_version": 1,
-                "project": "P",
-                "bug": "1",
-                "method_catalog_fingerprint": fingerprint,
-                "method_catalog": catalog,
-                "test_count": 1,
-                "tests": [{
-                    "test_id": "T1",
-                    "test": "p.RootTest::fails",
-                    "trigger": 1,
-                    "trace_index": "triggers/trigger_1/trace_index.json",
-                }],
-            }), encoding="utf-8")
+            write_trace_suite(bug_dir, [
+                ("T1", "p.RootTest::fails", 1, execution),
+            ])
             graphs = MethodExecutionGraphs(
                 bug_dir,
                 {"uml": {
@@ -933,38 +922,29 @@ class GraphToolContractTests(unittest.TestCase):
                 "ok": True,
                 "invocation_id": invocation_id,
                 "visible_call_count": int(entry_node["visible_call_count"]),
-                "omitted_call_count": 2,
+                "omitted_call_count": int(entry_node["omitted_call_count"]),
+                "has_omitted_calls": True,
+                "omitted_region_count": 1,
                 "focus_method": {
                     "name": "focus",
                     "line": references["p.Service.focus()"],
                 },
             })
             self.assertEqual(entry_node["links"], [])
-            self.assertEqual(entry_node["represented_call_count"], 8)
-            self.assertEqual(entry_node["omitted_call_count"], 2)
+            self.assertTrue(entry_node["has_omitted_calls"])
+            self.assertEqual(entry_node["omitted_region_count"], 1)
             self.assertEqual(
                 entry_node["visible_represented_call_count"]
                 + entry_node["omitted_call_count"],
-                8,
+                entry_node["represented_call_count"],
+            )
+            self.assertEqual(
+                sum(item["represented_call_count"] for item in entry_node["folds"]),
+                entry_node["omitted_call_count"],
             )
             self.assertEqual(
                 len(list((bug_dir / "inspection_graphs").rglob("*.png"))), 1
             )
-            root_coverage = next(
-                item for item in entry_node["semantic_child_coverage"]
-                if item["parent_invocation_id"] == 1
-            )
-            covered = [
-                *root_coverage["visible_child_invocation_ids"],
-                *(
-                    value
-                    for values in root_coverage["omitted_child_ranges"]
-                    for value in values
-                ),
-            ]
-            self.assertEqual(set(covered), {2, 6, 7, 8, 9})
-            self.assertEqual(len(covered), len(set(covered)))
-            self.assertEqual(root_coverage["omitted_child_ranges"], [[8, 9]])
 
             puml = (
                 bug_dir / "inspection_graphs"
@@ -974,71 +954,49 @@ class GraphToolContractTests(unittest.TestCase):
             self.assertIn("title Invocation ID: T1-C2", puml)
             self.assertIn("T1-C2 focus()", puml)
             self.assertNotIn("M2 C2 focus()", puml)
-            self.assertIn("... omit 2 calls ...", puml)
+            self.assertRegex(puml, r"\.\.\. omit \d+ calls \.\.\.")
             self.assertNotIn("note right of ", puml)
             self.assertNotIn("TO ", puml)
             self.assertNotIn("FROM ", puml)
             self.assertNotIn("VIEW ", puml)
 
-    def test_trace_index_contains_only_lookup_context(self):
+    def test_refinement_trace_contains_topology_values_and_lookup_index(self):
         execution = execution_fixture()
-        catalog, method_ids, fingerprint = build_method_catalog([execution])
-        value = build_trace_index(
-            execution,
-            test_id="T1",
-            test="p.ServiceTest::fails",
-            method_ids=method_ids,
-            catalog_fingerprint=fingerprint,
-            fold_by_invocation={2: "AF001"},
-            default_execution="execution_assertion_pruned.json",
-        )
-        self.assertIs(validate_trace_index(value), value)
-        self.assertEqual(value["schema_version"], 2)
-        self.assertEqual(
-            value["default_execution"], "execution_assertion_pruned.json"
-        )
-        self.assertNotIn("compressed_execution", value)
+        with tempfile.TemporaryDirectory() as directory:
+            bug_dir = Path(directory)
+            catalog, _, _ = write_trace_suite(bug_dir, [
+                ("T1", "p.ServiceTest::fails", 1, execution),
+            ])
+            from mllmfl.infrastructure.io import read_zstd_json
+            value = read_zstd_json(
+                bug_dir / "traces/T1.refinement-trace.json.zst"
+            )
+        self.assertIs(validate_refinement_trace(value), value)
+        self.assertEqual(value["schema_version"], 1)
+        for obsolete in (
+            "execution", "default_execution", "parent_chain",
+            "thread_name", "duration_ns",
+        ):
+            self.assertNotIn(obsolete, json.dumps(value))
         service_id = next(
             item["method_id"] for item in catalog
             if item["signature"] == "p.Service.run()"
         )
         occurrences = next(
-            item["occurrences"] for item in value["methods"]
-            if item["method_id"] == service_id
+            item[1] for item in value["method_invocations"]
+            if item[0] == service_id
         )
-        self.assertEqual(
-            [item["invocation_id"] for item in occurrences], [2, 6]
-        )
-        self.assertEqual(value["default_occurrence_count"], 4)
-        self.assertEqual(value["folded_occurrence_count"], 1)
-        self.assertEqual(
-            occurrences[0]["successful_assertion_fold_id"], "AF001"
-        )
-        self.assertEqual(
-            occurrences[0]["caller_signature"], "p.Root.root()"
-        )
-        self.assertEqual(set(occurrences[0]), {
-            "invocation_id", "successful_assertion_fold_id", "caller_signature",
-        })
-        reversed_occurrences = json.loads(json.dumps(value))
-        target = next(
-            item["occurrences"] for item in reversed_occurrences["methods"]
-            if item["method_id"] == service_id
-        )
-        target.reverse()
-        with self.assertRaisesRegex(ValueError, "trace occurrence context"):
-            validate_trace_index(reversed_occurrences)
+        self.assertEqual(occurrences, [2, 6])
+        topology = RefinementTraceTopology.build(value)
+        self.assertEqual(topology.caller_signature(2), "p.Root.root()")
+        self.assertEqual(topology.subtree_call_count(2), 4)
 
     def test_focus_viewport_uses_independent_context_and_internal_budgets(self):
         execution = execution_fixture()
-        compressed = compress_execution(
-            execution, protected_invocation_ids=frozenset({2})
-        )
         plan = plan_focus_viewport(
             diagram_id="D1",
             focus_invocation_id=2,
-            execution=execution,
-            compressed=compressed,
+            topology=normalized_topology(execution),
             max_upstream_calls=2,
             max_downstream_calls=3,
             max_internal_calls=3,
@@ -1056,18 +1014,15 @@ class GraphToolContractTests(unittest.TestCase):
         self.assertEqual(execution["call_count"], 5)
         self.assertEqual(len(execution["invocations"]), 6)
         self.assertEqual(plan["links"], [])
-        self.assertEqual(plan["omitted_call_count"], 0)
+        self.assertFalse(plan["has_omitted_calls"])
+        self.assertEqual(plan["omitted_region_count"], 0)
 
     def test_focus_viewport_ascends_when_nearby_siblings_are_exhausted(self):
         execution = execution_fixture()
-        compressed = compress_execution(
-            execution, protected_invocation_ids=frozenset({5})
-        )
         plan = plan_focus_viewport(
             diagram_id="D1",
             focus_invocation_id=5,
-            execution=execution,
-            compressed=compressed,
+            topology=normalized_topology(execution),
             max_upstream_calls=2,
             max_downstream_calls=3,
             max_internal_calls=3,
@@ -1081,49 +1036,26 @@ class GraphToolContractTests(unittest.TestCase):
         self.assertEqual(plan["upstream_visible_call_count"], 2)
         self.assertEqual(plan["downstream_visible_call_count"], 0)
         self.assertEqual(plan["structural_context_call_count"], 2)
-        self.assertEqual(plan["omitted_call_count"], 2)
+        self.assertTrue(plan["has_omitted_calls"])
+        self.assertEqual(plan["omitted_region_count"], 1)
         self.assertEqual(plan["links"], [])
 
     def test_source_lookup_returns_exact_visible_runtime_invocation_ids(self):
         with tempfile.TemporaryDirectory() as directory:
-            workspace = Path(directory)
-            source = workspace / "src/p/Service.java"
-            source.parent.mkdir(parents=True)
-            source.write_text(
-                "package p;\nclass Service {\n  void run(String value) {}\n}\n",
-                encoding="utf-8",
+            bug_dir = Path(directory)
+            execution = execution_fixture()
+            workspace = bug_dir / "workspace"
+            references = write_fixture_sources(workspace, execution)
+            write_trace_suite(bug_dir, [
+                ("T1", "p.ServiceTest::fails", 1, execution),
+            ])
+            graphs = MethodExecutionGraphs(
+                bug_dir, {"uml": {}}, 30, workspace=workspace
             )
-            graphs = MethodExecutionGraphs.__new__(MethodExecutionGraphs)
-            graphs.workspace = workspace
-            graphs.catalog = [{
-                "method_id": "M1",
-                "function": "p.Service.run",
-                "signature": "p.Service.run(String)",
-            }]
-            graphs.catalog_by_id = {"M1": graphs.catalog[0]}
-            graphs.queried_methods = []
-            graphs._records = {
-                "T1": SimpleNamespace(
-                    test="p.ServiceTest::fails",
-                    trigger="1",
-                    execution_path=Path("execution.json"),
-                    default_execution_path=Path("execution.json"),
-                    methods={"M1": [
-                    {
-                        "invocation_id": invocation_id,
-                        "successful_assertion_fold_id": (
-                            "AF001" if ordinal == 1 else None
-                        ),
-                        "caller_signature": "p.Caller.call()",
-                    }
-                    for ordinal, invocation_id in ((1, 7), (2, 19))
-                    ]},
-                ),
-            }
             result = graphs.find_invocation_ids({
                 "test_id": "T1",
                 "name": "run",
-                "line": "src/p/Service.java:3",
+                "line": references["p.Service.run()"],
             })
         self.assertTrue(result["ok"])
         self.assertEqual(result, {
@@ -1132,13 +1064,13 @@ class GraphToolContractTests(unittest.TestCase):
             "test": "p.ServiceTest::fails",
             "method": {
                 "name": "run",
-                "line": "src/p/Service.java:3",
+                "line": references["p.Service.run()"],
             },
-            "invocation_count": 1,
-            "invocations": [{
-                "invocation_id": "T1-C19",
-                "caller": "p.Caller.call()",
-            }],
+            "invocation_count": 2,
+            "invocations": [
+                {"invocation_id": "T1-C2", "caller": "p.Root.root()"},
+                {"invocation_id": "T1-C6", "caller": "p.Root.root()"},
+            ],
         })
 
     def test_graph_tools_separate_lookup_from_rendering(self):
@@ -1189,7 +1121,8 @@ class _FakeGraphs:
             "ok": True,
             "invocation_id": arguments["invocation_id"],
             "visible_call_count": 1,
-            "omitted_call_count": 0,
+            "has_omitted_calls": False,
+            "omitted_region_count": 0,
             "focus_method": {
                 "name": "run",
                 "line": "src/p/Service.java:3",
@@ -1202,6 +1135,126 @@ class _FakeGraphs:
     def image_path(self, diagram_id: str) -> Path:
         self.asserted_diagram_id = diagram_id
         return self.image
+
+
+class RefinementArtifactRetentionTests(unittest.TestCase):
+    @patch("mllmfl.stages.refine.stage.run_agent")
+    @patch("mllmfl.stages.refine.stage.runtime_method_ids")
+    @patch("mllmfl.stages.refine.stage.build_prompt")
+    @patch("mllmfl.stages.refine.stage.selected_trace_tests")
+    @patch("mllmfl.stages.refine.stage.MethodExecutionGraphs")
+    @patch("mllmfl.stages.refine.stage.load_localization_input")
+    def test_lean_refinement_retains_model_interaction_evidence(
+        self,
+        load_input,
+        graph_class,
+        select_tests,
+        prompt,
+        runtime_ids,
+        agent,
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            bug_dir = layout.artifacts / "P" / "bug_1"
+            bug_dir.mkdir(parents=True)
+            workspace = layout.workspace_dir("P", "1")
+            workspace.mkdir(parents=True)
+            (bug_dir / "trace_suite.json").write_text(json.dumps({
+                "schema": "execution-trace-suite",
+                "schema_version": 2,
+                "project": "P",
+                "bug": "1",
+                "method_catalog_fingerprint": "f" * 64,
+                "method_catalog": [{
+                    "method_id": "M1",
+                    "function": "p.Service.run",
+                    "signature": "p.Service.run()",
+                    "descriptor": "()V",
+                }],
+                "test_count": 1,
+                "tests": [{
+                    "test_id": "T1",
+                    "test": "p.ServiceTest::fails",
+                    "trigger": 1,
+                    "trace": "traces/T1.refinement-trace.json.zst",
+                    "trace_fingerprint": "a" * 64,
+                }],
+            }), encoding="utf-8")
+            load_input.return_value = {
+                "schema": "fault-localization-input",
+                "schema_version": 1,
+                "project": "P",
+                "bug": "1",
+                "locator": {"name": "test", "version": "1"},
+                "failing_tests": ["p.ServiceTest::fails"],
+                "ranking": [candidate()],
+            }
+            select_tests.return_value = [{
+                "test_id": "T1", "test": "p.ServiceTest::fails",
+            }]
+            prompt.return_value = "prompt"
+            runtime_ids.return_value = {"L001": "M1"}
+            graphs = graph_class.return_value
+            graphs.catalog = [{
+                "method_id": "M1",
+                "function": "p.Service.run",
+                "signature": "p.Service.run()",
+                "descriptor": "()V",
+            }]
+            graphs.failure_evidence.return_value = []
+            graphs.available_method_ids.return_value = {"M1"}
+
+            def run_fake_agent(*args):
+                conversation_path = args[7]
+                self.assertEqual(
+                    conversation_path, bug_dir / "refine_conversation.jsonl"
+                )
+                conversation_path.write_text(
+                    '{"role":"assistant","content":"final"}\n',
+                    encoding="utf-8",
+                )
+                (bug_dir / "refine_response_usage.jsonl").write_text(
+                    '{"schema":"refinement-response-usage"}\n',
+                    encoding="utf-8",
+                )
+                image = bug_dir / "inspection_graphs" / "D1" / "D1.png"
+                image.parent.mkdir(parents=True)
+                image.write_bytes(b"png")
+                return {
+                    "ranking": [{
+                        "input_candidate_id": "L001",
+                        "reason": "runtime evidence",
+                    }],
+                    "model": "test-model",
+                    "inspected_method_ids": ["M1"],
+                    "tool_rounds": 1,
+                    "diagram_view_count": 1,
+                    "viewed_diagrams": ["T1-M1-C1-D1"],
+                    "inspected_invocation_ids": ["T1-C1"],
+                    "queried_methods": [{
+                        "name": "run", "line": "src/p/Service.java:3",
+                    }],
+                    "terminal_command_count": 0,
+                    "request_count": 1,
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+                    "finalization_attempt_count": 1,
+                    "final_length_retry_count": 0,
+                    "final_finish_reason": "stop",
+                }
+
+            agent.side_effect = run_fake_agent
+            result = _refine_bug(
+                layout, "P", "1", Path("locator.json"), {"mllm": {}},
+                30, 1, False, True, 6, 6, 10, False,
+            )
+
+            self.assertEqual(result["status"], "OK")
+            self.assertTrue((bug_dir / "refine_conversation.jsonl").is_file())
+            self.assertTrue((bug_dir / "refine_response_usage.jsonl").is_file())
+            self.assertTrue(
+                (bug_dir / "inspection_graphs" / "D1" / "D1.png").is_file()
+            )
 
 
 class RefinementAgentTests(unittest.TestCase):

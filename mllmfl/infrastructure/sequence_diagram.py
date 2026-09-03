@@ -292,8 +292,7 @@ def make_puml(
             omitted = int(item.get("omitted_context_exit_count") or 0)
             result = (
                 f"... omit {omitted} calls ..."
-                if omitted
-                else _return_label(item)
+                if omitted else _return_label(item)
             )
             caller = str(item.get("caller_class") or "")
             if caller:
@@ -314,19 +313,12 @@ def make_puml(
         callee = str(
             item.get("callee_class") or item["callee"].rsplit(".", 1)[0]
         )
-        repeat = item.get("repeat_sequence") or {}
         if event_type == "enter":
-            if int(repeat.get("position") or 0) == 1:
-                lines.append(
-                    f"loop repeated sequence ×{int(repeat['repeat_count'])}"
-                )
             method = item.get("callee_method") or item["callee"].rsplit(".", 1)[-1]
             signature = readable_signature(
                 str(method), str(item.get("callee_descriptor") or "")
             )
             label = call_label(item, signature)
-            if int(item.get("count", 1)) > 1 and not repeat:
-                label += f" ×{int(item['count'])}"
             lines.append(
                 f"{_alias(caller)} {arrow(item)} {_alias(callee)}: "
                 f"{rendered_label(item, label)}"
@@ -338,11 +330,5 @@ def make_puml(
                 f"{_escape_message(_return_label(invocation_by_id.get(int(item['invocation_id'])) or item))}"
             )
             lines.append(f"deactivate {_alias(callee)}")
-            if (
-                repeat
-                and int(repeat.get("position") or 0)
-                == int(repeat.get("pattern_length") or 0)
-            ):
-                lines.append("end")
     lines.extend(["@enduml", ""])
     return "\n".join(lines)

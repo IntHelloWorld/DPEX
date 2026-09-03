@@ -46,7 +46,7 @@ def run_agent(
     graphs: MethodExecutionGraphs,
     workspace: Path,
     timeout: int,
-    conversation_path: Path,
+    conversation_path: Path | None,
     top_k: int,
 ) -> Dict[str, Any]:
     if top_k <= 0:
@@ -80,12 +80,33 @@ def run_agent(
         raise ValueError("terminal timeout must be positive")
     base_max_tokens, final_retry_max_tokens = finalization_limits(config)
     finalization_attempts: list[Dict[str, Any]] = []
+    total_usage: Dict[str, Any] = {}
+    request_count = 0
 
-    write_text(conversation_path, "")
-    usage_path = conversation_path.with_name("refine_response_usage.jsonl")
-    write_text(usage_path, "")
-    append_jsonl(conversation_path, {"role": "system", "content": system_prompt})
-    append_jsonl(conversation_path, pending_input[0])
+    usage_path = (
+        conversation_path.with_name("refine_response_usage.jsonl")
+        if conversation_path is not None else None
+    )
+    if conversation_path is not None:
+        write_text(conversation_path, "")
+        write_text(usage_path, "")
+        append_jsonl(conversation_path, {"role": "system", "content": system_prompt})
+        append_jsonl(conversation_path, pending_input[0])
+
+    def record(path: Path | None, value: Dict[str, Any]) -> None:
+        if path is not None:
+            append_jsonl(path, value)
+
+    def add_usage(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+        for key, value in source.items():
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, (int, float)):
+                target[key] = target.get(key, 0) + value
+            elif isinstance(value, dict):
+                child = target.setdefault(key, {})
+                if isinstance(child, dict):
+                    add_usage(child, value)
 
     def hydrate(items: Sequence[Dict[str, Any]]) -> list[Dict[str, Any]]:
         result = copy.deepcopy(list(items))
@@ -164,6 +185,8 @@ def run_agent(
                 tools=tools,
                 max_tokens=requested_max_tokens,
             )
+            request_count += 1
+            add_usage(total_usage, usage)
             tool_calls = message.get("tool_calls") or []
             if not isinstance(tool_calls, list):
                 raise ValueError("model tool_calls is not an array")
@@ -187,7 +210,7 @@ def run_agent(
                         ]
                     retained_output.append(replay_item)
                 response_output = retained_output
-            append_jsonl(usage_path, {
+            record(usage_path, {
                 "schema": "responses-usage",
                 "schema_version": 2,
                 "previous_response_id": None,
@@ -196,7 +219,7 @@ def run_agent(
                 "requested_max_tokens": requested_max_tokens,
                 "usage": usage,
             })
-            append_jsonl(conversation_path, message)
+            record(conversation_path, message)
             content = message.get("content")
             content_empty = (
                 not isinstance(content, str) or not content.strip()
@@ -267,14 +290,14 @@ def run_agent(
                 "content": json.dumps(result, ensure_ascii=False),
             }
             pending_input = [tool_item]
-            append_jsonl(conversation_path, tool_item)
+            record(conversation_path, tool_item)
             if image_path is not None:
                 image_item = {
                     "role": "user",
                     "content": [{"type": "image_ref", "diagram_id": image_id}],
                 }
                 pending_input.append(image_item)
-                append_jsonl(conversation_path, image_item)
+                record(conversation_path, image_item)
             continue
 
         content = message.get("content")
@@ -293,7 +316,7 @@ def run_agent(
                 ),
             }
             pending_input = [correction]
-            append_jsonl(conversation_path, correction)
+            record(conversation_path, correction)
             continue
         if validation_error:
             raise ValueError(f"invalid final response: {validation_error}")
@@ -329,4 +352,12 @@ def run_agent(
             "queried_methods": [dict(item) for item in graphs.queried_methods],
             "terminal_command_count": terminal_commands,
             "finalization_attempts": finalization_attempts,
+            "request_count": request_count,
+            "usage": total_usage,
+            "finalization_attempt_count": len(finalization_attempts),
+            "final_length_retry_count": sum(
+                1 for item in finalization_attempts
+                if item["finish_reason"] == "length" and item["content_empty"]
+            ),
+            "final_finish_reason": finalization_attempts[-1]["finish_reason"],
         }

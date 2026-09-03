@@ -13,6 +13,7 @@ from mllmfl.domain.schemas import (
 from mllmfl.infrastructure.ground_truth import ground_truth_locations
 from mllmfl.infrastructure.io import read_json, write_csv, write_json
 from mllmfl.infrastructure.layout import RunLayout
+from mllmfl.stages.cleanup import final_only_bug
 
 
 def _targets(
@@ -70,6 +71,7 @@ def run(
     projects: Sequence[str],
     bugs: set[str] | None,
     d4j_home: Path,
+    final_only: bool = False,
 ) -> List[Dict[str, Any]]:
     details: List[Dict[str, Any]] = []
     evaluated_metrics = []
@@ -181,4 +183,8 @@ def run(
             "error",
         ],
     )
+    if final_only:
+        for item in details:
+            if item["status"] == "OK":
+                final_only_bug(layout, str(item["project"]), str(item["bug"]))
     return rows

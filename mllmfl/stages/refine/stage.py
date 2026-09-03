@@ -15,7 +15,6 @@ from .agent import finalization_limits, run_agent
 from .client import invalid_final_json_retries
 from .context import (
     build_prompt,
-    defect_evidence,
     runtime_method_ids,
     selected_trace_tests,
 )
@@ -26,10 +25,14 @@ from .input import load_localization_input
 def _bug_items(
     layout: RunLayout, projects: Sequence[str], bugs: set[str] | None
 ) -> list[tuple[str, str]]:
-    return sorted({
-        (project, bug)
-        for project, bug, _, _ in layout.discover_triggers(projects, bugs)
-    })
+    result = set()
+    for project in sorted(set(projects)):
+        project_dir = layout.artifacts / project
+        for path in project_dir.glob("bug_*/trace_suite.json"):
+            bug = path.parent.name.removeprefix("bug_")
+            if bug.isdigit() and (bugs is None or bug in bugs):
+                result.add((project, bug))
+    return sorted(result, key=lambda item: (item[0], int(item[1])))
 
 
 def _refine_bug(
@@ -45,6 +48,7 @@ def _refine_bug(
     max_upstream_calls: int,
     max_downstream_calls: int,
     max_internal_calls: int,
+    retain_debug_artifacts: bool,
 ) -> Dict[str, object]:
     bug_dir = layout.artifacts / project / f"bug_{bug}"
     result_path = bug_dir / "refinement.json"
@@ -109,17 +113,6 @@ def _refine_bug(
         finalization_limits(config)
         selected_tests = selected_trace_tests(localization_input, suite)
         selected_test_ids = [str(item["test_id"]) for item in selected_tests]
-        failures = defect_evidence(
-            layout, project, bug, suite, selected_test_ids
-        )
-        prompt = build_prompt(
-            project,
-            bug,
-            localization_input["locator"],
-            candidates,
-            failures,
-            workspace,
-        )
         graphs = MethodExecutionGraphs(
             bug_dir,
             config,
@@ -129,6 +122,16 @@ def _refine_bug(
             max_internal_calls=max_internal_calls,
             workspace=workspace,
             allowed_test_ids=selected_test_ids,
+            retain_debug_artifacts=retain_debug_artifacts,
+        )
+        failures = graphs.failure_evidence(selected_test_ids)
+        prompt = build_prompt(
+            project,
+            bug,
+            localization_input["locator"],
+            candidates,
+            failures,
+            workspace,
         )
         method_ids = runtime_method_ids(candidates, graphs.catalog, workspace)
         available_method_ids = graphs.available_method_ids()
@@ -144,11 +147,11 @@ def _refine_bug(
                 "status": "DRY_RUN",
                 "top1": "",
             }
-        if force:
-            inspection_dir = bug_dir / "inspection_graphs"
-            if inspection_dir.is_dir():
-                shutil.rmtree(inspection_dir)
+        inspection_dir = bug_dir / "inspection_graphs"
+        if inspection_dir.is_dir():
+            shutil.rmtree(inspection_dir)
         conversation_path = bug_dir / "refine_conversation.jsonl"
+        conversation_path.unlink(missing_ok=True)
         (bug_dir / "refine_response_usage.jsonl").unlink(missing_ok=True)
         (bug_dir / "refine_render_errors.jsonl").unlink(missing_ok=True)
         agent_result = run_agent(
@@ -206,7 +209,7 @@ def _refine_bug(
         ]
         output = {
             "schema": "fault-localization-refinement",
-            "schema_version": 5,
+            "schema_version": 6,
             "project": project,
             "bug": bug,
             "status": "OK",
@@ -232,7 +235,15 @@ def _refine_bug(
             "inspected_invocation_ids": agent_result["inspected_invocation_ids"],
             "queried_methods": agent_result["queried_methods"],
             "terminal_command_count": agent_result["terminal_command_count"],
-            "finalization_attempts": agent_result["finalization_attempts"],
+            "request_count": agent_result["request_count"],
+            "usage": agent_result["usage"],
+            "finalization_attempt_count": agent_result[
+                "finalization_attempt_count"
+            ],
+            "final_length_retry_count": agent_result[
+                "final_length_retry_count"
+            ],
+            "final_finish_reason": agent_result["final_finish_reason"],
         }
         validate_refinement(output)
         write_json(result_path, output)
@@ -264,6 +275,7 @@ def run(
     max_upstream_calls: int = 6,
     max_downstream_calls: int = 6,
     max_internal_calls: int = 10,
+    retain_debug_artifacts: bool = False,
 ) -> List[Dict[str, object]]:
     if trigger is not None:
         raise ValueError("refinement runs once per bug and does not accept --trigger")
@@ -283,6 +295,7 @@ def run(
             layout, item[0], item[1], locator_results, config, timeout,
             top_k, dry_run, force,
             max_upstream_calls, max_downstream_calls, max_internal_calls,
+            retain_debug_artifacts,
         )
 
     if workers == 1 or len(items) <= 1:

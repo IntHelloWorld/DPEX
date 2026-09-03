@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Sequence
 
 from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.stages import collect, evaluate, refine, trace
+from mllmfl.stages import cleanup, collect, evaluate, refine, trace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROJECTS = [
@@ -89,7 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     collect_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     collect_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
     trace_parser = subparsers.add_parser(
-        "trace", help="record Fullchain v4 executions and refinement indexes"
+        "trace", help="record normalized Fullchain v4 refinement traces"
     )
     _common(trace_parser)
     trace_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
@@ -114,6 +114,11 @@ def build_parser() -> argparse.ArgumentParser:
     trace_parser.add_argument(
         "--value-max-arguments-chars", type=_positive_int, default=480
     )
+    trace_parser.add_argument(
+        "--retain-debug-artifacts",
+        action="store_true",
+        help="retain raw trace, full execution, and detailed folding diagnostics",
+    )
 
     refine_parser = subparsers.add_parser(
         "refine", help="audit and optimize an external fault-localization ranking"
@@ -123,6 +128,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--locator-results",
         required=True,
         help="canonical locator result or supported adapter input such as AutoFL XFL",
+    )
+    refine_parser.add_argument(
+        "--retain-debug-artifacts",
+        action="store_true",
+        help=(
+            "retain recoverable render-error diagnostics; conversations, "
+            "per-request usage, and inspection images are always retained"
+        ),
     )
     refine_parser.add_argument("--config", required=True)
     refine_parser.add_argument("--top-k", type=_positive_int)
@@ -141,6 +154,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _common(evaluate_parser, include_trigger=False, include_force=False)
     evaluate_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
+    evaluate_parser.add_argument(
+        "--final-only",
+        action="store_true",
+        help="after successful evaluation, retain final results and remove intermediates",
+    )
+    cleanup_parser = subparsers.add_parser(
+        "cleanup", help="preview or remove exact legacy trace artifacts"
+    )
+    _common(cleanup_parser, include_trigger=False, include_force=False)
+    cleanup_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="remove allowlisted files; without this flag cleanup is a dry-run",
+    )
     return parser
 
 
@@ -190,6 +217,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.value_max_items,
             args.value_max_depth,
             args.value_max_arguments_chars,
+            args.retain_debug_artifacts,
         )
     elif args.stage == "refine":
         rows = refine.run(
@@ -207,8 +235,9 @@ def main(argv: Sequence[str] | None = None) -> None:
             args.max_upstream_calls,
             args.max_downstream_calls,
             args.max_internal_calls,
+            args.retain_debug_artifacts,
         )
-    else:
+    elif args.stage == "evaluate":
         if not args.d4j_home:
             parser.error("evaluate requires --d4j-home or D4J_HOME")
         rows = evaluate.run(
@@ -216,7 +245,10 @@ def main(argv: Sequence[str] | None = None) -> None:
             projects,
             bugs,
             Path(args.d4j_home).expanduser().resolve(),
+            args.final_only,
         )
+    else:
+        rows = cleanup.run(layout, projects, bugs, apply=args.apply)
     counts = {}
     for row in rows:
         status = str(row.get("status", "OK"))

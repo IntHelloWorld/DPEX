@@ -1,8 +1,9 @@
 # MLLM Fault-Localization Refinement
 
-This repository contains one workflow: collect Defects4J failures, record lossless runtime
-executions, use a multimodal refinement agent to audit an external locator ranking, and evaluate
-the refined source ranges. The executable stages are `collect`, `trace`, `refine`, and `evaluate`.
+This repository contains one workflow: collect Defects4J failures, record normalized runtime
+evidence, use a multimodal refinement agent to audit an external locator ranking, and evaluate
+the refined source ranges. The executable stages are `collect`, `trace`, `refine`, `evaluate`, and
+the narrowly allowlisted `cleanup` maintenance command.
 
 ## Setup
 
@@ -28,12 +29,18 @@ python -m mllmfl refine --root runs/chart-1 --projects Chart --bugs 1 \
   --config config/mllm.local.json --dry-run
 python -m mllmfl evaluate --root runs/chart-1 --projects Chart --bugs 1 \
   --d4j-home "$D4J_HOME"
+# Preview obsolete trace files; add --apply only after reviewing cleanup.csv.
+python -m mllmfl cleanup --root runs/chart-1 --projects Chart --bugs 1
 ```
 
 Run refinement with `--dry-run` before making model requests. `--force` replaces an existing stage
 result. Trace accepts `--trigger`; a complete bug-level trace run produces the suite required by
 refinement. Refinement is serial by default and supports deterministic bug-level concurrency with
-`--workers N`.
+`--workers N`. Trace uses lean artifact retention by default; pass `--retain-debug-artifacts` to
+trace when diagnosing it. Refinement always retains its conversation, per-request usage, and
+inspected PUML/PNG evidence; its `--retain-debug-artifacts` switch additionally records recoverable
+render errors. Evaluation preserves intermediate artifacts unless the explicit `--final-only`
+switch is supplied.
 
 All runtime data stays under `--root`:
 
@@ -41,15 +48,12 @@ All runtime data stays under `--root`:
 <root>/
 ├── workspace/<project>_<id>b/
 ├── artifacts/<project>/bug_<id>/
-│   ├── triggers/trigger_<n>/
-│   │   ├── raw_events.jsonl
-│   │   ├── execution.json
-│   │   ├── execution_assertion_pruned.json
-│   │   ├── assertion_folding.json
-│   │   ├── trace_index.json
-│   │   └── defect_context.json
 │   ├── trace_suite.json
+│   ├── traces/
+│   │   └── T<n>.refinement-trace.json.zst
 │   ├── inspection_graphs/
+│   ├── refine_conversation.jsonl
+│   ├── refine_response_usage.jsonl
 │   └── refinement.json
 ├── logs/<stage>/<project>/bug_<id>/
 └── summaries/evaluation.json
@@ -68,15 +72,17 @@ Scalars, strings, enums, arrays, and an explicit JDK collection/map whitelist ar
 the configured limits; other objects are type-only placeholders. Value-enabled traces remain fully
 expanded instead of merging repeated calls.
 
-`execution.json` is lossless after framework filtering. The tracer emits dynamic assertion
-start/pass/fail events. Complete, normally returning subtrees wholly owned by successful assertions
-are hidden only in `execution_assertion_pruned.json`; throwing, incomplete, cross-boundary, fixture,
-and non-assertion calls remain visible. `assertion_folding.json` records every hidden invocation so
-the transformation is auditable and reversible.
+The tracer emits dynamic assertion start/pass/fail events. Complete, normally returning subtrees
+wholly owned by successful assertions are discarded from the lean refinement trace; throwing,
+incomplete, cross-boundary, fixture, and non-assertion calls remain visible. The compact trace keeps
+the folding counts, failure evidence, capture settings, method table, call topology, method lookup
+index, sibling order, and exact subtree-call counts. Raw JSONL is streamed during parsing and deleted
+after successful validation; a failure is retained as `raw_events.failed.jsonl.zst`.
 
-Each failing test receives an unpadded `T<n>` ID. `trace_index.json` maps runtime methods to exact
+Each failing test receives an unpadded `T<n>` ID. The normalized trace maps runtime methods to exact
 test-scoped invocation IDs such as `T1-C19`, and `trace_suite.json` contains the bug-global method
-catalog used internally by refinement.
+catalog used internally by refinement. `--retain-debug-artifacts` additionally retains compressed
+raw/full execution evidence and detailed assertion folding.
 
 ## Locator input
 
@@ -114,14 +120,18 @@ The agent starts with no image and has three tools:
 
 The focus viewport has independent upstream, downstream, and internal call budgets. Nearby siblings
 are selected before moving to higher caller levels; focus internals use breadth-first order. Omitted
-regions are represented by self-arrows of the form `... omit N calls ...`, where `N` includes every
-dynamic call in the omitted complete subtrees. A selected occurrence produces exactly one image and
-has no navigation graph.
+regions are represented by `... omit N calls ...` self-arrows. `N` comes from trace-time subtree
+counts, so viewport queries do not traverse hidden subtrees. Each selected test trace is opened once,
+and invocation dictionaries are expanded only for the bounded local viewport. A selected occurrence
+produces exactly one image and has no navigation graph.
 
 Diagram IDs use `T<test>-M<method>-C<invocation_id>-D1`; call labels use exact test-scoped IDs such
 as `T1-C19`. Arguments appear on call arrows and normal return values on dashed return arrows. PUML
 and PNG files are generated only when an occurrence is inspected. PNG rendering is content-addressed,
-atomically replaced, and rejected if it reaches the configured PlantUML size limit.
+atomically replaced, and rejected if it reaches the configured PlantUML size limit. Refinement
+retains inspection graphs, the complete replayable conversation, and one usage record per model
+request in both normal and debug modes. Debug mode additionally retains recoverable render-error
+records.
 
 The final model response is a JSON array of at most `top_k` source-anchored methods. The agent may
 reorder or remove locator candidates and may add runtime/source-supported methods. Every returned
@@ -143,19 +153,18 @@ follow the bounded JSON-correction path.
 | File | Schema | Producer | Consumer |
 |---|---|---|---|
 | `collect.json` | `collected-trigger` v2 | collect | trace |
-| `raw_events.jsonl` | Fullchain Agent protocol v4 | trace | trace parser |
-| `execution.json` | `fullchain-execution` v4 | trace | graph inspection |
-| `execution_assertion_pruned.json` | `fullchain-execution` v4 | trace | default lookup evidence |
-| `assertion_folding.json` | `assertion-trace-folding` v1 | trace | trace audit |
-| `trace_index.json` | `execution-trace-index` v2 | trace | invocation lookup |
-| `trace_suite.json` | `execution-trace-suite` v1 | trace | refine |
-| `defect_context.json` | `defect-context` v1 | trace | refine |
+| `T<n>.refinement-trace.json.zst` | `refinement-trace` v1 | trace | refine |
+| `trace_suite.json` | `execution-trace-suite` v2 | trace | refine |
 | external locator JSON | `fault-localization-input` v1 | external locator | refine |
-| `refinement.json` | `fault-localization-refinement` v5 | refine | evaluate |
+| `refinement.json` | `fault-localization-refinement` v6 | refine | evaluate |
 | `summaries/evaluation.json` | `fault-localization-evaluation` v2 | evaluate | reporting |
 
 Stage outputs are validated before consumption. Existing refinement results are reused only when the
 input, configuration, trace-suite fingerprints, and `top_k` match; otherwise rerun with `--force`.
+The cleanup command recognizes only `trace.json`, `execution_sliced.json`, and
+`execution_compressed.json`; it is a dry-run unless `--apply` is present. `evaluate --final-only`
+runs only after evaluation output is validated and removes known trace/debug directories plus the
+selected buggy workspace while preserving `refinement.json`, logs, and evaluation summaries.
 
 ## Validation
 

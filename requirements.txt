@@ -1,4 +1,5 @@
 requests
+zstandard
 # 0.26.0 corrupts process state with the 0.23.5 Java grammar wheel in this runtime.
 tree-sitter==0.25.2
 tree-sitter-java==0.23.5

@@ -1,8 +1,7 @@
 import os
-import sys
+import shutil
 import zipfile
 from collections import defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -13,8 +12,12 @@ from mllmfl.domain.assertion_folding import (
 )
 from mllmfl.domain.schemas import (
     validate_defect_context,
-    validate_trace_index,
     validate_trace_suite,
+)
+from mllmfl.domain.refinement_trace import (
+    build_method_catalog,
+    build_refinement_trace,
+    validate_refinement_trace,
 )
 from mllmfl.domain.trace import (
     EXECUTION_SCHEMA,
@@ -31,16 +34,99 @@ from mllmfl.infrastructure.defects4j import (
     test_classpath,
 )
 from mllmfl.infrastructure.io import (
+    compress_zstd_file,
     read_json,
+    read_zstd_json,
     write_compact_json,
     write_csv,
     write_json,
     write_text,
+    write_zstd_json,
 )
 from mllmfl.infrastructure.java_source import find_java_file
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.process import run_command
-from .trace_index import build_method_catalog, build_trace_index
+
+TRACE_WORK_NAME = "refinement-trace.work.json.zst"
+
+
+def archive_failed_raw_trace(output: Path) -> Path | None:
+    raw_path = output / "raw_events.jsonl"
+    if not raw_path.is_file():
+        return None
+    target = output / "raw_events.failed.jsonl.zst"
+    compress_zstd_file(raw_path, target, level=1)
+    raw_path.unlink()
+    return target
+
+
+def _suite_only_targets(
+    layout: RunLayout,
+    projects: Sequence[str],
+    bugs: set[str] | None,
+    trigger: str | None,
+) -> list[tuple[str, str, str, Path, str, Dict[str, Any]]]:
+    """Recover lean trace targets after their temporary trigger dirs are gone."""
+    bases = (
+        sorted(layout.artifacts.glob("*"))
+        if not projects or "ALL" in projects
+        else [layout.artifacts / project for project in projects]
+    )
+    result = []
+    for base in bases:
+        if not base.is_dir():
+            continue
+        for suite_path in sorted(base.glob("bug_*/trace_suite.json")):
+            bug_dir = suite_path.parent
+            bug = bug_dir.name.removeprefix("bug_")
+            if not bug.isdigit() or (bugs is not None and bug not in bugs):
+                continue
+            raw_suite = read_json(suite_path)
+            if (
+                not isinstance(raw_suite, dict)
+                or raw_suite.get("schema") != "execution-trace-suite"
+                or raw_suite.get("schema_version") != 2
+            ):
+                # Old suites are not read. Their still-present trigger inputs
+                # are migrated through the normal tracing path.
+                continue
+            suite = validate_trace_suite(raw_suite)
+            known_method_ids = {
+                str(item["method_id"]) for item in suite["method_catalog"]
+            }
+            for spec in suite["tests"]:
+                number = str(spec["trigger"])
+                if trigger is not None and trigger != number:
+                    continue
+                trace_path = bug_dir / Path(*Path(str(spec["trace"])).parts)
+                trace_value = validate_refinement_trace(
+                    read_zstd_json(trace_path)
+                )
+                if (
+                    trace_value["project"] != suite["project"]
+                    or trace_value["test_id"] != spec["test_id"]
+                    or trace_value["test"] != spec["test"]
+                    or trace_value["fingerprint"] != spec["trace_fingerprint"]
+                    or trace_value["method_catalog_fingerprint"]
+                    != suite["method_catalog_fingerprint"]
+                    or any(
+                        method_id not in known_method_ids
+                        for method_id, *_ in trace_value["methods"]
+                        if str(method_id).startswith("M")
+                    )
+                ):
+                    raise ValueError(
+                        f"trace suite payload mismatch for {spec['test_id']}"
+                    )
+                result.append((
+                    base.name,
+                    bug,
+                    number,
+                    layout.trigger_dir(base.name, bug, number),
+                    str(spec["test"]),
+                    trace_value,
+                ))
+    return result
 
 
 PROJECT_PREFIX = {
@@ -151,29 +237,13 @@ def java_xml_compatibility_arguments(
     return []
 
 
-@contextmanager
-def compression_recursion_limit(execution: Dict[str, Any]):
-    max_depth = max(
-        (len(call.get("parent_chain") or []) + 1 for call in execution["calls"]),
-        default=1,
-    )
-    previous = sys.getrecursionlimit()
-    required = max(previous, max_depth * 4 + 1000)
-    if required != previous:
-        sys.setrecursionlimit(required)
-    try:
-        yield
-    finally:
-        if required != previous:
-            sys.setrecursionlimit(previous)
-
-
 def trace_trigger(workspace: Path, output: Path, test: str, project: str,
                   agent_jar: Path, env: Dict[str, str], timeout: int,
                   log_dir: Path | None = None, capture_values: bool = True,
                   value_max_chars: int = 120, value_max_items: int = 8,
                   value_max_depth: int = 2,
-                  value_max_arguments_chars: int = 480) -> Dict[str, Any]:
+                  value_max_arguments_chars: int = 480,
+                  retain_debug_artifacts: bool = False) -> Dict[str, Any]:
     test_class, test_method = split_test(test)
     prefix = PROJECT_PREFIX.get(project, test_class.rsplit(".", 1)[0])
     test_source = find_java_file(workspace, test_class)
@@ -184,6 +254,7 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
     raw_path = output / "raw_events.jsonl"
     if raw_path.exists():
         raw_path.unlink()
+    (output / "raw_events.failed.jsonl.zst").unlink(missing_ok=True)
     agent_args = f"{prefix},class:{test_class}"
     classpath = build_classpath(workspace, agent_jar, env)
     compatibility_arguments = java_xml_compatibility_arguments(
@@ -228,7 +299,6 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
         "test_output": test_output,
     }
     validate_defect_context(defect_context)
-    write_json(output / "defect_context.json", defect_context)
     if not raw_path.is_file():
         raise RuntimeError("fullchain agent did not create raw_events.jsonl")
     full = build_trace(load_events(raw_path))
@@ -257,20 +327,35 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
     })
     execution = project_execution(full, test_class, test_method)
     execution["project"] = project
+    execution["process_exit_code"] = result.returncode
     assertion_pruned, assertion_folding = fold_successful_assertions(execution)
-    write_json(output / "execution.json", execution)
-    pruned_path = output / "execution_assertion_pruned.json"
-    if assertion_folding["folded_call_count"]:
-        write_json(pruned_path, assertion_pruned)
+    work = {
+        "schema": "refinement-trace-work",
+        "schema_version": 1,
+        "test": test,
+        "execution": assertion_pruned,
+        "assertion_folding": assertion_folding,
+        "defect_context": defect_context,
+    }
+    write_zstd_json(output / TRACE_WORK_NAME, work, level=1)
+    if retain_debug_artifacts:
+        write_zstd_json(output / "execution.debug.json.zst", execution, level=1)
+        write_json(output / "assertion_folding.debug.json", assertion_folding)
+        write_json(output / "defect_context.debug.json", defect_context)
+        compress_zstd_file(
+            raw_path, output / "raw_events.jsonl.zst", level=1
+        )
     else:
-        pruned_path.unlink(missing_ok=True)
-    write_json(output / "assertion_folding.json", assertion_folding)
-    return execution
+        (output / "raw_events.jsonl.zst").unlink(missing_ok=True)
+    raw_path.unlink(missing_ok=True)
+    return work
 
 
 def _write_trace_suites(
     layout: RunLayout,
     grouped: Dict[tuple[str, str], list[tuple[str, str, str, Path]]],
+    *,
+    retain_debug_artifacts: bool,
 ) -> None:
     for (project, bug), items in grouped.items():
         bug_dir = layout.artifacts / project / f"bug_{bug}"
@@ -280,60 +365,60 @@ def _write_trace_suites(
 
             def executions():
                 for _, _, _, directory in ordered:
-                    value = read_json(directory / "execution.json")
-                    yield validate_trace(value, EXECUTION_SCHEMA)
+                    work = read_zstd_json(directory / TRACE_WORK_NAME)
+                    yield validate_trace(work["execution"], EXECUTION_SCHEMA)
 
             catalog, method_ids, fingerprint = build_method_catalog(executions())
             tests = []
             for index, (_, _, number, directory) in enumerate(ordered, 1):
                 test_id = f"T{index}"
-                test = (directory / "trigger_test.txt").read_text(
-                    encoding="utf-8"
-                ).strip()
-                execution = validate_trace(
-                    read_json(directory / "execution.json"), EXECUTION_SCHEMA
-                )
+                work = read_zstd_json(directory / TRACE_WORK_NAME)
+                if (
+                    not isinstance(work, dict)
+                    or work.get("schema") != "refinement-trace-work"
+                    or work.get("schema_version") != 1
+                ):
+                    raise ValueError("unsupported refinement trace work schema")
+                test = str(work["test"])
+                execution = validate_trace(work["execution"], EXECUTION_SCHEMA)
                 assertion_folding = validate_assertion_folding(
-                    read_json(directory / "assertion_folding.json")
+                    work["assertion_folding"]
                 )
-                default_name = (
-                    "execution_assertion_pruned.json"
-                    if assertion_folding["folded_call_count"]
-                    else "execution.json"
-                )
-                default_execution = validate_trace(
-                    read_json(directory / default_name), EXECUTION_SCHEMA
-                )
-                if default_execution["call_count"] != assertion_folding[
+                if execution["call_count"] != assertion_folding[
                     "retained_call_count"
                 ]:
                     raise ValueError("assertion-pruned execution count mismatch")
-                fold_by_invocation = {
-                    int(invocation_id): str(fold["fold_id"])
-                    for fold in assertion_folding["folds"]
-                    for invocation_id in fold["invocation_ids"]
-                }
-                trace_index = build_trace_index(
+                context = validate_defect_context(work["defect_context"])
+                normalized = build_refinement_trace(
                     execution,
+                    project=project,
                     test_id=test_id,
                     test=test,
                     method_ids=method_ids,
                     catalog_fingerprint=fingerprint,
-                    fold_by_invocation=fold_by_invocation,
-                    default_execution=default_name,
+                    assertion_folding=assertion_folding,
+                    error_stack=str(context["error_stack"]),
+                    test_output=str(context["test_output"]),
                 )
-                validate_trace_index(trace_index, directory)
-                index_path = directory / "trace_index.json"
-                write_compact_json(index_path, trace_index)
+                trace_path = bug_dir / "traces" / (
+                    f"{test_id}.refinement-trace.json.zst"
+                )
+                write_zstd_json(trace_path, normalized, level=1)
                 tests.append({
                     "test_id": test_id,
                     "test": test,
                     "trigger": int(number),
-                    "trace_index": index_path.relative_to(bug_dir).as_posix(),
+                    "trace": trace_path.relative_to(bug_dir).as_posix(),
+                    "trace_fingerprint": normalized["fingerprint"],
                 })
+            expected_traces = {str(item["trace"]) for item in tests}
+            traces_dir = bug_dir / "traces"
+            for path in traces_dir.glob("T*.refinement-trace.json.zst"):
+                if path.relative_to(bug_dir).as_posix() not in expected_traces:
+                    path.unlink()
             suite = {
                 "schema": "execution-trace-suite",
-                "schema_version": 1,
+                "schema_version": 2,
                 "project": project,
                 "bug": bug,
                 "method_catalog_fingerprint": fingerprint,
@@ -342,7 +427,34 @@ def _write_trace_suites(
                 "tests": tests,
             }
             validate_trace_suite(suite, bug_dir)
-            write_json(suite_path, suite)
+            write_compact_json(suite_path, suite)
+            if not retain_debug_artifacts:
+                for _, _, _, directory in ordered:
+                    for name in (
+                        TRACE_WORK_NAME,
+                        "collect.json",
+                        "trigger_test.txt",
+                        "defect_context.json",
+                        "assertion_folding.json",
+                        "execution.json",
+                        "execution_assertion_pruned.json",
+                        "trace_index.json",
+                        "raw_events.jsonl",
+                        "raw_events.jsonl.zst",
+                    ):
+                        (directory / name).unlink(missing_ok=True)
+                    java_xml_patch = directory / "java_xml_patch"
+                    if java_xml_patch.is_dir():
+                        shutil.rmtree(java_xml_patch)
+                    try:
+                        directory.rmdir()
+                    except OSError:
+                        pass
+                triggers_dir = bug_dir / "triggers"
+                try:
+                    triggers_dir.rmdir()
+                except OSError:
+                    pass
         except Exception as error:
             suite_path.unlink(missing_ok=True)
             write_text(
@@ -350,34 +462,6 @@ def _write_trace_suites(
                 str(error) + "\n",
             )
             raise
-
-
-def _ensure_assertion_artifacts(
-    output: Path, execution: Dict[str, Any]
-) -> None:
-    pruned_path = output / "execution_assertion_pruned.json"
-    folding_path = output / "assertion_folding.json"
-    valid = False
-    if folding_path.is_file():
-        folding = validate_assertion_folding(read_json(folding_path))
-        if folding["original_call_count"] == execution["call_count"]:
-            if folding["folded_call_count"] == 0:
-                pruned_path.unlink(missing_ok=True)
-                valid = True
-            elif pruned_path.is_file():
-                pruned = validate_trace(read_json(pruned_path), EXECUTION_SCHEMA)
-                valid = (
-                    pruned.get("schema_version") == execution.get("schema_version")
-                    and pruned.get("test_start") == execution.get("test_start")
-                    and pruned["call_count"] == folding["retained_call_count"]
-                )
-    if not valid:
-        pruned, folding = fold_successful_assertions(execution)
-        write_json(folding_path, folding)
-        if folding["folded_call_count"]:
-            write_json(pruned_path, pruned)
-        else:
-            pruned_path.unlink(missing_ok=True)
 
 
 def run(
@@ -395,6 +479,7 @@ def run(
     value_max_items: int = 8,
     value_max_depth: int = 2,
     value_max_arguments_chars: int = 480,
+    retain_debug_artifacts: bool = False,
 ) -> List[Dict[str, object]]:
     if not agent_jar.is_file():
         raise FileNotFoundError(f"agent jar not found: {agent_jar}")
@@ -408,18 +493,61 @@ def run(
     }
     rows = []
     trigger_items = list(layout.discover_triggers(projects, bugs, trigger))
+    suite_targets = _suite_only_targets(layout, projects, bugs, trigger)
+    suite_keys = {(item[0], item[1]) for item in suite_targets}
+    retrace_suite_keys = {
+        (project, bug)
+        for project, bug, _, _, _, normalized in suite_targets
+        if force or normalized.get("capture") != requested_capture
+    }
+    trigger_items = [
+        item for item in trigger_items
+        if (item[0], item[1]) not in suite_keys
+    ]
+    for project, bug, number, output, test, normalized in suite_targets:
+        if (project, bug) not in retrace_suite_keys:
+            rows.append({
+                "project": project,
+                "bug": bug,
+                "trigger": number,
+                "status": "SKIPPED",
+                "call_count": int(normalized["call_count"]),
+            })
+            continue
+        output.mkdir(parents=True, exist_ok=True)
+        write_text(output / "trigger_test.txt", test + "\n")
+        write_json(output / "collect.json", {
+            "schema": "collected-trigger",
+            "schema_version": 2,
+            "project": project,
+            "bug": bug,
+            "trigger": int(number),
+            "test_id": str(normalized["test_id"]),
+            "test": test,
+            "test_exit_code": int(
+                normalized["failure"]["process_exit_code"]
+            ),
+            "test_output": str(normalized["failure"]["test_output"]),
+        })
+        trigger_items.append((project, bug, number, output))
     grouped = defaultdict(list)
     for item in trigger_items:
         grouped[(item[0], item[1])].append(item)
+    if force and trigger is None:
+        for project, bug in grouped:
+            (layout.artifacts / project / f"bug_{bug}" / "trace_suite.json").unlink(
+                missing_ok=True
+            )
     for project, bug, number, output in trigger_items:
         reuse = (
-            (output / "execution.json").exists()
+            (output / TRACE_WORK_NAME).exists()
             and not force
         )
         if reuse:
             try:
+                work = read_zstd_json(output / TRACE_WORK_NAME)
                 execution = validate_trace(
-                    read_json(output / "execution.json"), EXECUTION_SCHEMA
+                    work["execution"], EXECUTION_SCHEMA
                 )
                 instrumentation = execution.get("assertion_instrumentation")
                 if not isinstance(instrumentation, dict):
@@ -431,7 +559,6 @@ def run(
                 ):
                     reuse = False
                 if reuse:
-                    _ensure_assertion_artifacts(output, execution)
                     rows.append({
                         "project": project, "bug": bug, "trigger": number,
                         "status": "SKIPPED", "call_count": execution["call_count"],
@@ -449,6 +576,15 @@ def run(
                 continue
             if reuse:
                 continue
+        (output / TRACE_WORK_NAME).unlink(missing_ok=True)
+        if not retain_debug_artifacts:
+            for name in (
+                "execution.debug.json.zst",
+                "assertion_folding.debug.json",
+                "defect_context.debug.json",
+                "raw_events.jsonl.zst",
+            ):
+                (output / name).unlink(missing_ok=True)
         test_path = output / "trigger_test.txt"
         try:
             test = test_path.read_text(encoding="utf-8").strip().splitlines()[0]
@@ -458,16 +594,25 @@ def run(
                 agent_jar, env, timeout, log_dir,
                 capture_values, value_max_chars, value_max_items,
                 value_max_depth, value_max_arguments_chars,
+                retain_debug_artifacts,
             )
             rows.append({"project": project, "bug": bug, "trigger": number,
-                         "status": "OK", "call_count": execution["call_count"]})
+                         "status": "OK",
+                         "call_count": execution["execution"]["call_count"]})
         except Exception as error:
+            if (output / "raw_events.jsonl").is_file():
+                try:
+                    archive_failed_raw_trace(output)
+                except Exception as archive_error:
+                    error = RuntimeError(f"{error}; raw archive failed: {archive_error}")
             write_text(layout.stage_log_dir("trace", project, bug, number) / "error.log",
                        str(error) + "\n")
             rows.append({"project": project, "bug": bug, "trigger": number,
                          "status": "ERROR", "call_count": 0})
     if trigger is None and rows and all(row["status"] != "ERROR" for row in rows):
-        _write_trace_suites(layout, grouped)
+        _write_trace_suites(
+            layout, grouped, retain_debug_artifacts=retain_debug_artifacts
+        )
     write_csv(
         layout.logs / "trace.csv",
         rows,

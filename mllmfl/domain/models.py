@@ -55,8 +55,6 @@ class Call:
     exit_seq: int
     exit_type: str
     origin_test_line: int = 0
-    count: int = 1
-    context: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
