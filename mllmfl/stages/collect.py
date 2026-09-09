@@ -5,9 +5,9 @@ from typing import Dict, List, Sequence
 from mllmfl.infrastructure.defects4j import (
     bug_ids, checkout, compile_project, defects4j_environment, ensure_defects4j, trigger_tests,
 )
-from mllmfl.infrastructure.io import write_csv, write_json, write_text
+from mllmfl.infrastructure.io import write_csv, write_text
 from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.infrastructure.process import run_command
+from mllmfl.infrastructure.checkouts import remove_checkout
 
 
 def _prepare_trigger_directories(
@@ -41,81 +41,71 @@ def run(
     java_home: Path | None,
     timeout: int,
     force: bool = False,
+    *,
+    agent_jar: Path,
+    config_path: Path,
+    retain_debug_artifacts: bool = False,
 ) -> List[Dict[str, object]]:
+    from mllmfl.stages import trace
+
     layout.ensure()
+    if not agent_jar.is_file():
+        raise FileNotFoundError(f"agent jar not found: {agent_jar}")
+    capture = trace.load_trace_configuration(config_path)
     env = defects4j_environment(d4j_home, java_home)
     ensure_defects4j(env)
     rows: List[Dict[str, object]] = []
-    for project in projects:
-        selected = sorted(bugs or set(bug_ids(project, env)), key=lambda value: int(value))
+    for project in dict.fromkeys(projects):
+        selected = sorted(bugs if bugs is not None else set(bug_ids(project, env)), key=int)
         for bug in selected:
             workspace = layout.workspace_dir(project, bug)
-            checkout_result = checkout(project, bug, workspace, env, force=force, timeout=timeout)
-            bug_log = layout.logs / "collect" / project / f"bug_{bug}"
-            write_text(bug_log / "checkout.stdout.log", checkout_result.stdout)
-            write_text(bug_log / "checkout.stderr.log", checkout_result.stderr)
-            if checkout_result.returncode != 0:
-                rows.append(
-                    {
-                        "project": project,
-                        "bug": bug,
-                        "status": "SETUP_FAILED",
-                        "trigger_count": 0,
-                    }
-                )
-                continue
-
-            compile_result = compile_project(workspace, env, timeout)
-            write_text(bug_log / "compile.stdout.log", compile_result.stdout)
-            write_text(bug_log / "compile.stderr.log", compile_result.stderr)
-            if compile_result.returncode != 0:
-                rows.append(
-                    {
-                        "project": project,
-                        "bug": bug,
-                        "status": "SETUP_FAILED",
-                        "trigger_count": 0,
-                    }
-                )
-                continue
-            available_tests = trigger_tests(workspace, env)
-            tests = list(available_tests)
-            _prepare_trigger_directories(layout, project, bug, tests)
-            for index, test in enumerate(tests, 1):
-                output = layout.trigger_dir(project, bug, index)
-                trigger_log = layout.stage_log_dir("collect", project, bug, index)
-                result = run_command(
-                    ["defects4j", "test", "-t", test],
-                    cwd=workspace,
-                    env=env,
-                    timeout=timeout,
-                )
-                write_text(output / "trigger_test.txt", test + "\n")
-                write_text(trigger_log / "test.stdout.log", result.stdout)
-                write_text(trigger_log / "test.stderr.log", result.stderr)
-                test_output = "\n".join(
-                    part.rstrip() for part in (result.stdout, result.stderr) if part
-                )
-                test_id = f"T{index}"
-                write_json(output / "collect.json", {
-                    "schema": "collected-trigger", "schema_version": 2,
-                    "project": project, "bug": bug, "trigger": index,
-                    "test_id": test_id,
-                    "test": test, "test_exit_code": result.returncode,
-                    "test_output": test_output,
-                })
-            rows.append(
-                {
-                    "project": project,
-                    "bug": bug,
-                    "status": "OK",
-                    "available_trigger_count": len(available_tests),
-                    "trigger_count": len(tests),
-                }
-            )
-    write_csv(
-        layout.logs / "collect.csv",
-        rows,
-        ["project", "bug", "status", "available_trigger_count", "trigger_count"],
-    )
+            bug_log = layout.stage_log_dir("collect", project, bug)
+            row = {"project": project, "bug": bug, "status": "ERROR",
+                   "trigger_count": 0, "checkout_removed": False}
+            try:
+                targets = []
+                if not force:
+                    targets = trace._suite_only_targets(layout, [project], {bug}, None)
+                if targets and all(item[5].get("capture") == capture for item in targets):
+                    row.update(status="SKIPPED", trigger_count=len(targets))
+                else:
+                    result = checkout(
+                        project, bug, workspace, env, force=force, timeout=timeout
+                    )
+                    write_text(bug_log / "checkout.stdout.log", result.stdout)
+                    write_text(bug_log / "checkout.stderr.log", result.stderr)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"checkout failed: {result.returncode}")
+                    result = compile_project(workspace, env, timeout)
+                    write_text(bug_log / "compile.stdout.log", result.stdout)
+                    write_text(bug_log / "compile.stderr.log", result.stderr)
+                    if result.returncode != 0:
+                        raise RuntimeError(f"compile failed: {result.returncode}")
+                    tests = list(dict.fromkeys(trigger_tests(workspace, env)))
+                    if not tests:
+                        raise ValueError("no trigger tests exported")
+                    _prepare_trigger_directories(layout, project, bug, tests)
+                    # Invalidate the old suite before attempting fresh executions.
+                    (layout.artifacts / project / f"bug_{bug}" / "trace_suite.json").unlink(missing_ok=True)
+                    for index, test in enumerate(tests, 1):
+                        write_text(layout.trigger_dir(project, bug, index) / "trigger_test.txt", test + "\n")
+                    results = trace.run(
+                        layout, [project], {bug}, None, agent_jar, d4j_home,
+                        java_home, config_path, timeout, force, retain_debug_artifacts,
+                    )
+                    row["trigger_count"] = len(tests)
+                    if len(results) != len(tests) or any(r["status"] == "ERROR" for r in results):
+                        raise RuntimeError("trigger tracing failed; checkout retained")
+                    verified = trace._suite_only_targets(layout, [project], {bug}, None)
+                    if len(verified) != len(tests) or [v[4] for v in verified] != tests:
+                        raise ValueError("persisted trace suite does not match exported tests")
+                    row["status"] = "OK"
+                remove_checkout(layout, project, bug)
+                row["checkout_removed"] = True
+            except Exception as error:
+                row["status"] = "ERROR"
+                write_text(bug_log / "error.log", str(error) + "\n")
+            rows.append(row)
+    write_csv(layout.logs / "collect.csv", rows,
+              ["project", "bug", "status", "trigger_count", "checkout_removed"])
     return rows

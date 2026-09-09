@@ -15,17 +15,19 @@ import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class TraceRuntime {
-    private static final int PROTOCOL_VERSION = 4;
+    private static final int PROTOCOL_VERSION = 5;
     private static final boolean CAPTURE_VALUES = booleanProperty(
             "fltrace.capture.values", true);
-    private static final int VALUE_MAX_CHARS = positiveIntProperty(
-            "fltrace.value.max.chars", 120);
-    private static final int VALUE_MAX_ITEMS = positiveIntProperty(
-            "fltrace.value.max.items", 8);
+    private static final int VALUE_STRING_EDGE_CHARS = positiveIntProperty(
+            "fltrace.value.string.edge.chars", 10);
+    private static final int VALUE_CONTAINER_EDGE_ITEMS = positiveIntProperty(
+            "fltrace.value.container.edge.items", 2);
+    private static final int VALUE_NESTED_CONTAINER_EDGE_ITEMS = positiveIntProperty(
+            "fltrace.value.nested.container.edge.items", 1);
     private static final int VALUE_MAX_DEPTH = nonNegativeIntProperty(
             "fltrace.value.max.depth", 2);
-    private static final int VALUE_MAX_ARGUMENTS_CHARS = positiveIntProperty(
-            "fltrace.value.max.arguments.chars", 480);
+    private static final int VALUE_MAX_ARGUMENTS = positiveIntProperty(
+            "fltrace.value.max.arguments", 8);
     private static final AtomicLong NEXT_INVOCATION_ID = new AtomicLong(1);
     private static final AtomicLong NEXT_SEQUENCE = new AtomicLong(1);
     private static final ThreadLocal<Deque<Frame>> STACK =
@@ -219,11 +221,12 @@ public final class TraceRuntime {
                     ",\"agent_protocol_version\":" + PROTOCOL_VERSION +
                     ",\"value_capture\":{" +
                     "\"capture_values\":" + CAPTURE_VALUES +
-                    ",\"value_max_chars\":" + VALUE_MAX_CHARS +
-                    ",\"value_max_items\":" + VALUE_MAX_ITEMS +
+                    ",\"value_string_edge_chars\":" + VALUE_STRING_EDGE_CHARS +
+                    ",\"value_container_edge_items\":" + VALUE_CONTAINER_EDGE_ITEMS +
+                    ",\"value_nested_container_edge_items\":" +
+                    VALUE_NESTED_CONTAINER_EDGE_ITEMS +
                     ",\"value_max_depth\":" + VALUE_MAX_DEPTH +
-                    ",\"value_max_arguments_chars\":" +
-                    VALUE_MAX_ARGUMENTS_CHARS + "}}");
+                    ",\"value_max_arguments\":" + VALUE_MAX_ARGUMENTS + "}}");
         } catch (Throwable ignored) {
         }
     }
@@ -337,24 +340,16 @@ public final class TraceRuntime {
         Object[] safeValues = values == null ? new Object[0] : values;
         Class<?>[] safeTypes = declaredTypes == null ? new Class<?>[0] : declaredTypes;
         int count = safeValues.length;
-        int limit = Math.min(count, VALUE_MAX_ITEMS);
+        int limit = Math.min(count, VALUE_MAX_ARGUMENTS);
         StringBuilder items = new StringBuilder();
         int emitted = 0;
-        int used = 0;
         boolean truncated = count > limit || safeTypes.length != count;
         for (int index = 0; index < limit; index++) {
             Class<?> declared = index < safeTypes.length ? safeTypes[index] : null;
             ValueSummary summary = safeSummary(safeValues[index], declared);
             String item = summary.json(index);
-            int boundaryCost = (emitted == 0 ? 0 : 2)
-                    + ("arg" + index + "=").length() + summary.text.length();
-            if (used + boundaryCost > VALUE_MAX_ARGUMENTS_CHARS) {
-                truncated = true;
-                break;
-            }
             if (emitted > 0) items.append(',');
             items.append(item);
-            used += boundaryCost;
             emitted++;
             truncated = truncated || summary.truncated;
         }
@@ -365,7 +360,7 @@ public final class TraceRuntime {
     }
 
     private static String summarizeReturn(Object value, Class<?> declaredType) {
-        if (declaredType == null || declaredType == Void.TYPE || declaredType == Void.class) {
+        if (declaredType == null || declaredType == Void.TYPE) {
             return new ValueSummary(typeName(declaredType), "", "void", "", false)
                     .json(null);
         }
@@ -376,23 +371,15 @@ public final class TraceRuntime {
         try {
             IdentityHashMap<Object, Boolean> seen = new IdentityHashMap<Object, Boolean>();
             TextValue rendered = renderValue(value, 0, seen);
-            String text = rendered.text;
-            boolean truncated = rendered.truncated;
-            if (text.length() > VALUE_MAX_CHARS) {
-                text = abbreviate(text, VALUE_MAX_CHARS);
-                truncated = true;
-            }
             return new ValueSummary(
                     typeName(declaredType), value == null ? "" : value.getClass().getName(),
-                    rendered.kind, text, truncated);
+                    rendered.kind, rendered.text, rendered.truncated);
         } catch (Throwable error) {
             String name = error == null ? "java.lang.Throwable" : error.getClass().getName();
             String text = "<capture-error:" + name + ">";
-            boolean truncated = text.length() > VALUE_MAX_CHARS;
-            if (truncated) text = abbreviate(text, VALUE_MAX_CHARS);
             return new ValueSummary(typeName(declaredType),
                     value == null ? "" : safeClassName(value), "error",
-                    text, truncated);
+                    text, false);
         }
     }
 
@@ -401,7 +388,7 @@ public final class TraceRuntime {
         if (value == null) return new TextValue("null", "null", false);
         Class<?> type = value.getClass();
         if (value instanceof String) {
-            return new TextValue("string", quote((String) value), false);
+            return renderString((String) value);
         }
         if (value instanceof Character) {
             return new TextValue("char", "'" + escapeText(String.valueOf(value)) + "'", false);
@@ -428,6 +415,29 @@ public final class TraceRuntime {
         return new TextValue("object", "<" + type.getName() + ">", false);
     }
 
+    private static TextValue renderString(String value) {
+        int edge = VALUE_STRING_EDGE_CHARS;
+        if (value.length() <= edge * 2) {
+            return new TextValue("string", quote(value), false);
+        }
+        String text = "\"" + escapeText(value.substring(0, edge)) + "…"
+                + escapeText(value.substring(value.length() - edge)) + "\"";
+        return new TextValue("string", text, true);
+    }
+
+    private static boolean isContainer(Object value) {
+        if (value == null) return false;
+        Class<?> type = value.getClass();
+        return type.isArray() || isWhitelistedCollection(type)
+                || isWhitelistedMap(type);
+    }
+
+    private static int containerEdgeItems(boolean containsContainer, int depth) {
+        return depth > 0 || containsContainer
+                ? VALUE_NESTED_CONTAINER_EDGE_ITEMS
+                : VALUE_CONTAINER_EDGE_ITEMS;
+    }
+
     private static TextValue renderArray(Object value, int depth,
                                          IdentityHashMap<Object, Boolean> seen) {
         if (seen.containsKey(value)) return new TextValue("cycle", "<cycle>", false);
@@ -435,17 +445,31 @@ public final class TraceRuntime {
         seen.put(value, Boolean.TRUE);
         try {
             int length = java.lang.reflect.Array.getLength(value);
-            int limit = Math.min(length, VALUE_MAX_ITEMS);
+            boolean containsContainer = false;
+            for (int index = 0; index < length && !containsContainer; index++) {
+                containsContainer = isContainer(java.lang.reflect.Array.get(value, index));
+            }
+            int edge = containerEdgeItems(containsContainer, depth);
             StringBuilder out = new StringBuilder("[");
-            boolean truncated = length > limit;
-            for (int index = 0; index < limit; index++) {
+            boolean truncated = length > edge * 2;
+            int firstEnd = truncated ? edge : length;
+            for (int index = 0; index < firstEnd; index++) {
                 if (index > 0) out.append(", ");
                 TextValue child = renderValue(java.lang.reflect.Array.get(value, index),
                         depth + 1, seen);
                 out.append(child.text);
                 truncated = truncated || child.truncated;
             }
-            if (length > limit) out.append(", …");
+            if (length > edge * 2) {
+                out.append(", …");
+                for (int index = length - edge; index < length; index++) {
+                    out.append(", ");
+                    TextValue child = renderValue(java.lang.reflect.Array.get(value, index),
+                            depth + 1, seen);
+                    out.append(child.text);
+                    truncated = truncated || child.truncated;
+                }
+            }
             out.append(']');
             return new TextValue("array", out.toString(), truncated);
         } finally {
@@ -459,20 +483,50 @@ public final class TraceRuntime {
         if (depth >= VALUE_MAX_DEPTH) return new TextValue("collection", "<max-depth>", true);
         seen.put(value, Boolean.TRUE);
         try {
-            StringBuilder out = new StringBuilder("[");
+            List<Object> first = new ArrayList<Object>();
+            List<Object> tail = new ArrayList<Object>();
+            int bufferEdge = Math.max(
+                    VALUE_CONTAINER_EDGE_ITEMS, VALUE_NESTED_CONTAINER_EDGE_ITEMS);
             Iterator<?> iterator = value.iterator();
-            int index = 0;
-            boolean truncated = false;
-            while (iterator.hasNext() && index < VALUE_MAX_ITEMS) {
-                if (index > 0) out.append(", ");
-                TextValue child = renderValue(iterator.next(), depth + 1, seen);
+            int count = 0;
+            boolean containsContainer = false;
+            while (iterator.hasNext()) {
+                Object item = iterator.next();
+                containsContainer = containsContainer || isContainer(item);
+                if (first.size() < bufferEdge) first.add(item);
+                if (tail.size() == bufferEdge) tail.remove(0);
+                tail.add(item);
+                count++;
+            }
+            int edge = containerEdgeItems(containsContainer, depth);
+            boolean truncated = count > edge * 2;
+            StringBuilder out = new StringBuilder("[");
+            int emitted = 0;
+            int firstCount = truncated ? edge : Math.min(count, first.size());
+            for (int index = 0; index < firstCount; index++) {
+                if (emitted++ > 0) out.append(", ");
+                TextValue child = renderValue(first.get(index), depth + 1, seen);
                 out.append(child.text);
                 truncated = truncated || child.truncated;
-                index++;
             }
-            if (iterator.hasNext()) {
+            if (count > edge * 2) {
                 out.append(", …");
-                truncated = true;
+                Object[] tailValues = tail.toArray();
+                for (int index = tailValues.length - edge; index < tailValues.length; index++) {
+                    out.append(", ");
+                    TextValue child = renderValue(tailValues[index], depth + 1, seen);
+                    out.append(child.text);
+                    truncated = truncated || child.truncated;
+                }
+            } else {
+                Object[] tailValues = tail.toArray();
+                for (int globalIndex = firstCount; globalIndex < count; globalIndex++) {
+                    int index = globalIndex - (count - tailValues.length);
+                    if (emitted++ > 0) out.append(", ");
+                    TextValue child = renderValue(tailValues[index], depth + 1, seen);
+                    out.append(child.text);
+                    truncated = truncated || child.truncated;
+                }
             }
             out.append(']');
             return new TextValue("collection", out.toString(), truncated);
@@ -487,22 +541,57 @@ public final class TraceRuntime {
         if (depth >= VALUE_MAX_DEPTH) return new TextValue("map", "<max-depth>", true);
         seen.put(value, Boolean.TRUE);
         try {
-            StringBuilder out = new StringBuilder("{");
+            List<Map.Entry<?, ?>> first = new ArrayList<Map.Entry<?, ?>>();
+            List<Map.Entry<?, ?>> tail = new ArrayList<Map.Entry<?, ?>>();
+            int bufferEdge = Math.max(
+                    VALUE_CONTAINER_EDGE_ITEMS, VALUE_NESTED_CONTAINER_EDGE_ITEMS);
             Iterator<? extends Map.Entry<?, ?>> iterator = value.entrySet().iterator();
-            int index = 0;
-            boolean truncated = false;
-            while (iterator.hasNext() && index < VALUE_MAX_ITEMS) {
-                if (index > 0) out.append(", ");
+            int count = 0;
+            boolean containsContainer = false;
+            while (iterator.hasNext()) {
                 Map.Entry<?, ?> entry = iterator.next();
+                containsContainer = containsContainer || isContainer(entry.getKey())
+                        || isContainer(entry.getValue());
+                if (first.size() < bufferEdge) first.add(entry);
+                if (tail.size() == bufferEdge) tail.remove(0);
+                tail.add(entry);
+                count++;
+            }
+            int edge = containerEdgeItems(containsContainer, depth);
+            boolean truncated = count > edge * 2;
+            StringBuilder out = new StringBuilder("{");
+            int emitted = 0;
+            int firstCount = truncated ? edge : Math.min(count, first.size());
+            for (int index = 0; index < firstCount; index++) {
+                if (emitted++ > 0) out.append(", ");
+                Map.Entry<?, ?> entry = first.get(index);
                 TextValue key = renderValue(entry.getKey(), depth + 1, seen);
                 TextValue item = renderValue(entry.getValue(), depth + 1, seen);
                 out.append(key.text).append('=').append(item.text);
                 truncated = truncated || key.truncated || item.truncated;
-                index++;
             }
-            if (iterator.hasNext()) {
+            if (count > edge * 2) {
                 out.append(", …");
-                truncated = true;
+                Object[] tailValues = tail.toArray();
+                for (int index = tailValues.length - edge; index < tailValues.length; index++) {
+                    out.append(", ");
+                    Map.Entry<?, ?> entry = (Map.Entry<?, ?>) tailValues[index];
+                    TextValue key = renderValue(entry.getKey(), depth + 1, seen);
+                    TextValue item = renderValue(entry.getValue(), depth + 1, seen);
+                    out.append(key.text).append('=').append(item.text);
+                    truncated = truncated || key.truncated || item.truncated;
+                }
+            } else {
+                Object[] tailValues = tail.toArray();
+                for (int globalIndex = firstCount; globalIndex < count; globalIndex++) {
+                    int index = globalIndex - (count - tailValues.length);
+                    if (emitted++ > 0) out.append(", ");
+                    Map.Entry<?, ?> entry = (Map.Entry<?, ?>) tailValues[index];
+                    TextValue key = renderValue(entry.getKey(), depth + 1, seen);
+                    TextValue item = renderValue(entry.getValue(), depth + 1, seen);
+                    out.append(key.text).append('=').append(item.text);
+                    truncated = truncated || key.truncated || item.truncated;
+                }
             }
             out.append('}');
             return new TextValue("map", out.toString(), truncated);
@@ -573,12 +662,6 @@ public final class TraceRuntime {
             } else out.append(current);
         }
         return out.toString();
-    }
-
-    private static String abbreviate(String value, int limit) {
-        if (value.length() <= limit) return value;
-        if (limit <= 1) return "…".substring(0, limit);
-        return value.substring(0, limit - 1) + "…";
     }
 
     private static boolean booleanProperty(String name, boolean fallback) {

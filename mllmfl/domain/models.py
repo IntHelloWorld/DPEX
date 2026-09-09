@@ -49,15 +49,18 @@ class Call:
     callee_descriptor: str
     parent_invocation_id: int
     invocation_id: int
-    parent_chain: List[int]
     thread_id: int
     enter_seq: int
     exit_seq: int
     exit_type: str
     origin_test_line: int = 0
+    parent_chain: Optional[List[int]] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        value = asdict(self)
+        if value["parent_chain"] is None:
+            value.pop("parent_chain")
+        return value
 
 
 @dataclass(frozen=True)

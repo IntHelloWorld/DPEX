@@ -39,9 +39,74 @@ BASH_TOOL = {
     "strict": True,
 }
 
+STATIC_BASH_TOOL = {
+    **BASH_TOOL,
+    "description": (
+        "Run one complete Bash command in the buggy Defects4J project root. "
+        "Only static file-inspection commands such as rg, grep, sed, cat, and find "
+        "are allowed: do not compile, run tests, execute project code, or invoke "
+        "a language runtime. stdout and "
+        "stderr are returned as one merged text stream. Do not modify files or "
+        "inspect repository history, patches, fixed versions, or paths outside "
+        "the project."
+    ),
+}
+
+STATIC_ALLOWED_COMMANDS = {
+    "basename", "cat", "cut", "dirname", "echo", "file", "find", "grep",
+    "head", "ls", "nl", "pwd", "rg", "sed", "sort", "stat", "tail", "tr",
+    "uniq", "wc",
+}
+STATIC_COMMAND_SEPARATORS = {"&&", ";", "|", "||"}
+
+
+def _validate_static_tokens(value: str, tokens: list[str]) -> None:
+    if "$(" in value or "`" in value:
+        raise ValueError(
+            "bash-only agent permits static source inspection commands only"
+        )
+    expect_command = True
+    for index, token in enumerate(tokens):
+        if token in STATIC_COMMAND_SEPARATORS:
+            expect_command = True
+            continue
+        if token in {">", ">>"}:
+            target = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if target != "/dev/null":
+                raise ValueError(
+                    "bash-only agent permits static source inspection commands only"
+                )
+            continue
+        if token in {"&", "(", ")", "<", "<<", "<<<", "|&"}:
+            raise ValueError(
+                "bash-only agent permits static source inspection commands only"
+            )
+        if expect_command:
+            if Path(token.lower()).name not in STATIC_ALLOWED_COMMANDS:
+                raise ValueError(
+                    "bash-only agent permits static source inspection commands only"
+                )
+            expect_command = False
+    lowered_tokens = {token.lower() for token in tokens}
+    if (
+        {"-delete", "-exec", "-execdir", "-ok", "-okdir"} & lowered_tokens
+        or any(
+            token == "-i" or token.startswith("-i.")
+            for token in lowered_tokens
+        )
+        or {"--pre", "--pre-glob"} & lowered_tokens
+        or any(token.startswith("--pre=") for token in lowered_tokens)
+    ):
+        raise ValueError(
+            "bash-only agent permits static source inspection commands only"
+        )
+
 
 def validate_bash_command(
-    value: object, workspace: Path | None = None,
+    value: object,
+    workspace: Path | None = None,
+    *,
+    static_only: bool = False,
 ) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("command must be a non-empty string")
@@ -57,6 +122,8 @@ def validate_bash_command(
     except ValueError as error:
         raise ValueError(f"command has invalid shell syntax: {error}") from error
     forbidden_commands = {"git", "defects4j", "patch"}
+    if static_only:
+        _validate_static_tokens(value, tokens)
     for token in tokens:
         lowered = token.lower()
         if Path(lowered).name in forbidden_commands:
@@ -112,9 +179,13 @@ def execute_bash(
     max_output_chars_value: object,
     workspace: Path,
     timeout: int,
+    *,
+    static_only: bool = False,
 ) -> Dict[str, Any]:
     try:
-        command = validate_bash_command(command_value, workspace)
+        command = validate_bash_command(
+            command_value, workspace, static_only=static_only
+        )
         max_output_chars = validate_max_output_chars(max_output_chars_value)
     except ValueError as error:
         return {"ok": False, "error": str(error)}

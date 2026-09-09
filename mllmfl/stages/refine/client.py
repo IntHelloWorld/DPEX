@@ -17,20 +17,28 @@ REASONING_EFFORTS = {
     "none", "minimal", "low", "medium", "high", "xhigh", "max",
 }
 API_STYLES = {"responses", "chat_completions"}
-DEFAULT_INVALID_FINAL_JSON_RETRIES = 2
+DEFAULT_INVALID_FINAL_RESPONSE_RETRIES = 2
 
 
-def invalid_final_json_retries(config: Dict[str, Any]) -> int:
+def invalid_final_response_retries(config: Dict[str, Any]) -> int:
     cfg = config.get("mllm", config)
     value = int(
         cfg.get(
-            "invalid_final_json_retries",
-            DEFAULT_INVALID_FINAL_JSON_RETRIES,
+            "invalid_final_response_retries",
+            cfg.get(
+                "invalid_final_json_retries",
+                DEFAULT_INVALID_FINAL_RESPONSE_RETRIES,
+            ),
         )
     )
     if value < 0:
-        raise ValueError("invalid_final_json_retries must be non-negative")
+        raise ValueError("invalid_final_response_retries must be non-negative")
     return value
+
+
+def invalid_final_json_retries(config: Dict[str, Any]) -> int:
+    """Backward-compatible alias for the former JSON response setting."""
+    return invalid_final_response_retries(config)
 
 
 def _response_message(data: Dict[str, Any]) -> Dict[str, Any]:

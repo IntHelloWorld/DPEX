@@ -35,3 +35,5 @@ fullchain_tracer/target/
 # Others
 reproduce/
 benchmark/
+paper/
+.vscode/

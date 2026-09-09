@@ -11,10 +11,13 @@ from mllmfl.domain.schemas import (
 )
 from mllmfl.infrastructure.io import read_json, write_csv, write_json, write_text
 from mllmfl.infrastructure.layout import RunLayout
+from mllmfl.infrastructure.checkouts import temporary_checkout
 from .agent import finalization_limits, run_agent
-from .client import invalid_final_json_retries
+from .client import invalid_final_response_retries
 from .context import (
+    AGENT_VARIANT_BASH_ONLY,
     build_prompt,
+    refinement_agent_variant,
     runtime_method_ids,
     selected_trace_tests,
 )
@@ -55,204 +58,209 @@ def _refine_bug(
     error_log = layout.stage_log_dir("refine", project, bug) / "error.log"
     error_log.unlink(missing_ok=True)
     try:
-        workspace = layout.workspace_dir(project, bug)
-        localization_input = load_localization_input(
-            locator_results, project, bug, workspace
-        )
-        suite = validate_trace_suite(
-            read_json(bug_dir / "trace_suite.json")
-        )
-        candidates = list(localization_input["ranking"])
-        cfg = config.get("mllm", config)
-        selected_top_k = (
-            requested_top_k if requested_top_k is not None else int(
-                cfg.get("top_k", 5)
+        with temporary_checkout(layout, project, bug, timeout) as workspace:
+            localization_input = load_localization_input(
+                locator_results, project, bug, workspace
             )
-        )
-        if selected_top_k <= 0:
-            raise ValueError("top_k must be positive")
-        fingerprint_input = {
-            key: value for key, value in localization_input.items()
-            if key != "source_path"
-        }
-        input_fingerprint = hashlib.sha256(json.dumps(
-            fingerprint_input, ensure_ascii=False, sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
-        configuration_fingerprint = hashlib.sha256(json.dumps(
-            {
-                "config": config,
-                "refinement_viewport": {
-                    "max_upstream_calls": max_upstream_calls,
-                    "max_downstream_calls": max_downstream_calls,
-                    "max_internal_calls": max_internal_calls,
-                },
-            },
-            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        ).encode("utf-8")).hexdigest()
-        suite_fingerprint = str(suite["method_catalog_fingerprint"])
-        if result_path.is_file() and not force:
-            existing = validate_refinement(read_json(result_path))
-            if (
-                existing["project"] != project
-                or existing["bug"] != bug
-                or existing["input_fingerprint"] != input_fingerprint
-                or existing["configuration_fingerprint"]
-                != configuration_fingerprint
-                or existing["suite_fingerprint"] != suite_fingerprint
-                or existing["top_k"] != selected_top_k
-            ):
-                raise ValueError(
-                    "existing refinement does not match input, config, trace suite, or "
-                    "top_k; rerun with --force"
+            suite = validate_trace_suite(
+                read_json(bug_dir / "trace_suite.json")
+            )
+            candidates = list(localization_input["ranking"])
+            cfg = config.get("mllm", config)
+            selected_top_k = (
+                requested_top_k if requested_top_k is not None else int(
+                    cfg.get("top_k", 5)
                 )
-            return {
-                "project": project, "bug": bug, "status": "SKIPPED", "top1": "",
+            )
+            if selected_top_k <= 0:
+                raise ValueError("top_k must be positive")
+            fingerprint_input = {
+                key: value for key, value in localization_input.items()
+                if key != "source_path"
             }
-        invalid_final_json_retries(config)
-        finalization_limits(config)
-        selected_tests = selected_trace_tests(localization_input, suite)
-        selected_test_ids = [str(item["test_id"]) for item in selected_tests]
-        graphs = MethodExecutionGraphs(
-            bug_dir,
-            config,
-            timeout,
-            max_upstream_calls=max_upstream_calls,
-            max_downstream_calls=max_downstream_calls,
-            max_internal_calls=max_internal_calls,
-            workspace=workspace,
-            allowed_test_ids=selected_test_ids,
-            retain_debug_artifacts=retain_debug_artifacts,
-        )
-        failures = graphs.failure_evidence(selected_test_ids)
-        prompt = build_prompt(
-            project,
-            bug,
-            localization_input["locator"],
-            candidates,
-            failures,
-            workspace,
-        )
-        method_ids = runtime_method_ids(candidates, graphs.catalog, workspace)
-        available_method_ids = graphs.available_method_ids()
-        method_ids = {
-            candidate_id: method_id
-            for candidate_id, method_id in method_ids.items()
-            if method_id in available_method_ids
-        }
-        if dry_run:
+            input_fingerprint = hashlib.sha256(json.dumps(
+                fingerprint_input, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            configuration_fingerprint = hashlib.sha256(json.dumps(
+                {
+                    "config": config,
+                    "refinement_viewport": {
+                        "max_upstream_calls": max_upstream_calls,
+                        "max_downstream_calls": max_downstream_calls,
+                        "max_internal_calls": max_internal_calls,
+                    },
+                },
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")).hexdigest()
+            suite_fingerprint = str(suite["method_catalog_fingerprint"])
+            if result_path.is_file() and not force:
+                existing = validate_refinement(read_json(result_path))
+                if (
+                    existing["project"] != project
+                    or existing["bug"] != bug
+                    or existing["input_fingerprint"] != input_fingerprint
+                    or existing["configuration_fingerprint"]
+                    != configuration_fingerprint
+                    or existing["suite_fingerprint"] != suite_fingerprint
+                    or existing["top_k"] != selected_top_k
+                ):
+                    raise ValueError(
+                        "existing refinement does not match input, config, trace suite, or "
+                        "top_k; rerun with --force"
+                    )
+                return {
+                    "project": project, "bug": bug, "status": "SKIPPED", "top1": "",
+                }
+            invalid_final_response_retries(config)
+            finalization_limits(config)
+            agent_variant = refinement_agent_variant(config)
+            selected_tests = selected_trace_tests(localization_input, suite)
+            selected_test_ids = [str(item["test_id"]) for item in selected_tests]
+            graphs = MethodExecutionGraphs(
+                bug_dir,
+                config,
+                timeout,
+                max_upstream_calls=max_upstream_calls,
+                max_downstream_calls=max_downstream_calls,
+                max_internal_calls=max_internal_calls,
+                workspace=workspace,
+                allowed_test_ids=selected_test_ids,
+                retain_debug_artifacts=retain_debug_artifacts,
+            )
+            failures = graphs.failure_evidence(selected_test_ids)
+            prompt = build_prompt(
+                project,
+                bug,
+                localization_input["locator"],
+                candidates,
+                failures,
+                workspace,
+            )
+            method_ids = runtime_method_ids(candidates, graphs.catalog, workspace)
+            available_method_ids = graphs.available_method_ids()
+            method_ids = {
+                candidate_id: method_id
+                for candidate_id, method_id in method_ids.items()
+                if method_id in available_method_ids
+            }
+            if agent_variant == AGENT_VARIANT_BASH_ONLY:
+                method_ids = {}
+            if dry_run:
+                return {
+                    "project": project,
+                    "bug": bug,
+                    "status": "DRY_RUN",
+                    "top1": "",
+                }
+            inspection_dir = bug_dir / "inspection_graphs"
+            if inspection_dir.is_dir():
+                shutil.rmtree(inspection_dir)
+            conversation_path = bug_dir / "refine_conversation.jsonl"
+            conversation_path.unlink(missing_ok=True)
+            (bug_dir / "refine_response_usage.jsonl").unlink(missing_ok=True)
+            (bug_dir / "refine_render_errors.jsonl").unlink(missing_ok=True)
+            agent_result = run_agent(
+                config,
+                prompt,
+                candidates,
+                method_ids,
+                graphs,
+                workspace,
+                timeout,
+                conversation_path,
+                selected_top_k,
+            )
+            candidate_by_id = {str(item["candidate_id"]): item for item in candidates}
+            ranking = []
+            new_index = 0
+            for index, decision in enumerate(agent_result["ranking"], 1):
+                input_candidate_id = decision["input_candidate_id"]
+                if input_candidate_id is not None:
+                    source = candidate_by_id[input_candidate_id]
+                    item = dict(source)
+                    candidate_id = input_candidate_id
+                    original_rank = int(source["rank"])
+                else:
+                    new_index += 1
+                    candidate_id = f"N{new_index:03d}"
+                    original_rank = None
+                    item = {
+                        "function": decision["function"],
+                        "signature": decision["signature"],
+                        "source_file": decision["source_file"],
+                        "start_line": decision["start_line"],
+                        "end_line": decision["end_line"],
+                    }
+                item.update({
+                    "candidate_id": candidate_id,
+                    "rank": index,
+                    "original_rank": original_rank,
+                    "reason": decision["reason"],
+                })
+                ranking.append(item)
+            retained_ids = {
+                item["candidate_id"] for item in ranking
+                if item["candidate_id"].startswith("L")
+            }
+            rejected = [
+                item["candidate_id"] for item in candidates
+                if item["candidate_id"] not in retained_ids
+            ]
+            inspected_method_ids = set(agent_result["inspected_method_ids"])
+            inspected_candidate_ids = [
+                candidate_id
+                for candidate_id, method_id in method_ids.items()
+                if method_id in inspected_method_ids
+            ]
+            output = {
+                "schema": "fault-localization-refinement",
+                "schema_version": 7,
+                "project": project,
+                "bug": bug,
+                "status": "OK",
+                "model": agent_result["model"],
+                "agent_variant": agent_result["agent_variant"],
+                "prompt_version": agent_result["prompt_version"],
+                "locator": dict(localization_input["locator"]),
+                "top_k": selected_top_k,
+                "input_fingerprint": input_fingerprint,
+                "configuration_fingerprint": configuration_fingerprint,
+                "suite_fingerprint": suite_fingerprint,
+                "test_count": len(selected_tests),
+                "tests": [
+                    {"test_id": item["test_id"], "test": item["test"]}
+                    for item in selected_tests
+                ],
+                "input_ranking": candidates,
+                "ranking": ranking,
+                "rejected_candidate_ids": rejected,
+                "candidate_runtime_method_ids": method_ids,
+                "inspected_candidate_ids": inspected_candidate_ids,
+                "tool_rounds": agent_result["tool_rounds"],
+                "diagram_view_count": agent_result["diagram_view_count"],
+                "viewed_diagrams": agent_result["viewed_diagrams"],
+                "inspected_invocation_ids": agent_result["inspected_invocation_ids"],
+                "queried_methods": agent_result["queried_methods"],
+                "terminal_command_count": agent_result["terminal_command_count"],
+                "request_count": agent_result["request_count"],
+                "usage": agent_result["usage"],
+                "finalization_attempt_count": agent_result[
+                    "finalization_attempt_count"
+                ],
+                "final_length_retry_count": agent_result[
+                    "final_length_retry_count"
+                ],
+                "final_finish_reason": agent_result["final_finish_reason"],
+            }
+            validate_refinement(output)
+            write_json(result_path, output)
             return {
                 "project": project,
                 "bug": bug,
-                "status": "DRY_RUN",
-                "top1": "",
+                "status": "OK",
+                "top1": ranking[0]["function"],
             }
-        inspection_dir = bug_dir / "inspection_graphs"
-        if inspection_dir.is_dir():
-            shutil.rmtree(inspection_dir)
-        conversation_path = bug_dir / "refine_conversation.jsonl"
-        conversation_path.unlink(missing_ok=True)
-        (bug_dir / "refine_response_usage.jsonl").unlink(missing_ok=True)
-        (bug_dir / "refine_render_errors.jsonl").unlink(missing_ok=True)
-        agent_result = run_agent(
-            config,
-            prompt,
-            candidates,
-            method_ids,
-            graphs,
-            workspace,
-            timeout,
-            conversation_path,
-            selected_top_k,
-        )
-        candidate_by_id = {str(item["candidate_id"]): item for item in candidates}
-        ranking = []
-        new_index = 0
-        for index, decision in enumerate(agent_result["ranking"], 1):
-            input_candidate_id = decision["input_candidate_id"]
-            if input_candidate_id is not None:
-                source = candidate_by_id[input_candidate_id]
-                item = dict(source)
-                candidate_id = input_candidate_id
-                original_rank = int(source["rank"])
-            else:
-                new_index += 1
-                candidate_id = f"N{new_index:03d}"
-                original_rank = None
-                item = {
-                    "function": decision["function"],
-                    "signature": decision["signature"],
-                    "source_file": decision["source_file"],
-                    "start_line": decision["start_line"],
-                    "end_line": decision["end_line"],
-                }
-            item.update({
-                "candidate_id": candidate_id,
-                "rank": index,
-                "original_rank": original_rank,
-                "reason": decision["reason"],
-            })
-            ranking.append(item)
-        retained_ids = {
-            item["candidate_id"] for item in ranking
-            if item["candidate_id"].startswith("L")
-        }
-        rejected = [
-            item["candidate_id"] for item in candidates
-            if item["candidate_id"] not in retained_ids
-        ]
-        inspected_method_ids = set(agent_result["inspected_method_ids"])
-        inspected_candidate_ids = [
-            candidate_id
-            for candidate_id, method_id in method_ids.items()
-            if method_id in inspected_method_ids
-        ]
-        output = {
-            "schema": "fault-localization-refinement",
-            "schema_version": 6,
-            "project": project,
-            "bug": bug,
-            "status": "OK",
-            "model": agent_result["model"],
-            "locator": dict(localization_input["locator"]),
-            "top_k": selected_top_k,
-            "input_fingerprint": input_fingerprint,
-            "configuration_fingerprint": configuration_fingerprint,
-            "suite_fingerprint": suite_fingerprint,
-            "test_count": len(selected_tests),
-            "tests": [
-                {"test_id": item["test_id"], "test": item["test"]}
-                for item in selected_tests
-            ],
-            "input_ranking": candidates,
-            "ranking": ranking,
-            "rejected_candidate_ids": rejected,
-            "candidate_runtime_method_ids": method_ids,
-            "inspected_candidate_ids": inspected_candidate_ids,
-            "tool_rounds": agent_result["tool_rounds"],
-            "diagram_view_count": agent_result["diagram_view_count"],
-            "viewed_diagrams": agent_result["viewed_diagrams"],
-            "inspected_invocation_ids": agent_result["inspected_invocation_ids"],
-            "queried_methods": agent_result["queried_methods"],
-            "terminal_command_count": agent_result["terminal_command_count"],
-            "request_count": agent_result["request_count"],
-            "usage": agent_result["usage"],
-            "finalization_attempt_count": agent_result[
-                "finalization_attempt_count"
-            ],
-            "final_length_retry_count": agent_result[
-                "final_length_retry_count"
-            ],
-            "final_finish_reason": agent_result["final_finish_reason"],
-        }
-        validate_refinement(output)
-        write_json(result_path, output)
-        return {
-            "project": project,
-            "bug": bug,
-            "status": "OK",
-            "top1": ranking[0]["function"],
-        }
     except Exception as error:
         write_text(error_log, str(error) + "\n")
         return {

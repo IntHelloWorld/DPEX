@@ -172,11 +172,17 @@ def fold_successful_assertions(
     retained_invocation_ids = {
         int(call["invocation_id"]) for call in retained_calls
     }
-    for call in retained_calls:
-        retained_invocation_ids.add(int(call["parent_invocation_id"]))
-        retained_invocation_ids.update(
-            int(value) for value in call.get("parent_chain") or []
-        )
+    parents = {
+        int(item["invocation_id"]): int(item.get("parent_id") or 0)
+        for item in execution["invocations"]
+    }
+    # Compute the ancestor closure once, without materializing a chain per call.
+    pending = list(retained_invocation_ids)
+    while pending:
+        parent = parents.get(pending.pop(), 0)
+        if parent and parent not in retained_invocation_ids:
+            retained_invocation_ids.add(parent)
+            pending.append(parent)
     retained_invocations = [
         dict(invocation) for invocation in execution["invocations"]
         if int(invocation["invocation_id"]) in retained_invocation_ids

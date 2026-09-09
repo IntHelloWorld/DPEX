@@ -67,7 +67,23 @@ public class ValueWorkload {
         return a + b + c + d + e + f + g + h + i;
     }
 
+    static int boundedValues(String text, int[] array, List<Integer> list,
+                             Map<Integer, Integer> map, Object[] nested) {
+        return text.length() + array.length + list.size() + map.size()
+                + nested.length;
+    }
+
+    static int argumentBudget(String a, String b, String c, String d,
+                              String e, String f) {
+        return a.length() + b.length() + c.length() + d.length()
+                + e.length() + f.length();
+    }
+
     static void noop() {
+    }
+
+    static Void boxedVoid() {
+        return null;
     }
 
     static int explode() {
@@ -93,7 +109,28 @@ public class ValueWorkload {
         result += mutate(mutable);
         result += repeat(1) + repeat(1) + repeat(2);
         result += many(1, 2, 3, 4, 5, 6, 7, 8, 9);
+        String longText = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+                + "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        int[] longArray = new int[] {0, 1, 2, 3, 4, 5, 6, 7, 8, 9};
+        List<Integer> longList = new ArrayList<Integer>();
+        Map<Integer, Integer> longMap = new LinkedHashMap<Integer, Integer>();
+        for (int index = 0; index < 10; index++) {
+            longList.add(Integer.valueOf(index));
+            longMap.put(Integer.valueOf(index), Integer.valueOf(index + 10));
+        }
+        Object[] nested = new Object[] {
+            new int[] {0, 1, 2, 3, 4},
+            new int[] {5, 6, 7, 8, 9},
+            new int[] {10, 11, 12, 13, 14}
+        };
+        result += boundedValues(longText, longArray, longList, longMap, nested);
+        String budgetValue = longText.substring(0, 110);
+        result += argumentBudget(
+                budgetValue, budgetValue, budgetValue,
+                budgetValue, budgetValue, budgetValue);
         noop();
+        boxedVoid();
         try {
             explode();
         } catch (IllegalArgumentException expected) {

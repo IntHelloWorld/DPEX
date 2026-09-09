@@ -1,6 +1,26 @@
-import json
 from pathlib import PurePosixPath
 from typing import Any, Dict
+
+
+METHOD_RECORD_PREFIX = "METHOD"
+
+
+def format_method_record(name: str, line: str, reason: str) -> str:
+    fields = {"method name": name, "method line": line}
+    for label, value in fields.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be non-empty text")
+        if (
+            value != value.strip()
+            or "\n" in value
+            or "\r" in value
+            or "|" in value
+        ):
+            raise ValueError(f"{label} is not safe for METHOD line format")
+    if not isinstance(reason, str):
+        raise ValueError("method reason must be text")
+    normalized_reason = " ".join(reason.split()) or "(no locator reason provided)"
+    return f"{METHOD_RECORD_PREFIX}|{name}|{line}|{normalized_reason}"
 
 
 def parse_method_line(value: str) -> tuple[str, int]:
@@ -22,20 +42,40 @@ def parse_method_line(value: str) -> tuple[str, int]:
 
 
 def parse_model_response(text: str) -> list[Any] | None:
-    try:
-        value = json.loads(text.strip())
-    except json.JSONDecodeError:
+    """Extract well-formed METHOD records that begin at a physical line boundary.
+
+    Non-record output and blank lines are ignored. A record line remains atomic:
+    embedding a second METHOD record on that same physical line is invalid.
+    """
+    if not isinstance(text, str):
         return None
-    return value if isinstance(value, list) else None
+    result = []
+    record_prefix = f"{METHOD_RECORD_PREFIX}|"
+    for raw_line in text.splitlines():
+        if not raw_line.startswith(record_prefix):
+            continue
+        if raw_line.count(record_prefix) != 1:
+            return None
+        parts = raw_line.split("|", 3)
+        if len(parts) != 4 or parts[0] != METHOD_RECORD_PREFIX:
+            return None
+        name, line, reason = parts[1:]
+        result.append({
+            "method": {"name": name, "line": line},
+            "reason": reason,
+        })
+    return result or None
 
 
 def validate_model_refinement(
     value: list[Any], top_k: int
 ) -> list[Dict[str, Any]]:
     if not isinstance(value, list):
-        raise ValueError("final JSON must be an array")
+        raise ValueError("final ranking must be a list of METHOD lines")
     if not 1 <= len(value) <= top_k:
-        raise ValueError(f"final array must contain between 1 and {top_k} entries")
+        raise ValueError(
+            f"final ranking must contain between 1 and {top_k} METHOD lines"
+        )
     result = []
     seen = set()
     for index, item in enumerate(value):

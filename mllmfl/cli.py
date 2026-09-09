@@ -82,37 +82,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="stage", required=True)
 
-    collect_parser = subparsers.add_parser(
-        "collect", help="checkout, compile, and collect failing tests"
-    )
-    _common(collect_parser, include_trigger=False)
-    collect_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
-    collect_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
     trace_parser = subparsers.add_parser(
-        "trace", help="record normalized Fullchain v4 refinement traces"
+        "collect", aliases=["trace"], help="checkout, collect failures and traces in one test execution, then remove checkout"
     )
-    _common(trace_parser)
+    _common(trace_parser, include_trigger=False)
     trace_parser.add_argument("--d4j-home", default=os.environ.get("D4J_HOME"))
     trace_parser.add_argument("--java-home", default=os.environ.get("JAVA_HOME"))
     trace_parser.add_argument(
         "--agent-jar",
         default=str(PROJECT_ROOT / "lib" / "fullchain-tracer.jar"),
     )
-    capture_group = trace_parser.add_mutually_exclusive_group()
-    capture_group.add_argument(
-        "--capture-values", dest="capture_values", action="store_true",
-        help="capture bounded entry arguments and normal return values (default)",
-    )
-    capture_group.add_argument(
-        "--no-capture-values", dest="capture_values", action="store_false",
-        help="disable argument and return-value capture",
-    )
-    trace_parser.set_defaults(capture_values=True)
-    trace_parser.add_argument("--value-max-chars", type=_positive_int, default=120)
-    trace_parser.add_argument("--value-max-items", type=_positive_int, default=8)
-    trace_parser.add_argument("--value-max-depth", type=int, default=2)
     trace_parser.add_argument(
-        "--value-max-arguments-chars", type=_positive_int, default=480
+        "--config",
+        required=True,
+        help="JSON configuration containing the trace value-capture policy",
     )
     trace_parser.add_argument(
         "--retain-debug-artifacts",
@@ -181,8 +164,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
-    if args.stage == "trace" and args.value_max_depth < 0:
-        parser.error("--value-max-depth must be non-negative")
     try:
         bugs = _bugs(args.bugs)
     except ValueError as error:
@@ -191,33 +172,15 @@ def main(argv: Sequence[str] | None = None) -> None:
     layout.ensure()
     projects = _projects(args.projects)
 
-    if args.stage == "collect":
+    if args.stage in {"collect", "trace"}:
         rows = collect.run(
-            layout,
-            projects,
-            bugs,
+            layout, projects, bugs,
             Path(args.d4j_home).expanduser() if args.d4j_home else None,
             Path(args.java_home).expanduser() if args.java_home else None,
-            args.timeout,
-            args.force,
-        )
-    elif args.stage == "trace":
-        rows = trace.run(
-            layout,
-            projects,
-            bugs,
-            args.trigger,
-            Path(args.agent_jar).expanduser().resolve(),
-            Path(args.d4j_home).expanduser() if args.d4j_home else None,
-            Path(args.java_home).expanduser() if args.java_home else None,
-            args.timeout,
-            args.force,
-            args.capture_values,
-            args.value_max_chars,
-            args.value_max_items,
-            args.value_max_depth,
-            args.value_max_arguments_chars,
-            args.retain_debug_artifacts,
+            args.timeout, args.force,
+            agent_jar=Path(args.agent_jar).expanduser().resolve(),
+            config_path=Path(args.config).expanduser().resolve(),
+            retain_debug_artifacts=args.retain_debug_artifacts,
         )
     elif args.stage == "refine":
         rows = refine.run(

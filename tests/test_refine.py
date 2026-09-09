@@ -21,8 +21,11 @@ from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.stages.refine.agent import run_agent
 from mllmfl.stages.refine.adapters import _autofl_diagnosis
 from mllmfl.stages.refine.context import (
+    AGENT_VARIANT_BASH_ONLY,
+    BASH_ONLY_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_prompt,
+    build_system_prompt,
     selected_trace_tests,
 )
 from mllmfl.stages.refine.input import load_localization_input
@@ -31,7 +34,11 @@ from mllmfl.stages.refine.graphs import (
     FIND_METHOD_INVOCATION_ID_TOOL,
     MethodExecutionGraphs,
 )
-from mllmfl.stages.refine.parsing import validate_model_refinement
+from mllmfl.stages.refine.parsing import (
+    format_method_record,
+    parse_model_response,
+    validate_model_refinement,
+)
 from mllmfl.stages.refine.shell import (
     BASH_TOOL,
     execute_bash,
@@ -320,7 +327,7 @@ class RefinementSchemaTests(unittest.TestCase):
 
     def test_system_prompt_briefly_describes_graph_tools_and_elements(self):
         paragraphs = SYSTEM_PROMPT.split("\n\n")
-        self.assertEqual(len(paragraphs), 6)
+        self.assertEqual(len(paragraphs), 8)
         self.assertIn("find_method_invocation_id", paragraphs[2])
         self.assertIn("inspect_execution_graph", paragraphs[2])
         self.assertIn("tests excluded by the upstream locator", paragraphs[2])
@@ -442,6 +449,33 @@ class RefinementSchemaTests(unittest.TestCase):
             "final_finish_reason": "stop",
         })
         self.assertIs(validate_refinement(refined_v6), refined_v6)
+        refined_v7 = {
+            **refined_v6,
+            "schema_version": 7,
+            "agent_variant": "dynamic-graph",
+            "prompt_version": "refinement-method-lines-v1",
+        }
+        self.assertIs(validate_refinement(refined_v7), refined_v7)
+        bash_only_v7 = {
+            **refined_v7,
+            "agent_variant": "bash-only",
+            "prompt_version": "refinement-method-lines-bash-only-v2",
+            "tool_rounds": 1,
+            "diagram_view_count": 0,
+            "terminal_command_count": 1,
+            "viewed_diagrams": [],
+            "inspected_candidate_ids": [],
+            "candidate_runtime_method_ids": {},
+            "inspected_invocation_ids": [],
+            "queried_methods": [],
+        }
+        self.assertIs(validate_refinement(bash_only_v7), bash_only_v7)
+        with self.assertRaisesRegex(ValueError, "dynamic inspection evidence"):
+            validate_refinement({
+                **bash_only_v7,
+                "diagram_view_count": 1,
+                "viewed_diagrams": ["T1-M1-C1-D1"],
+            })
         with self.assertRaisesRegex(ValueError, "aggregate usage audit"):
             validate_refinement({
                 **refined_v6,
@@ -562,6 +596,69 @@ class RefinementSchemaTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "method line"):
             validate_model_refinement(value, 2)
 
+    def test_model_output_extracts_physical_method_lines(self):
+        text = (
+            "METHOD|run|src/p/Service.java:3|source and trace agree\n"
+            "METHOD|helper|src/p/Service.java:8|value A | value B"
+        )
+        self.assertEqual(parse_model_response(text), [{
+            "method": {"name": "run", "line": "src/p/Service.java:3"},
+            "reason": "source and trace agree",
+        }, {
+            "method": {"name": "helper", "line": "src/p/Service.java:8"},
+            "reason": "value A | value B",
+        }])
+        expected = [{
+            "method": {"name": "run", "line": "src/p/Service.java:3"},
+            "reason": "reason",
+        }, {
+            "method": {"name": "helper", "line": "src/p/Service.java:8"},
+            "reason": "reason",
+        }]
+        self.assertEqual(parse_model_response(
+            "Here is the ranking:\n\n"
+            "METHOD|run|src/p/Service.java:3|reason\n\n\n"
+            "Some additional explanation.\n"
+            "METHOD|helper|src/p/Service.java:8|reason\nDone."
+        ), expected)
+        self.assertEqual(parse_model_response(
+            "```\nMETHOD|run|src/p/Service.java:3|reason\n```\n\n\n"
+            "METHOD|helper|src/p/Service.java:8|reason"
+        ), expected)
+        self.assertEqual(parse_model_response(
+            "  METHOD|ignored|src/p/Service.java:12|not at line start\n"
+            "METHOD|run|src/p/Service.java:3|reason"
+        ), expected[:1])
+        self.assertIsNone(parse_model_response(
+            "METHOD|run|src/p/Service.java:3|reason "
+            "METHOD|helper|src/p/Service.java:8|reason"
+        ))
+        self.assertIsNone(parse_model_response(
+            "METHOD|run|src/p/Service.java:3"
+        ))
+        self.assertIsNone(parse_model_response("explanation only"))
+        self.assertIsNone(parse_model_response(""))
+        with self.assertRaisesRegex(ValueError, "between 1 and 1 METHOD lines"):
+            validate_model_refinement([], 1)
+
+    def test_method_record_formatter_flattens_locator_reason(self):
+        self.assertEqual(
+            format_method_record(
+                "run", "src/p/Service.java:3", "first line\nsecond | detail"
+            ),
+            "METHOD|run|src/p/Service.java:3|first line second | detail",
+        )
+
+    def test_bash_only_prompt_is_the_minimal_static_variant(self):
+        prompt = build_system_prompt(5, AGENT_VARIANT_BASH_ONLY)
+        self.assertEqual(prompt, BASH_ONLY_SYSTEM_PROMPT.replace("__TOP_K__", "5"))
+        self.assertIn("Use bash only to inspect buggy-project source", prompt)
+        self.assertIn("rg, grep, sed, cat, and find", prompt)
+        self.assertIn("Do not compile, run tests, execute project code", prompt)
+        self.assertNotIn("find_method_invocation_id", prompt)
+        self.assertNotIn("inspect_execution_graph", prompt)
+        self.assertNotIn("dynamic execution graph", prompt)
+
     def test_locator_ranking_uses_agent_source_method_format(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -584,15 +681,12 @@ class RefinementSchemaTests(unittest.TestCase):
                 [],
                 workspace,
             )
-        locator_json = prompt.split("[Locator Ranking]\n", 1)[1]
-        self.assertEqual(json.loads(locator_json), [{
-            "method": {
-                "name": "run",
-                "line": "src/p/Service.java:4",
-            },
-            "reason": "upstream",
-        }])
-        self.assertNotIn("p.Service.run()", locator_json)
+        locator_lines = prompt.split("[Locator Ranking]\n", 1)[1]
+        self.assertEqual(
+            locator_lines,
+            "METHOD|run|src/p/Service.java:4|upstream",
+        )
+        self.assertNotIn("p.Service.run()", locator_lines)
 
     def test_adapts_autofl_prediction_without_using_grading_labels(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -775,6 +869,30 @@ class BashToolTests(unittest.TestCase):
         self.assertIn("inside the buggy-project workspace", outside["error"])
         self.assertFalse(parent["ok"])
         self.assertIn("inside the buggy-project workspace", parent["error"])
+
+    def test_bash_only_rejects_dynamic_execution_commands(self):
+        for command in (
+            "jshell --class-path target/classes",
+            "mvn test",
+            "./gradlew test",
+            "python3 inspect.py",
+            "bash script.sh",
+            "for file in src/*.java; do cat $file; done",
+            "cat src/Service.java > copy.java",
+            "find src -name '*.java' -exec cat {} ';'",
+        ):
+            with self.subTest(command=command):
+                with self.assertRaisesRegex(ValueError, "static source inspection"):
+                    validate_bash_command(command, static_only=True)
+        self.assertEqual(
+            validate_bash_command(
+                "find . -name '*.java' | head; "
+                "rg -n 'value' src && sed -n '1,80p' src/Service.java",
+                static_only=True,
+            ),
+            "find . -name '*.java' | head; "
+            "rg -n 'value' src && sed -n '1,80p' src/Service.java",
+        )
 
     def test_timeout_returns_merged_timeout_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -972,7 +1090,7 @@ class GraphToolContractTests(unittest.TestCase):
                 bug_dir / "traces/T1.refinement-trace.json.zst"
             )
         self.assertIs(validate_refinement_trace(value), value)
-        self.assertEqual(value["schema_version"], 1)
+        self.assertEqual(value["schema_version"], 2)
         for obsolete in (
             "execution", "default_execution", "parent_chain",
             "thread_name", "duration_ns",
@@ -1227,6 +1345,8 @@ class RefinementArtifactRetentionTests(unittest.TestCase):
                         "reason": "runtime evidence",
                     }],
                     "model": "test-model",
+                    "agent_variant": "dynamic-graph",
+                    "prompt_version": "refinement-method-lines-v1",
                     "inspected_method_ids": ["M1"],
                     "tool_rounds": 1,
                     "diagram_view_count": 1,
@@ -1259,6 +1379,71 @@ class RefinementArtifactRetentionTests(unittest.TestCase):
 
 class RefinementAgentTests(unittest.TestCase):
     @patch("mllmfl.stages.refine.agent._post_response")
+    def test_bash_only_agent_exposes_only_bash_and_has_no_graph_audit(self, post):
+        bash_call = {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+                "name": "bash",
+                "arguments": (
+                    '{"command":"sed -n \'1,20p\' src/p/Service.java",'
+                    '"max_output_chars":2000}'
+                ),
+            },
+        }
+        final = (
+            "The source inspection found one suspicious method.\n\n\n"
+            "METHOD|run|src/p/Service.java:3|source condition is incorrect\n\n"
+            "End of analysis."
+        )
+        post.side_effect = [
+            (
+                {"role": "assistant", "content": None, "tool_calls": [bash_call]},
+                "vision", "resp-1", [{
+                    "role": "assistant", "content": None,
+                    "tool_calls": [bash_call],
+                }], {}, "tool_calls",
+            ),
+            (
+                {"role": "assistant", "content": final},
+                "vision", "resp-2", [{
+                    "role": "assistant", "content": final,
+                }], {}, "stop",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n  void run() {}\n}\n",
+                encoding="utf-8",
+            )
+            result = run_agent(
+                {"mllm": {
+                    "agent_variant": "bash-only",
+                    "invalid_final_response_retries": 0,
+                }},
+                "prompt",
+                [{**candidate(), "end_line": 3}],
+                {},
+                None,
+                root,
+                30,
+                root / "refine_conversation.jsonl",
+                1,
+            )
+        self.assertEqual(
+            [tool["name"] for tool in post.call_args_list[0].kwargs["tools"]],
+            ["bash"],
+        )
+        self.assertEqual(result["agent_variant"], "bash-only")
+        self.assertEqual(result["terminal_command_count"], 1)
+        self.assertEqual(result["diagram_view_count"], 0)
+        self.assertEqual(result["viewed_diagrams"], [])
+        self.assertEqual(result["inspected_method_ids"], [])
+
+    @patch("mllmfl.stages.refine.agent._post_response")
     def test_empty_length_final_retries_same_request_with_larger_limit(self, post):
         inspect_call = {
             "id": "call-1",
@@ -1268,10 +1453,10 @@ class RefinementAgentTests(unittest.TestCase):
                 "arguments": '{"invocation_id":"T1-C1"}',
             },
         }
-        final = json.dumps([{
-            "method": {"name": "run", "line": "src/p/Service.java:3"},
-            "reason": "runtime and source evidence agree",
-        }])
+        final = (
+            "METHOD|run|src/p/Service.java:3|"
+            "runtime and source evidence agree"
+        )
         post.side_effect = [
             (
                 {"role": "assistant", "content": None,
@@ -1313,7 +1498,7 @@ class RefinementAgentTests(unittest.TestCase):
             )
             result = run_agent(
                 {"mllm": {
-                    "invalid_final_json_retries": 0,
+                    "invalid_final_response_retries": 0,
                     "max_tokens": 16384,
                     "final_length_retry_max_tokens": 32768,
                 }},
@@ -1392,7 +1577,7 @@ class RefinementAgentTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "response content is empty"):
                 run_agent(
                     {"mllm": {
-                        "invalid_final_json_retries": 0,
+                        "invalid_final_response_retries": 0,
                         "max_tokens": 16384,
                         "final_length_retry_max_tokens": 32768,
                     }},
@@ -1459,13 +1644,10 @@ class RefinementAgentTests(unittest.TestCase):
                 }], {}, "tool_calls",
             ),
             (
-                {"role": "assistant", "content": json.dumps([{
-                        "method": {
-                            "name": "run",
-                            "line": "src/p/Service.java:3",
-                        },
-                        "reason": "the selected method returns the bad state",
-                    }])},
+                {"role": "assistant", "content": (
+                    "METHOD|run|src/p/Service.java:3|"
+                    "the selected method returns the bad state"
+                )},
                 "vision", "resp-3", [{
                     "type": "message",
                     "role": "assistant",
@@ -1486,7 +1668,7 @@ class RefinementAgentTests(unittest.TestCase):
             graphs = _FakeGraphs(image)
             input_candidate = {**candidate(), "end_line": 3}
             result = run_agent(
-                {"mllm": {"invalid_final_json_retries": 0}},
+                {"mllm": {"invalid_final_response_retries": 0}},
                 "prompt",
                 [input_candidate],
                 {"L001": "M1"},
@@ -1529,6 +1711,75 @@ class RefinementAgentTests(unittest.TestCase):
         third_input = post.call_args_list[2].args[1]
         self.assertEqual(third_input[-1]["content"][0]["type"], "image_url")
         self.assertNotIn("data:image", conversation)
+
+    @patch("mllmfl.stages.refine.agent._post_response")
+    def test_agent_accepts_retained_candidate_without_inspecting_its_graph(
+        self, post
+    ):
+        inspect_call = {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+                "name": "inspect_execution_graph",
+                "arguments": '{"invocation_id":"T1-C1"}',
+            },
+        }
+        final = (
+            "METHOD|other|src/p/Service.java:4|"
+            "this retained candidate best explains the failure"
+        )
+        post.side_effect = [
+            (
+                {"role": "assistant", "content": None,
+                 "tool_calls": [inspect_call]},
+                "vision", "resp-1", [{
+                    "role": "assistant", "content": None,
+                    "tool_calls": [inspect_call],
+                }], {}, "tool_calls",
+            ),
+            (
+                {"role": "assistant", "content": final},
+                "vision", "resp-2", [{
+                    "role": "assistant", "content": final,
+                }], {}, "stop",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "graph.png"
+            image.write_bytes(b"png")
+            source = root / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n  void run() {}\n"
+                "  void other() {}\n}\n",
+                encoding="utf-8",
+            )
+            result = run_agent(
+                {"mllm": {"invalid_final_response_retries": 0}},
+                "prompt",
+                [
+                    {**candidate(), "end_line": 3},
+                    {
+                        **candidate(),
+                        "candidate_id": "L002",
+                        "function": "p.Service.other",
+                        "signature": "p.Service.other()",
+                        "start_line": 4,
+                        "end_line": 4,
+                    },
+                ],
+                {"L001": "M1", "L002": "M2"},
+                _FakeGraphs(image),
+                root,
+                30,
+                root / "refine_conversation.jsonl",
+                1,
+            )
+
+        self.assertEqual(len(post.call_args_list), 2)
+        self.assertEqual(result["ranking"][0]["input_candidate_id"], "L002")
+        self.assertEqual(result["inspected_method_ids"], ["M1"])
 
 
 if __name__ == "__main__":

@@ -47,7 +47,38 @@ from mllmfl.infrastructure.java_source import find_java_file
 from mllmfl.infrastructure.layout import RunLayout
 from mllmfl.infrastructure.process import run_command
 
-TRACE_WORK_NAME = "refinement-trace.work.json.zst"
+
+TRACE_CAPTURE_FIELDS = {
+    "capture_values",
+    "value_string_edge_chars",
+    "value_container_edge_items",
+    "value_nested_container_edge_items",
+    "value_max_depth",
+    "value_max_arguments",
+}
+
+
+def load_trace_configuration(config_path: Path) -> Dict[str, Any]:
+    config = read_json(config_path)
+    trace_config = config.get("trace") if isinstance(config, dict) else None
+    if not isinstance(trace_config, dict) or set(trace_config) != TRACE_CAPTURE_FIELDS:
+        raise ValueError(
+            "trace configuration must contain exactly: "
+            + ", ".join(sorted(TRACE_CAPTURE_FIELDS))
+        )
+    if not isinstance(trace_config["capture_values"], bool):
+        raise ValueError("trace.capture_values must be boolean")
+    for field in TRACE_CAPTURE_FIELDS - {"capture_values", "value_max_depth"}:
+        value = trace_config[field]
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValueError(f"trace.{field} must be a positive integer")
+    depth = trace_config["value_max_depth"]
+    if not isinstance(depth, int) or isinstance(depth, bool) or depth < 0:
+        raise ValueError("trace.value_max_depth must be a non-negative integer")
+    return dict(trace_config)
+
+
+TRACE_WORK_NAME = "refinement-trace.v2.work.json.zst"
 
 
 def archive_failed_raw_trace(output: Path) -> Path | None:
@@ -239,11 +270,12 @@ def java_xml_compatibility_arguments(
 
 def trace_trigger(workspace: Path, output: Path, test: str, project: str,
                   agent_jar: Path, env: Dict[str, str], timeout: int,
-                  log_dir: Path | None = None, capture_values: bool = True,
-                  value_max_chars: int = 120, value_max_items: int = 8,
-                  value_max_depth: int = 2,
-                  value_max_arguments_chars: int = 480,
+                  log_dir: Path | None = None,
+                  capture_config: Dict[str, Any] | None = None,
                   retain_debug_artifacts: bool = False) -> Dict[str, Any]:
+    if capture_config is None or set(capture_config) != TRACE_CAPTURE_FIELDS:
+        raise ValueError("validated trace capture configuration is required")
+    capture_values = bool(capture_config["capture_values"])
     test_class, test_method = split_test(test)
     prefix = PROJECT_PREFIX.get(project, test_class.rsplit(".", 1)[0])
     test_source = find_java_file(workspace, test_class)
@@ -275,10 +307,14 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
         f"-Dfltrace.test.class={test_class}", f"-Dfltrace.test.method={test_method}",
         f"-Dfltrace.assert.ranges={assertion_ranges}",
         f"-Dfltrace.capture.values={str(capture_values).lower()}",
-        f"-Dfltrace.value.max.chars={value_max_chars}",
-        f"-Dfltrace.value.max.items={value_max_items}",
-        f"-Dfltrace.value.max.depth={value_max_depth}",
-        f"-Dfltrace.value.max.arguments.chars={value_max_arguments_chars}",
+        "-Dfltrace.value.string.edge.chars="
+        f"{capture_config['value_string_edge_chars']}",
+        "-Dfltrace.value.container.edge.items="
+        f"{capture_config['value_container_edge_items']}",
+        "-Dfltrace.value.nested.container.edge.items="
+        f"{capture_config['value_nested_container_edge_items']}",
+        f"-Dfltrace.value.max.depth={capture_config['value_max_depth']}",
+        f"-Dfltrace.value.max.arguments={capture_config['value_max_arguments']}",
         f"-javaagent:{agent_jar}={agent_args}", "-cp", classpath,
         "fltrace.runner.SingleTestRunner", test_class, test_method,
     ]
@@ -286,11 +322,11 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
     write_text(log_dir / "trace.stdout.log", result.stdout)
     write_text(log_dir / "trace.stderr.log", result.stderr)
     error_stack = extract_error_stack(result.stdout + "\n" + result.stderr)
-    collect_path = output / "collect.json"
-    if not collect_path.is_file():
-        raise RuntimeError("collect.json is required before tracing")
-    collect_data = read_json(collect_path)
-    test_output = str(collect_data.get("test_output") or "")
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"test process failed: {result.returncode}")
+    test_output = "\n".join(
+        part.rstrip() for part in (result.stdout, result.stderr) if part
+    )
     defect_context = {
         "schema": "defect-context",
         "schema_version": 1,
@@ -302,17 +338,12 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
     if not raw_path.is_file():
         raise RuntimeError("fullchain agent did not create raw_events.jsonl")
     full = build_trace(load_events(raw_path))
-    requested_capture = {
-        "capture_values": capture_values,
-        "value_max_chars": value_max_chars,
-        "value_max_items": value_max_items,
-        "value_max_depth": value_max_depth,
-        "value_max_arguments_chars": value_max_arguments_chars,
-    }
+    if not isinstance(full.get("test_end"), dict):
+        raise ValueError("test process did not record TEST_END")
     test_start = full.get("test_start") or {}
-    if test_start.get("agent_protocol_version") != 4:
-        raise ValueError("requested Fullchain agent v4 but raw trace used another protocol")
-    if test_start.get("value_capture") != requested_capture:
+    if test_start.get("agent_protocol_version") != 5:
+        raise ValueError("requested Fullchain agent v5 but raw trace used another protocol")
+    if test_start.get("value_capture") != capture_config:
         raise ValueError(
             "requested value capture configuration does not match agent TEST_START"
         )
@@ -326,12 +357,13 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
         },
     })
     execution = project_execution(full, test_class, test_method)
+    del full
     execution["project"] = project
     execution["process_exit_code"] = result.returncode
     assertion_pruned, assertion_folding = fold_successful_assertions(execution)
     work = {
         "schema": "refinement-trace-work",
-        "schema_version": 1,
+        "schema_version": 2,
         "test": test,
         "execution": assertion_pruned,
         "assertion_folding": assertion_folding,
@@ -348,7 +380,7 @@ def trace_trigger(workspace: Path, output: Path, test: str, project: str,
     else:
         (output / "raw_events.jsonl.zst").unlink(missing_ok=True)
     raw_path.unlink(missing_ok=True)
-    return work
+    return {"call_count": assertion_pruned["call_count"]}
 
 
 def _write_trace_suites(
@@ -367,6 +399,7 @@ def _write_trace_suites(
                 for _, _, _, directory in ordered:
                     work = read_zstd_json(directory / TRACE_WORK_NAME)
                     yield validate_trace(work["execution"], EXECUTION_SCHEMA)
+                    del work
 
             catalog, method_ids, fingerprint = build_method_catalog(executions())
             tests = []
@@ -376,7 +409,7 @@ def _write_trace_suites(
                 if (
                     not isinstance(work, dict)
                     or work.get("schema") != "refinement-trace-work"
-                    or work.get("schema_version") != 1
+                    or work.get("schema_version") != 2
                 ):
                     raise ValueError("unsupported refinement trace work schema")
                 test = str(work["test"])
@@ -411,6 +444,7 @@ def _write_trace_suites(
                     "trace": trace_path.relative_to(bug_dir).as_posix(),
                     "trace_fingerprint": normalized["fingerprint"],
                 })
+                del work, execution, normalized, assertion_folding, context
             expected_traces = {str(item["trace"]) for item in tests}
             traces_dir = bug_dir / "traces"
             for path in traces_dir.glob("T*.refinement-trace.json.zst"):
@@ -472,25 +506,15 @@ def run(
     agent_jar: Path,
     d4j_home: Path | None,
     java_home: Path | None,
+    config_path: Path,
     timeout: int,
     force: bool = False,
-    capture_values: bool = True,
-    value_max_chars: int = 120,
-    value_max_items: int = 8,
-    value_max_depth: int = 2,
-    value_max_arguments_chars: int = 480,
     retain_debug_artifacts: bool = False,
 ) -> List[Dict[str, object]]:
     if not agent_jar.is_file():
         raise FileNotFoundError(f"agent jar not found: {agent_jar}")
     env = defects4j_environment(d4j_home, java_home)
-    requested_capture = {
-        "capture_values": capture_values,
-        "value_max_chars": value_max_chars,
-        "value_max_items": value_max_items,
-        "value_max_depth": value_max_depth,
-        "value_max_arguments_chars": value_max_arguments_chars,
-    }
+    requested_capture = load_trace_configuration(config_path)
     rows = []
     trigger_items = list(layout.discover_triggers(projects, bugs, trigger))
     suite_targets = _suite_only_targets(layout, projects, bugs, trigger)
@@ -516,19 +540,6 @@ def run(
             continue
         output.mkdir(parents=True, exist_ok=True)
         write_text(output / "trigger_test.txt", test + "\n")
-        write_json(output / "collect.json", {
-            "schema": "collected-trigger",
-            "schema_version": 2,
-            "project": project,
-            "bug": bug,
-            "trigger": int(number),
-            "test_id": str(normalized["test_id"]),
-            "test": test,
-            "test_exit_code": int(
-                normalized["failure"]["process_exit_code"]
-            ),
-            "test_output": str(normalized["failure"]["test_output"]),
-        })
         trigger_items.append((project, bug, number, output))
     grouped = defaultdict(list)
     for item in trigger_items:
@@ -553,7 +564,7 @@ def run(
                 if not isinstance(instrumentation, dict):
                     reuse = False
                 if (
-                    execution.get("schema_version") != 4
+                    execution.get("schema_version") != 6
                     or (execution.get("test_start") or {}).get("value_capture")
                     != requested_capture
                 ):
@@ -574,6 +585,8 @@ def run(
                     "status": "ERROR", "call_count": 0,
                 })
                 continue
+            finally:
+                work = execution = None
             if reuse:
                 continue
         (output / TRACE_WORK_NAME).unlink(missing_ok=True)
@@ -592,13 +605,13 @@ def run(
             execution = trace_trigger(
                 layout.workspace_dir(project, bug), output, test, project,
                 agent_jar, env, timeout, log_dir,
-                capture_values, value_max_chars, value_max_items,
-                value_max_depth, value_max_arguments_chars,
+                requested_capture,
                 retain_debug_artifacts,
             )
             rows.append({"project": project, "bug": bug, "trigger": number,
                          "status": "OK",
-                         "call_count": execution["execution"]["call_count"]})
+                         "call_count": execution["call_count"]})
+            del execution
         except Exception as error:
             if (output / "raw_events.jsonl").is_file():
                 try:

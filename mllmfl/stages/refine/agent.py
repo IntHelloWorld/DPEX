@@ -7,9 +7,14 @@ from typing import Any, Dict, List, Sequence
 
 from mllmfl.infrastructure.io import append_jsonl, write_text
 from mllmfl.infrastructure.method_location import resolve_source_method_reference
-from .client import _image_part, _post_response, invalid_final_json_retries
+from .client import _image_part, _post_response, invalid_final_response_retries
 
-from .context import build_system_prompt
+from .context import (
+    AGENT_VARIANT_BASH_ONLY,
+    PROMPT_VERSIONS,
+    build_system_prompt,
+    refinement_agent_variant,
+)
 from .graphs import (
     EXECUTION_GRAPH_TOOL,
     FIND_METHOD_INVOCATION_ID_TOOL,
@@ -20,7 +25,7 @@ from .parsing import (
     parse_model_response,
     validate_model_refinement,
 )
-from .shell import BASH_TOOL, execute_bash
+from .shell import BASH_TOOL, STATIC_BASH_TOOL, execute_bash
 
 
 def finalization_limits(config: Dict[str, Any]) -> tuple[int, int]:
@@ -43,7 +48,7 @@ def run_agent(
     prompt: str,
     candidates: Sequence[Dict[str, Any]],
     candidate_method_ids: Dict[str, str],
-    graphs: MethodExecutionGraphs,
+    graphs: MethodExecutionGraphs | None,
     workspace: Path,
     timeout: int,
     conversation_path: Path | None,
@@ -52,9 +57,17 @@ def run_agent(
     if top_k <= 0:
         raise ValueError("top_k must be positive")
     cfg = config.get("mllm", config)
-    retries = invalid_final_json_retries(config)
-    system_prompt = build_system_prompt(top_k)
-    tools = [FIND_METHOD_INVOCATION_ID_TOOL, EXECUTION_GRAPH_TOOL, BASH_TOOL]
+    retries = invalid_final_response_retries(config)
+    agent_variant = refinement_agent_variant(config)
+    bash_only = agent_variant == AGENT_VARIANT_BASH_ONLY
+    if graphs is None and not bash_only:
+        raise ValueError("dynamic-graph agent requires refinement graphs")
+    system_prompt = build_system_prompt(top_k, agent_variant)
+    tools = (
+        [STATIC_BASH_TOOL]
+        if bash_only
+        else [FIND_METHOD_INVOCATION_ID_TOOL, EXECUTION_GRAPH_TOOL, BASH_TOOL]
+    )
     pending_input: List[Dict[str, Any]] = [{
         "role": "user",
         "content": [{"type": "text", "text": prompt}],
@@ -118,15 +131,19 @@ def run_agent(
                 if not isinstance(part, dict) or part.get("type") != "image_ref":
                     continue
                 diagram_id = str(part.get("diagram_id") or "")
+                if graphs is None:
+                    raise ValueError("bash-only agent history contains an image")
                 content[index] = _image_part(graphs.image_path(diagram_id))
         return result
 
     def final_error(content: str) -> str:
-        if mapped_method_ids and not graphs.viewed:
+        if bash_only and terminal_commands == 0:
+            return "at least one bash source inspection is required"
+        if not bash_only and mapped_method_ids and graphs is not None and not graphs.viewed:
             return "at least one runtime method graph must be viewed"
         parsed = parse_model_response(content)
         if parsed is None:
-            return "response is not valid JSON"
+            return "response does not match the required METHOD line format"
         try:
             ranking = validate_model_refinement(parsed, top_k)
             resolved = []
@@ -146,17 +163,6 @@ def run_agent(
             for _, location in resolved
         }
         returned_candidate_ids.discard(None)
-        required_method_ids = {
-            candidate_method_ids[candidate_id]
-            for candidate_id in returned_candidate_ids
-            if candidate_id in candidate_method_ids
-        }
-        missing_method_ids = required_method_ids - set(graphs.inspected_method_ids)
-        if missing_method_ids:
-            return (
-                "every retained runtime candidate must be inspected; missing: "
-                + ", ".join(sorted(missing_method_ids))
-            )
         if (
             len(returned_candidate_ids) < len(resolved)
             or any(candidate_id not in candidate_method_ids
@@ -257,9 +263,13 @@ def run_agent(
                 arguments = None
             image_id = ""
             if name == "find_method_invocation_id":
+                if graphs is None:
+                    raise ValueError("bash-only agent cannot query runtime methods")
                 result = graphs.find_invocation_ids(arguments)
                 image_path = None
             elif name == "inspect_execution_graph":
+                if graphs is None:
+                    raise ValueError("bash-only agent cannot inspect execution graphs")
                 result, image_path = graphs.inspect(arguments)
                 if image_path is not None:
                     image_id = graphs.viewed_diagram_id(
@@ -279,6 +289,7 @@ def run_agent(
                     max_output_chars,
                     workspace,
                     terminal_timeout,
+                    static_only=bash_only,
                 )
                 image_path = None
             else:
@@ -312,7 +323,7 @@ def run_agent(
                 "role": "user",
                 "content": (
                     f"Your final response was invalid: {validation_error}. Retry now "
-                    "with exactly one JSON array matching the Output Contract."
+                    f"with only 1 to {top_k} METHOD lines matching the Output Contract."
                 ),
             }
             pending_input = [correction]
@@ -324,7 +335,7 @@ def run_agent(
             raise ValueError("model returned neither a tool call nor final text")
         parsed = parse_model_response(content)
         if parsed is None:
-            raise ValueError("model returned invalid final JSON")
+            raise ValueError("model returned invalid final METHOD lines")
         ranking = validate_model_refinement(parsed, top_k)
         resolved_ranking = []
         for item in ranking:
@@ -343,13 +354,22 @@ def run_agent(
             })
         return {
             "model": model,
+            "agent_variant": agent_variant,
+            "prompt_version": PROMPT_VERSIONS[agent_variant],
             "ranking": resolved_ranking,
             "tool_rounds": tool_rounds,
-            "diagram_view_count": len(graphs.viewed),
-            "viewed_diagrams": list(graphs.viewed),
-            "inspected_method_ids": list(graphs.inspected_method_ids),
-            "inspected_invocation_ids": list(graphs.inspected_invocation_ids),
-            "queried_methods": [dict(item) for item in graphs.queried_methods],
+            "diagram_view_count": len(graphs.viewed) if graphs is not None else 0,
+            "viewed_diagrams": list(graphs.viewed) if graphs is not None else [],
+            "inspected_method_ids": (
+                list(graphs.inspected_method_ids) if graphs is not None else []
+            ),
+            "inspected_invocation_ids": (
+                list(graphs.inspected_invocation_ids) if graphs is not None else []
+            ),
+            "queried_methods": (
+                [dict(item) for item in graphs.queried_methods]
+                if graphs is not None else []
+            ),
             "terminal_command_count": terminal_commands,
             "finalization_attempts": finalization_attempts,
             "request_count": request_count,

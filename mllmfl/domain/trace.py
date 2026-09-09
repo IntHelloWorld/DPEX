@@ -6,7 +6,9 @@ from .models import Call, Invocation
 
 FULL_TRACE_SCHEMA = "fullchain-trace"
 EXECUTION_SCHEMA = "fullchain-execution"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
+AGENT_PROTOCOL_VERSION = 5
+VALUE_CAPTURE_LEGACY_SCHEMA_VERSION = 4
 LEGACY_SCHEMA_VERSION = 3
 ASSERTION_EVENTS = {"ASSERT_START", "ASSERT_PASS", "ASSERT_FAIL"}
 ALLOWED_EVENTS = {
@@ -230,7 +232,11 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 callee_descriptor=child.descriptor,
                 parent_invocation_id=parent.invocation_id,
                 invocation_id=child.invocation_id,
-                parent_chain=_ancestor_chain(by_id, parent.invocation_id),
+                parent_chain=(
+                    _ancestor_chain(by_id, parent.invocation_id)
+                    if int((test_start or {}).get("agent_protocol_version") or 3) < 5
+                    else None
+                ),
                 thread_id=child.thread_id,
                 enter_seq=child.enter_seq,
                 exit_seq=int(child.exit_seq or 0),
@@ -239,7 +245,14 @@ def build_trace(events: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             )
         )
     protocol_version = int((test_start or {}).get("agent_protocol_version") or 3)
-    schema_version = SCHEMA_VERSION if protocol_version == 4 else LEGACY_SCHEMA_VERSION
+    if protocol_version not in {
+        LEGACY_SCHEMA_VERSION, VALUE_CAPTURE_LEGACY_SCHEMA_VERSION, AGENT_PROTOCOL_VERSION,
+    }:
+        raise ValueError(f"unsupported agent protocol version: {protocol_version}")
+    schema_version = (
+        SCHEMA_VERSION if protocol_version == AGENT_PROTOCOL_VERSION
+        else protocol_version
+    )
     result = {
         "schema": FULL_TRACE_SCHEMA,
         "schema_version": schema_version,
@@ -268,7 +281,9 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
     if expected_schema and schema != expected_schema:
         raise ValueError(f"expected schema {expected_schema}, got {schema}")
     schema_version = value.get("schema_version")
-    if schema_version not in {LEGACY_SCHEMA_VERSION, SCHEMA_VERSION}:
+    if schema_version not in {
+        LEGACY_SCHEMA_VERSION, VALUE_CAPTURE_LEGACY_SCHEMA_VERSION, AGENT_PROTOCOL_VERSION, SCHEMA_VERSION,
+    }:
         raise ValueError(f"unsupported schema_version: {value.get('schema_version')!r}")
     if not isinstance(value.get("calls"), list) or not isinstance(value.get("invocations"), list):
         raise ValueError("trace calls and invocations must be arrays")
@@ -283,13 +298,17 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
     seen_invocations = set()
     capture_values = False
     config = None
-    if schema_version == SCHEMA_VERSION:
+    if schema_version in {VALUE_CAPTURE_LEGACY_SCHEMA_VERSION, AGENT_PROTOCOL_VERSION, SCHEMA_VERSION}:
         test_start = value.get("test_start")
         if not isinstance(test_start, dict):
-            raise ValueError("fullchain v4 requires TEST_START metadata")
-        if test_start.get("agent_protocol_version") != 4:
-            raise ValueError("fullchain v4 requires agent protocol version 4")
-        config = _validate_value_capture_config(test_start.get("value_capture"))
+            raise ValueError("value-capturing fullchain trace requires TEST_START metadata")
+        if test_start.get("agent_protocol_version") != (
+            AGENT_PROTOCOL_VERSION if schema_version == SCHEMA_VERSION else schema_version
+        ):
+            raise ValueError("fullchain schema and agent protocol versions differ")
+        config = _validate_value_capture_config(
+            test_start.get("value_capture"), schema_version
+        )
         capture_values = config["capture_values"]
     for index, invocation in enumerate(invocations):
         if not isinstance(invocation, dict):
@@ -304,7 +323,7 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
         ):
             raise ValueError(f"invalid invocation at index {index}")
         seen_invocations.add(invocation_id)
-        if schema_version == SCHEMA_VERSION:
+        if schema_version in {VALUE_CAPTURE_LEGACY_SCHEMA_VERSION, AGENT_PROTOCOL_VERSION, SCHEMA_VERSION}:
             has_arguments = "arguments" in invocation
             has_return = "return_value" in invocation
             if capture_values != has_arguments:
@@ -324,7 +343,7 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
                 if capture_values:
                     returned = _validate_value_item(
                         invocation["return_value"], allow_index=False,
-                        max_chars=config["value_max_chars"],
+                        max_chars=config.get("value_max_chars"),
                     )
                     descriptor_void = str(invocation.get("descriptor") or "").endswith(
                         ")V"
@@ -337,6 +356,35 @@ def validate_trace(value: Any, expected_schema: str | None = None) -> Dict[str, 
                 raise ValueError(
                     f"THROW invocation has return value: invocation {invocation_id}"
                 )
+    if schema_version == SCHEMA_VERSION:
+        parents = {}
+        for item in invocations:
+            parent = item.get("parent_id")
+            if not isinstance(parent, int) or isinstance(parent, bool) or parent < 0:
+                raise ValueError("invalid invocation parent pointer")
+            if parent and parent not in seen_invocations:
+                raise ValueError("missing invocation parent")
+            parents[item["invocation_id"]] = parent
+        visited = {0}
+        for invocation_id in parents:
+            path = set()
+            current = invocation_id
+            while current not in visited:
+                if current in path:
+                    raise ValueError("cyclic invocation parent pointers")
+                path.add(current)
+                current = parents[current]
+            visited.update(path)
+        call_ids = set()
+        for call in value["calls"]:
+            invocation_id = call["invocation_id"]
+            if invocation_id not in parents or invocation_id in call_ids:
+                raise ValueError("missing or duplicate call invocation")
+            call_ids.add(invocation_id)
+            if "parent_chain" in call:
+                raise ValueError("schema v6 stores parent pointers, not parent_chain")
+            if call["parent_invocation_id"] != parents[invocation_id]:
+                raise ValueError("call parent pointer does not match invocation")
     assertions = value.get("assertions", [])
     if not isinstance(assertions, list):
         raise ValueError("trace assertions must be an array")
@@ -376,16 +424,32 @@ VALUE_KINDS = {
 }
 
 
-def _validate_value_capture_config(value: Any) -> Dict[str, Any]:
-    required = {
-        "capture_values", "value_max_chars", "value_max_items",
-        "value_max_depth", "value_max_arguments_chars",
-    }
+def _validate_value_capture_config(
+    value: Any, schema_version: int = SCHEMA_VERSION
+) -> Dict[str, Any]:
+    if schema_version == VALUE_CAPTURE_LEGACY_SCHEMA_VERSION:
+        required = {
+            "capture_values", "value_max_chars", "value_max_items",
+            "value_max_depth", "value_max_arguments_chars",
+        }
+        positive_fields = (
+            "value_max_chars", "value_max_items", "value_max_arguments_chars",
+        )
+    else:
+        required = {
+            "capture_values", "value_string_edge_chars",
+            "value_container_edge_items", "value_nested_container_edge_items",
+            "value_max_depth", "value_max_arguments",
+        }
+        positive_fields = (
+            "value_string_edge_chars", "value_container_edge_items",
+            "value_nested_container_edge_items", "value_max_arguments",
+        )
     if not isinstance(value, dict) or set(value) != required:
         raise ValueError("invalid value capture configuration")
     if not isinstance(value["capture_values"], bool):
         raise ValueError("invalid value capture enabled flag")
-    for field in ("value_max_chars", "value_max_items", "value_max_arguments_chars"):
+    for field in positive_fields:
         if (
             not isinstance(value[field], int)
             or isinstance(value[field], bool)
@@ -479,22 +543,28 @@ def _validate_arguments(
         or not isinstance(value["truncated"], bool)
     ):
         raise ValueError("invalid captured argument counts")
-    if len(items) > config["value_max_items"]:
+    legacy = "value_max_items" in config
+    if len(items) > config[
+        "value_max_items" if legacy else "value_max_arguments"
+    ]:
         raise ValueError("captured arguments exceed configured item limit")
     for index, item in enumerate(items):
         _validate_value_item(
-            item, allow_index=True, max_chars=config["value_max_chars"]
+            item,
+            allow_index=True,
+            max_chars=config["value_max_chars"] if legacy else None,
         )
         if item["index"] != index:
             raise ValueError("captured argument indexes are not contiguous")
     expected_truncated = omitted > 0 or any(item["truncated"] for item in items)
     if value["truncated"] != expected_truncated:
         raise ValueError("inconsistent captured arguments truncation")
-    text_chars = sum(
-        len(f"arg{item['index']}=") + len(item["text"]) for item in items
-    ) + 2 * max(0, len(items) - 1)
-    if text_chars > config["value_max_arguments_chars"]:
-        raise ValueError("captured arguments exceed configured total limit")
+    if legacy:
+        text_chars = sum(
+            len(f"arg{item['index']}=") + len(item["text"]) for item in items
+        ) + 2 * max(0, len(items) - 1)
+        if text_chars > config["value_max_arguments_chars"]:
+            raise ValueError("captured arguments exceed configured total limit")
     return value
 
 

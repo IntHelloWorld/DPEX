@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 from typing import Any, Dict, Sequence
 
@@ -6,6 +5,19 @@ from mllmfl.infrastructure.method_location import (
     java_executables,
     resolve_method_location,
 )
+from .parsing import format_method_record
+
+
+AGENT_VARIANT_DYNAMIC_GRAPH = "dynamic-graph"
+AGENT_VARIANT_BASH_ONLY = "bash-only"
+AGENT_VARIANTS = {
+    AGENT_VARIANT_DYNAMIC_GRAPH,
+    AGENT_VARIANT_BASH_ONLY,
+}
+PROMPT_VERSIONS = {
+    AGENT_VARIANT_DYNAMIC_GRAPH: "refinement-method-lines-v1",
+    AGENT_VARIANT_BASH_ONLY: "refinement-method-lines-bash-only-v2",
+}
 
 
 SYSTEM_PROMPT = """You are a fault-localization refinement agent. Your task is to analyze dynamic
@@ -16,7 +28,7 @@ a new ranking from most to least suspicious.
 
 Use bash to inspect buggy-project source. It accepts one complete Bash command string and a maximum
 output character count, including pipelines and conditionals. Its working directory is the buggy
-Defects4J project root. Use inspection commands only and do not modify the project. Do not inspect
+project root. Use inspection commands only and do not modify any files. Do not inspect
 repository history, patches, fixed versions, or paths outside the buggy project root.
 
 Use find_method_invocation_id to find the runtime invocations of a source-anchored method in one
@@ -32,20 +44,80 @@ number of dynamic calls represented by that region.
 
 Do not overthink. Call at most one tool in each assistant response.
 
-When finished, return only one JSON array, without Markdown or surrounding text:
-[{"method":{"name":"getServiceName","line":"src/main/java/p/Service.java:42"},"reason":"..."}]
-The array must contain between 1 and __TOP_K__ distinct methods in descending suspiciousness.
-Do not return confidence. method.name is the declared method name (or the declared class name for a
-constructor). method.line combines the POSIX source path relative to the buggy project root, a
-colon, and the 1-based line number containing that declared name. Copy both from source inspected
-with bash. Give a concise, candidate-specific reason grounded in runtime
+When finished, return only METHOD lines, without JSON, XML, Markdown, or surrounding text. Use this
+exact four-field format for every line:
+
+METHOD|getServiceName|src/main/java/p/Service.java:42|Concise evidence-based reason
+
+Return between 1 and __TOP_K__ distinct METHOD lines in descending suspiciousness. Keep every record,
+including its reason, on one physical line. The reason may contain additional `|` characters because
+only the first three separators are structural.
+The second field is the declared method name (or the declared class name
+for a constructor). The third field combines the POSIX source path relative to the buggy project
+root, a colon, and the 1-based line number containing that declared name. Copy both from source
+inspected with bash. Give a concise, candidate-specific reason grounded in runtime
 behavior and relevant source evidence."""
 
 
-def build_system_prompt(top_k: int) -> str:
+BASH_ONLY_SYSTEM_PROMPT = SYSTEM_PROMPT.replace(
+    "analyze dynamic\nprogram sequence diagrams to understand runtime behavior",
+    "analyze\nprogram source code to understand behavior",
+).replace(
+    """Use bash to inspect buggy-project source. It accepts one complete Bash command string and a maximum
+output character count, including pipelines and conditionals. Its working directory is the buggy
+project root. Use inspection commands only and do not modify any files. Do not inspect
+repository history, patches, fixed versions, or paths outside the buggy project root.""",
+    """Use bash only to inspect buggy-project source with static file-inspection commands such as
+rg, grep, sed, cat, and find. It accepts one complete Bash command string and a maximum output
+character count, including pipelines. Its working directory is the buggy project root.
+Do not compile, run tests, execute project code, or invoke a language runtime. Do not modify any
+files in the project or inspect repository history, patches, fixed versions, or paths outside the buggy project
+root.""",
+).replace(
+    """Use find_method_invocation_id to find the runtime invocations of a source-anchored method in one
+failing-test trace. Use inspect_execution_graph to view the dynamic execution graph around an exact
+invocation_id returned by that lookup or shown in another execution graph. Use only the failing
+tests listed in the prompt; tests excluded by the upstream locator are outside this task's evidence.
+
+An execution graph is a sequence diagram read from top to bottom. Participants are runtime classes;
+solid arrows are method calls, and dashed arrows are returns or throws. Each call arrow starts with
+an exact test-scoped invocation_id such as T1-C32, and the highlighted call is the selected focus.
+A self-directed `... omit N calls ...` arrow marks a hidden execution region; N is the exact
+number of dynamic calls represented by that region.""",
+    """Use only the failing tests listed in the prompt; tests excluded by the upstream locator are outside
+this task's evidence.""",
+).replace(
+    "grounded in runtime\nbehavior and relevant source evidence.",
+    "grounded in relevant source\nevidence.",
+)
+
+
+def refinement_agent_variant(config: Dict[str, Any]) -> str:
+    cfg = config.get("mllm", config)
+    variant = str(
+        cfg.get("agent_variant") or AGENT_VARIANT_DYNAMIC_GRAPH
+    ).strip().lower()
+    if variant not in AGENT_VARIANTS:
+        raise ValueError(
+            "agent_variant must be dynamic-graph or bash-only"
+        )
+    return variant
+
+
+def build_system_prompt(
+    top_k: int,
+    agent_variant: str = AGENT_VARIANT_DYNAMIC_GRAPH,
+) -> str:
     if top_k <= 0:
         raise ValueError("top_k must be positive")
-    return SYSTEM_PROMPT.replace("__TOP_K__", str(top_k))
+    if agent_variant not in AGENT_VARIANTS:
+        raise ValueError("agent_variant must be dynamic-graph or bash-only")
+    template = (
+        BASH_ONLY_SYSTEM_PROMPT
+        if agent_variant == AGENT_VARIANT_BASH_ONLY
+        else SYSTEM_PROMPT
+    )
+    return template.replace("__TOP_K__", str(top_k))
 
 
 def runtime_method_ids(
@@ -158,18 +230,16 @@ def build_prompt(
             executable.function.rsplit(".", 2)[-2].rsplit("$", 1)[-1]
             if canonical_name == "<init>" else canonical_name
         )
-        locator_ranking.append({
-            "method": {
-                "name": declared_name,
-                "line": f"{source_file}:{executable.declaration_line}",
-            },
-            "reason": str(item.get("reason") or ""),
-        })
+        locator_ranking.append(format_method_record(
+            declared_name,
+            f"{source_file}:{executable.declaration_line}",
+            str(item.get("reason") or ""),
+        ))
     lines.extend([
         "[Locator]",
         f"Name: {locator['name']}",
         "",
         "[Locator Ranking]",
-        json.dumps(locator_ranking, ensure_ascii=False, indent=2),
+        *locator_ranking,
     ])
     return "\n".join(lines)

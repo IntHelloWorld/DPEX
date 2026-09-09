@@ -18,6 +18,7 @@ from mllmfl.stages.trace import (
     assertion_range_argument,
     classpath_has_class,
     java_xml_compatibility_arguments,
+    load_trace_configuration,
     run as run_trace,
 )
 from mllmfl.domain.refinement_trace import validate_refinement_trace
@@ -87,7 +88,39 @@ def v4_events(capture_values=True):
     return result
 
 
+def v5_events(capture_values=True):
+    result = v4_events(capture_values)
+    result[0]["agent_protocol_version"] = 5
+    result[0]["value_capture"] = {
+        "capture_values": capture_values,
+        "value_string_edge_chars": 10,
+        "value_container_edge_items": 2,
+        "value_nested_container_edge_items": 1,
+        "value_max_depth": 2,
+        "value_max_arguments": 8,
+    }
+    return result
+
+
 class EventParsingTests(unittest.TestCase):
+    def test_loads_trace_capture_policy_only_from_json(self):
+        expected = {
+            "capture_values": True,
+            "value_string_edge_chars": 10,
+            "value_container_edge_items": 2,
+            "value_nested_container_edge_items": 1,
+            "value_max_depth": 2,
+            "value_max_arguments": 8,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            path.write_text(json.dumps({"trace": expected}), encoding="utf-8")
+            self.assertEqual(load_trace_configuration(path), expected)
+            invalid = {**expected, "value_max_arguments_chars": 480}
+            path.write_text(json.dumps({"trace": invalid}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "exactly"):
+                load_trace_configuration(path)
+
     def test_finds_a_compiled_class_on_directory_classpath(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "p" / "Example.class"
@@ -173,6 +206,18 @@ class EventParsingTests(unittest.TestCase):
         legacy = build_trace(events())
         self.assertEqual(legacy["schema_version"], 3)
         self.assertFalse(any("arguments" in item for item in legacy["invocations"]))
+
+    def test_v5_rejects_removed_argument_character_budget(self):
+        trace = build_trace(v5_events())
+        self.assertEqual(trace["schema_version"], 6)
+        invalid = v5_events()
+        invalid[0]["value_capture"]["value_max_arguments_chars"] = 480
+        with self.assertRaisesRegex(ValueError, "capture configuration"):
+            build_trace(invalid)
+        unknown_protocol = v5_events()
+        unknown_protocol[0]["agent_protocol_version"] = 6
+        with self.assertRaisesRegex(ValueError, "protocol version"):
+            build_trace(unknown_protocol)
 
     def test_rejects_duplicate_invocation(self):
         value = events()
@@ -265,7 +310,7 @@ class ExecutionProjectionTests(unittest.TestCase):
                 path.write_text("obsolete")
             write_zstd_json(trigger / TRACE_WORK_NAME, {
                 "schema": "refinement-trace-work",
-                "schema_version": 1,
+                "schema_version": 2,
                 "test": "p.Test::testCase",
                 "execution": pruned,
                 "assertion_folding": folding,
@@ -312,17 +357,28 @@ class ExecutionProjectionTests(unittest.TestCase):
 
             agent_jar = layout.root / "agent.jar"
             agent_jar.write_bytes(b"jar")
+            config_path = layout.root / "config.json"
+            trace_config = {
+                "capture_values": True,
+                "value_string_edge_chars": 10,
+                "value_container_edge_items": 2,
+                "value_nested_container_edge_items": 1,
+                "value_max_depth": 2,
+                "value_max_arguments": 8,
+            }
+            config_path.write_text(json.dumps({"trace": trace_config}))
 
             def retrace(*args, **kwargs):
                 output = args[1]
-                recovered_collect = json.loads(
-                    (output / "collect.json").read_text()
+                self.assertEqual(args[8], trace_config)
+                self.assertEqual(
+                    (output / "trigger_test.txt").read_text().strip(),
+                    "p.Test::testCase",
                 )
-                self.assertEqual(recovered_collect["test_id"], "T1")
-                self.assertEqual(recovered_collect["test_output"], "failed")
+                self.assertFalse((output / "collect.json").exists())
                 work = {
                     "schema": "refinement-trace-work",
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "test": "p.Test::testCase",
                     "execution": pruned,
                     "assertion_folding": folding,
@@ -335,7 +391,7 @@ class ExecutionProjectionTests(unittest.TestCase):
                     },
                 }
                 write_zstd_json(output / TRACE_WORK_NAME, work)
-                return work
+                return {"call_count": work["execution"]["call_count"]}
 
             with (
                 patch(
@@ -346,7 +402,7 @@ class ExecutionProjectionTests(unittest.TestCase):
             ):
                 rerun = run_trace(
                     layout, ["P"], {"1"}, None, agent_jar,
-                    None, None, 5, force=True,
+                    None, None, config_path, 5, force=True,
                 )
             self.assertEqual(rerun[0]["status"], "OK")
             self.assertTrue((

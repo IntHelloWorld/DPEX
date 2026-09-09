@@ -13,6 +13,7 @@ from mllmfl.domain.schemas import (
 from mllmfl.infrastructure.ground_truth import ground_truth_locations
 from mllmfl.infrastructure.io import read_json, write_csv, write_json
 from mllmfl.infrastructure.layout import RunLayout
+from mllmfl.infrastructure.checkouts import temporary_checkout
 from mllmfl.stages.cleanup import final_only_bug
 
 
@@ -95,9 +96,10 @@ def run(
             ))
             continue
         try:
-            truth_locations = ground_truth_locations(
-                d4j_home, layout.workspace_dir(project, bug), project, bug
-            )
+            with temporary_checkout(layout, project, bug, d4j_home=d4j_home) as workspace:
+                truth_locations = ground_truth_locations(
+                    d4j_home, workspace, project, bug
+                )
             ranking_locations = [
                 {
                     "function": str(item["function"]),
@@ -114,7 +116,7 @@ def run(
                 ranking_locations, truth_locations
             )
             identity_mode = "source_range"
-        except (OSError, UnicodeError, ValueError) as error:
+        except (OSError, UnicodeError, ValueError, RuntimeError) as error:
             details.append(_skipped(project, bug, "GROUND_TRUTH_ERROR", str(error)))
             continue
         ranking = [str(item["function"]) for item in result["ranking"]]

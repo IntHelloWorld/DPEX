@@ -16,16 +16,25 @@ class CliTests(unittest.TestCase):
             {"collect", "trace", "refine", "evaluate", "cleanup"},
         )
 
-    def test_trace_value_capture_defaults_on_and_can_be_disabled(self) -> None:
+    def test_collect_and_trace_share_the_merged_parser(self) -> None:
         parser = build_parser()
-        default_args = parser.parse_args(["trace"])
-        disabled_args = parser.parse_args(["trace", "--no-capture-values"])
-        self.assertTrue(default_args.capture_values)
-        self.assertFalse(disabled_args.capture_values)
+        for stage in ("collect", "trace"):
+            args = parser.parse_args([stage, "--config", "trace.json"])
+            self.assertEqual(args.config, "trace.json")
+            self.assertNotIn("trigger", vars(args))
+
+    def test_trace_value_capture_configuration_is_json_only(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["trace", "--config", "trace.json"])
+        self.assertEqual(args.config, "trace.json")
+        self.assertNotIn("capture_values", vars(args))
+        self.assertNotIn("value_max_arguments_chars", vars(args))
 
     def test_debug_and_cleanup_flags_default_to_safe_retention(self) -> None:
         parser = build_parser()
-        self.assertFalse(parser.parse_args(["trace"]).retain_debug_artifacts)
+        self.assertFalse(parser.parse_args([
+            "trace", "--config", "trace.json",
+        ]).retain_debug_artifacts)
         self.assertFalse(parser.parse_args(["refine", "--locator-results", "x", "--config", "y"]).retain_debug_artifacts)
         self.assertFalse(parser.parse_args(["evaluate"]).final_only)
         self.assertFalse(parser.parse_args(["cleanup"]).apply)

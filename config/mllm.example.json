@@ -3,12 +3,21 @@
     "plantuml_command": "plantuml",
     "plantuml_limit_size": 32768
   },
+  "trace": {
+    "capture_values": true,
+    "value_string_edge_chars": 10,
+    "value_container_edge_items": 2,
+    "value_nested_container_edge_items": 1,
+    "value_max_depth": 2,
+    "value_max_arguments": 8
+  },
   "mllm": {
     "base_url": "https://api.openai.com/v1",
     "api_key_env": "OPENAI_API_KEY",
+    "agent_variant": "dynamic-graph",
     "vision_model": "gpt-5.4",
     "reasoning_effort": "medium",
-    "invalid_final_json_retries": 2,
+    "invalid_final_response_retries": 2,
     "terminal_timeout": 30,
     "top_k": 5,
     "max_tokens": 4096,

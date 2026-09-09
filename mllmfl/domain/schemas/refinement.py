@@ -134,7 +134,7 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
         raise ValueError("refinement artifact must be a JSON object")
     if (
         value.get("schema") != "fault-localization-refinement"
-        or value.get("schema_version") not in {4, 5, 6}
+        or value.get("schema_version") not in {4, 5, 6, 7}
     ):
         raise ValueError("unsupported refinement schema")
     _identity(value, "refinement")
@@ -168,7 +168,7 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
         value.get("input_ranking"), "refinement input", refined=False
     )
     selected_test_ids: set[str] | None = None
-    if value["schema_version"] in {5, 6}:
+    if value["schema_version"] in {5, 6, 7}:
         tests = value.get("tests")
         test_count = value.get("test_count")
         if (
@@ -241,7 +241,7 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
     ):
         if not isinstance(value.get(field), int) or value[field] < 0:
             raise ValueError(f"invalid refinement {field}")
-    if value["schema_version"] == 6:
+    if value["schema_version"] in {6, 7}:
         request_count = value.get("request_count")
         finalization_count = value.get("finalization_attempt_count")
         length_retry_count = value.get("final_length_retry_count")
@@ -298,6 +298,20 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
             or finalization_attempts[-1]["content_empty"]
         ):
             raise ValueError("invalid refinement finalization audit")
+    if value["schema_version"] == 7:
+        agent_variant = value.get("agent_variant")
+        prompt_version = value.get("prompt_version")
+        expected_prompt_versions = {
+            "dynamic-graph": "refinement-method-lines-v1",
+            "bash-only": "refinement-method-lines-bash-only-v2",
+        }
+        if (
+            agent_variant not in expected_prompt_versions
+            or prompt_version != expected_prompt_versions[agent_variant]
+        ):
+            raise ValueError("invalid refinement agent variant audit")
+    else:
+        agent_variant = "dynamic-graph"
     viewed = value.get("viewed_diagrams")
     inspected = value.get("inspected_candidate_ids")
     method_ids = value.get("candidate_runtime_method_ids")
@@ -366,4 +380,14 @@ def validate_refinement(value: Any) -> Dict[str, Any]:
         or value["terminal_command_count"] > value["tool_rounds"]
     ):
         raise ValueError("invalid refinement inspection audit")
+    if agent_variant == "bash-only" and (
+        value["terminal_command_count"] < 1
+        or value["diagram_view_count"] != 0
+        or viewed
+        or inspected
+        or method_ids
+        or invocations
+        or queried_methods
+    ):
+        raise ValueError("bash-only refinement contains dynamic inspection evidence")
     return value

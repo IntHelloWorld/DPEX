@@ -11,7 +11,7 @@ from .trace import EXECUTION_SCHEMA, validate_trace
 
 
 REFINEMENT_TRACE_SCHEMA = "refinement-trace"
-REFINEMENT_TRACE_VERSION = 1
+REFINEMENT_TRACE_VERSION = 2
 
 # Compact call/context row fields. Keeping this protocol positional removes the
 # repeated field-name cost without forcing consumers to materialize call objects.
@@ -56,6 +56,7 @@ def build_method_catalog(
             for invocation in execution["invocations"]
             if int(invocation.get("invocation_id") or 0) in call_ids
         )
+        del execution
     keys = sorted(recorded_keys)
     method_ids = {key: f"M{index}" for index, key in enumerate(keys, 1)}
     catalog = [
@@ -251,10 +252,11 @@ def build_refinement_trace(
     ]
     capture = dict((execution.get("test_start") or {}).get("value_capture") or {
         "capture_values": False,
-        "value_max_chars": 120,
-        "value_max_items": 8,
+        "value_string_edge_chars": 10,
+        "value_container_edge_items": 2,
+        "value_nested_container_edge_items": 1,
         "value_max_depth": 2,
-        "value_max_arguments_chars": 480,
+        "value_max_arguments": 8,
     })
     value: Dict[str, Any] = {
         "schema": REFINEMENT_TRACE_SCHEMA,
@@ -348,21 +350,28 @@ def validate_refinement_trace(value: Any) -> Dict[str, Any]:
             raise ValueError("invalid refinement trace method")
         method_ids.add(item[0])
     capture = value.get("capture")
+    capture_fields = {
+        "capture_values", "value_string_edge_chars",
+        "value_container_edge_items", "value_nested_container_edge_items",
+        "value_max_depth", "value_max_arguments",
+    }
+    legacy_capture_fields = {
+        "capture_values", "value_max_chars", "value_max_items",
+        "value_max_depth", "value_max_arguments_chars",
+    }
+    actual_capture_fields = set(capture) if isinstance(capture, dict) else set()
+    positive_capture_fields = (
+        actual_capture_fields - {"capture_values", "value_max_depth"}
+    )
     if (
         not isinstance(capture, dict)
-        or set(capture) != {
-            "capture_values", "value_max_chars", "value_max_items",
-            "value_max_depth", "value_max_arguments_chars",
-        }
+        or actual_capture_fields not in (capture_fields, legacy_capture_fields)
         or not isinstance(capture["capture_values"], bool)
         or any(
             not isinstance(capture[field], int)
             or isinstance(capture[field], bool)
             or capture[field] <= 0
-            for field in (
-                "value_max_chars", "value_max_items",
-                "value_max_arguments_chars",
-            )
+            for field in positive_capture_fields
         )
         or not isinstance(capture["value_max_depth"], int)
         or isinstance(capture["value_max_depth"], bool)

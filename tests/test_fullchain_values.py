@@ -6,7 +6,14 @@ import time
 import unittest
 from pathlib import Path
 
-from mllmfl.domain.trace import build_trace, load_events, validate_trace
+from mllmfl.domain.trace import (
+    build_trace,
+    load_events,
+    project_execution,
+    validate_trace,
+)
+from mllmfl.infrastructure.plantuml import DEFAULT_PLANTUML_JAR, ensure_rendered
+from mllmfl.infrastructure.sequence_diagram import make_puml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,10 +51,11 @@ class FullchainValueCaptureTests(unittest.TestCase):
         raw.unlink(missing_ok=True)
         config = {
             "capture_values": capture_values,
-            "value_max_chars": 80,
-            "value_max_items": 8,
+            "value_string_edge_chars": 10,
+            "value_container_edge_items": 2,
+            "value_nested_container_edge_items": 1,
             "value_max_depth": 2,
-            "value_max_arguments_chars": 240,
+            "value_max_arguments": 8,
         }
         command = [
             "java",
@@ -55,10 +63,11 @@ class FullchainValueCaptureTests(unittest.TestCase):
             "-Dfltrace.test.class=valuefixture.ValueWorkload",
             "-Dfltrace.test.method=scenario",
             f"-Dfltrace.capture.values={str(capture_values).lower()}",
-            "-Dfltrace.value.max.chars=80",
-            "-Dfltrace.value.max.items=8",
+            "-Dfltrace.value.string.edge.chars=10",
+            "-Dfltrace.value.container.edge.items=2",
+            "-Dfltrace.value.nested.container.edge.items=1",
             "-Dfltrace.value.max.depth=2",
-            "-Dfltrace.value.max.arguments.chars=240",
+            "-Dfltrace.value.max.arguments=8",
             f"-javaagent:{AGENT_JAR}=class:valuefixture.ValueWorkload",
             "-cp", f"{self.classes}:{AGENT_JAR}",
             "valuefixture.ValueDriver",
@@ -76,12 +85,30 @@ class FullchainValueCaptureTests(unittest.TestCase):
         validate_trace(trace)
         return events, trace, elapsed, raw.stat().st_size, config, outcome
 
+    def run_default_limit_workload(self):
+        raw = Path(self.temp.name) / "default-limits.jsonl"
+        raw.unlink(missing_ok=True)
+        command = [
+            "java",
+            f"-Dfltrace.raw.file={raw}",
+            "-Dfltrace.test.class=valuefixture.ValueWorkload",
+            "-Dfltrace.test.method=scenario",
+            f"-javaagent:{AGENT_JAR}=class:valuefixture.ValueWorkload",
+            "-cp", f"{self.classes}:{AGENT_JAR}",
+            "valuefixture.ValueDriver",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        trace = build_trace(load_events(raw))
+        validate_trace(trace)
+        return trace
+
     def test_safe_value_protocol_and_statuses(self):
         events, trace, _, _, config, _ = self.run_workload(True)
         start = next(event for event in events if event["type"] == "TEST_START")
-        self.assertEqual(start["agent_protocol_version"], 4)
+        self.assertEqual(start["agent_protocol_version"], 5)
         self.assertEqual(start["value_capture"], config)
-        self.assertEqual(trace["schema_version"], 4)
+        self.assertEqual(trace["schema_version"], 6)
         enters = {
             event["method"]: event
             for event in events if event["type"] == "ENTER"
@@ -117,6 +144,12 @@ class FullchainValueCaptureTests(unittest.TestCase):
         self.assertEqual(exits[constructor["invocation_id"]]["return_value"]["kind"], "void")
         noop = enters["noop"]
         self.assertEqual(exits[noop["invocation_id"]]["return_value"]["kind"], "void")
+        boxed = enters["boxedVoid"]
+        self.assertEqual(boxed["descriptor"], "()Ljava/lang/Void;")
+        self.assertEqual(exits[boxed["invocation_id"]]["return_value"], {
+            "declared_type": "java.lang.Void", "runtime_type": "",
+            "kind": "null", "text": "null", "truncated": False,
+        })
         explode = enters["explode"]
         self.assertEqual(exits[explode["invocation_id"]]["type"], "THROW")
         self.assertEqual(
@@ -148,6 +181,97 @@ class FullchainValueCaptureTests(unittest.TestCase):
         self.assertGreater(captured_size, plain_size)
         self.assertGreater(captured_seconds, 0)
         self.assertGreater(plain_seconds, 0)
+
+    def test_default_limits_render_long_values_to_png(self):
+        trace = self.run_default_limit_workload()
+        self.assertEqual(trace["test_start"]["value_capture"], {
+            "capture_values": True,
+            "value_string_edge_chars": 10,
+            "value_container_edge_items": 2,
+            "value_nested_container_edge_items": 1,
+            "value_max_depth": 2,
+            "value_max_arguments": 8,
+        })
+        invocations = {
+            item["method"]: item for item in trace["invocations"]
+        }
+        bounded = invocations["boundedValues"]["arguments"]
+
+        self.assertEqual(
+            bounded["items"][0]["text"],
+            '"xxxxxxxxxx…xxxxxxxxxx"',
+        )
+        self.assertTrue(bounded["items"][0]["truncated"])
+        self.assertEqual(
+            bounded["items"][1]["text"],
+            "[0, 1, …, 8, 9]",
+        )
+        self.assertEqual(
+            bounded["items"][2]["text"],
+            "[0, 1, …, 8, 9]",
+        )
+        self.assertEqual(
+            bounded["items"][3]["text"],
+            "{0=10, 1=11, …, 8=18, 9=19}",
+        )
+        self.assertEqual(
+            bounded["items"][4]["text"],
+            "[[0, …, 4], …, [10, …, 14]]",
+        )
+        self.assertTrue(all(item["truncated"] for item in bounded["items"]))
+
+        budget = invocations["argumentBudget"]["arguments"]
+        self.assertEqual(budget["count"], 6)
+        self.assertEqual(len(budget["items"]), 6)
+        self.assertEqual(budget["omitted_count"], 0)
+        self.assertTrue(budget["truncated"])
+        self.assertTrue(all(
+            item["text"] == '"xxxxxxxxxx…xxxxxxxxxx"'
+            for item in budget["items"]
+        ))
+        many = invocations["many"]["arguments"]
+        self.assertEqual(many["count"], 9)
+        self.assertEqual(len(many["items"]), 8)
+        self.assertEqual(many["omitted_count"], 1)
+
+        execution = project_execution(
+            trace, "valuefixture.ValueWorkload", "scenario"
+        )
+        puml = make_puml(
+            execution,
+            title="Default value limits",
+            boundary_invocations=[],
+            graph_folds=[],
+            invocation_labels={
+                int(item["invocation_id"]): f"T1-C{item['invocation_id']}"
+                for item in execution["invocations"]
+            },
+            highlighted_invocation_ids=[],
+        )
+        self.assertIn('"xxxxxxxxxx…xxxxxxxxxx"', puml)
+        self.assertIn("[0, 1, …, 8, 9]", puml)
+        self.assertIn(
+            "{0=10, 1=11, …, 8=18, 9=19}",
+            puml,
+        )
+        self.assertIn("[[0, …, 4], …, [10, …, 14]]", puml)
+        self.assertNotIn("… (+2 omitted)", puml)
+        self.assertEqual(puml.count('"xxxxxxxxxx…xxxxxxxxxx"'), 7)
+        self.assertIn("… (+1 omitted)", puml)
+        self.assertIn("\\n", puml)
+
+        with tempfile.TemporaryDirectory() as directory:
+            puml_path = Path(directory) / "default-value-limits.puml"
+            png_path = puml_path.with_suffix(".png")
+            puml_path.write_text(puml, encoding="utf-8")
+            ensure_rendered(
+                puml_path,
+                png_path,
+                jar=DEFAULT_PLANTUML_JAR,
+                timeout=30,
+                limit_size=32768,
+            )
+            self.assertEqual(png_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
 if __name__ == "__main__":
     unittest.main()
