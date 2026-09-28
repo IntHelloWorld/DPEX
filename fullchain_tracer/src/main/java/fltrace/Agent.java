@@ -23,6 +23,8 @@ public final class Agent {
     private static final List<String> PREFIX = new ArrayList<String>();
     private static final String TEST_CLASS = System.getProperty("fltrace.test.class", "");
     private static final String TEST_METHOD = System.getProperty("fltrace.test.method", "");
+    private static final boolean CAPTURE_VALUES = Boolean.parseBoolean(
+            System.getProperty("fltrace.capture.values", "true"));
 
     private Agent() {}
 
@@ -99,13 +101,38 @@ public final class Agent {
                     methodName = behavior.getName();
                 }
                 String descriptor = behavior.getSignature();
-                String enter = "{ fltrace.TraceRuntime.enter(\"" + javaLiteral(className) +
-                        "\",\"" + javaLiteral(methodName) + "\",\"" +
-                        javaLiteral(descriptor) + "\", $args, $sig); }";
-                behavior.insertBefore(enter);
-                behavior.insertAfter(
-                        "{ fltrace.TraceRuntime.exitNormal(($w)$_, $type); }", false);
-                behavior.addCatch("{ fltrace.TraceRuntime.exitThrow($e); throw $e; }", throwable);
+                String identity = "\"" + javaLiteral(className) + "\",\"" +
+                        javaLiteral(methodName) + "\",\"" + javaLiteral(descriptor) + "\"";
+                String enter = CAPTURE_VALUES
+                        ? "{ try { fltrace.TraceRuntime.enter(" + identity +
+                        ", $args, $sig); " +
+                        "} catch (java.lang.Throwable fltraceIgnored) {} }"
+                        : "{ try { fltrace.TraceRuntime.enter(" + identity +
+                        ", null, null); " +
+                        "} catch (java.lang.Throwable fltraceIgnored) {} }";
+                if (behavior instanceof CtConstructor
+                        && !((CtConstructor) behavior).isClassInitializer()) {
+                    // A constructor's exception handler cannot cover the mandatory
+                    // super()/this() call.  Emit ENTER only once that call succeeds;
+                    // otherwise a delegated-constructor failure would leave a
+                    // synthetic, permanently unclosed outer invocation.
+                    ((CtConstructor) behavior).insertBeforeBody(enter);
+                } else {
+                    behavior.insertBefore(enter);
+                }
+                String exitNormal = CAPTURE_VALUES
+                        ? "{ try { fltrace.TraceRuntime.exitNormal(" + identity +
+                        ", ($w)$_, $type); " +
+                        "} catch (java.lang.Throwable fltraceIgnored) {} }"
+                        : "{ try { fltrace.TraceRuntime.exitNormal(" + identity +
+                        ", null, null); " +
+                        "} catch (java.lang.Throwable fltraceIgnored) {} }";
+                behavior.insertAfter(exitNormal, false);
+                behavior.addCatch(
+                        "{ try { fltrace.TraceRuntime.exitThrow(" + identity + ", $e); " +
+                        "} catch (java.lang.Throwable fltraceIgnored) {} throw $e; }",
+                        throwable
+                );
                 if (className.equals(TEST_CLASS) && methodName.equals(TEST_METHOD)) {
                     instrumentTestLines(behavior, className, methodName);
                 }

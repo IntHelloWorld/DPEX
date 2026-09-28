@@ -1,0 +1,36 @@
+{
+  "uml": {
+    "max_upstream_calls": 6,
+    "max_downstream_calls": 6,
+    "max_internal_calls": 10,
+    "plantuml_command": "plantuml",
+    "plantuml_limit_size": 32768
+  },
+  "trace": {
+    "archive_final_sqlite": true,
+    "degradation_raw_size_bytes": 268435456,
+    "capture_values": true,
+    "value_string_edge_chars": 10,
+    "value_container_edge_items": 2,
+    "value_nested_container_edge_items": 1,
+    "value_max_depth": 2,
+    "value_max_arguments": 8
+  },
+  "dpex": {
+    "api_style": "responses",
+    "base_url": "https://api.xxx.com/v1",
+    "api_key_env": "OPENAI_API_KEY",
+    "agent_variant": "dynamic-text",
+    "vision_model": "gpt-5.4-mini",
+    "reasoning_effort": "low",
+    "invalid_final_response_retries": 2,
+    "terminal_timeout": 30,
+    "top_k": 5,
+    "max_tokens": 16384,
+    "final_length_retry_max_tokens": 32768,
+    "retry": {
+      "max_retries": 3,
+      "backoff_s": 2
+    }
+  }
+}

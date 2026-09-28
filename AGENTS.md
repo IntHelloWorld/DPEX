@@ -2,9 +2,10 @@
 
 ## 项目结构
 
-- `mllmfl/domain/` 定义版本化 trace 和 ranking 模型及纯逻辑。
-- `mllmfl/infrastructure/` 封装 Defects4J、外部命令、文件、Java 源码和 PlantUML。
-- `mllmfl/stages/` 实现 collect、trace、uml、localize、aggregate。
+- `paper/` latex 论文项目目录。`paper/PAPER.md`中记录了论文的写作思路。
+- `dpex/domain/` 定义版本化 trace 和 ranking 模型及纯逻辑。
+- `dpex/infrastructure/` 封装 Defects4J、外部命令、文件、Java 源码和 PlantUML。
+- `dpex/stages/` 实现 collect、trace、uml、localize、aggregate。
 - `fullchain_tracer/` 是独立 Maven 字节码 agent；工具 JAR 位于 `lib/`。
 - 所有运行产物必须写入 `--root` 的 `workspace/`、`artifacts/`、`logs/`、`summaries/`。
 
@@ -14,11 +15,11 @@
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 source d4j_env.sh
-python -m mllmfl --help
+python -m dpex --help
 python -m unittest discover -s tests -v
-python -m compileall -q mllmfl
-python -m mllmfl localize --root runs/smoke --projects Chart --bugs 1 \
-  --config config/mllm.example.json --dry-run
+python -m compileall -q dpex
+python -m dpex localize --root runs/smoke --projects Chart --bugs 1 \
+  --config config/dpex.example.json --dry-run
 ```
 
 提交前执行单元测试和 `compileall`。修改外部阶段时，用单项目/bug 冒烟；Stage 5 必须先

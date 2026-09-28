@@ -2,8 +2,7 @@ package fltrace;
 
 import java.io.File;
 import java.io.FileOutputStream;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -12,6 +11,8 @@ import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 public final class TraceRuntime {
@@ -30,6 +31,8 @@ public final class TraceRuntime {
             "fltrace.value.max.arguments", 8);
     private static final AtomicLong NEXT_INVOCATION_ID = new AtomicLong(1);
     private static final AtomicLong NEXT_SEQUENCE = new AtomicLong(1);
+    private static final ConcurrentMap<Long, Frame> OPEN_FRAMES =
+            new ConcurrentHashMap<Long, Frame>();
     private static final ThreadLocal<Deque<Frame>> STACK =
             new ThreadLocal<Deque<Frame>>() {
                 @Override protected Deque<Frame> initialValue() {
@@ -45,7 +48,7 @@ public final class TraceRuntime {
     private static final List<AssertionRange> ASSERTION_RANGES = assertionRanges();
     private static final ThreadLocal<ActiveAssertion> ACTIVE_ASSERTION =
             new ThreadLocal<ActiveAssertion>();
-    private static PrintWriter OUT = null;
+    private static FileOutputStream OUT = null;
 
     private static final class Frame {
         final long invocationId;
@@ -53,6 +56,7 @@ public final class TraceRuntime {
         final String methodName;
         final String descriptor;
         final long enterNs;
+        boolean emitted;
 
         Frame(long invocationId, String className, String methodName,
               String descriptor, long enterNs) {
@@ -61,6 +65,7 @@ public final class TraceRuntime {
             this.methodName = methodName;
             this.descriptor = descriptor;
             this.enterNs = enterNs;
+            this.emitted = false;
         }
     }
 
@@ -95,12 +100,14 @@ public final class TraceRuntime {
                 File file = new File(path);
                 File parent = file.getParentFile();
                 if (parent != null) parent.mkdirs();
-                OUT = new PrintWriter(new OutputStreamWriter(
-                        new FileOutputStream(file, true), "UTF-8"), true);
+                OUT = new FileOutputStream(file, true);
                 Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
                     @Override public void run() {
                         synchronized (TraceRuntime.class) {
-                            if (OUT != null) OUT.close();
+                            try {
+                                if (OUT != null) OUT.close();
+                            } catch (Throwable ignored) {
+                            }
                         }
                     }
                 }, "fltrace-shutdown"));
@@ -143,71 +150,143 @@ public final class TraceRuntime {
 
     public static void enter(String className, String methodName, String descriptor,
                              Object[] arguments, Class<?>[] declaredTypes) {
+        Deque<Frame> stack = null;
+        Frame frame = null;
         try {
             if (OUT == null) return;
-            Deque<Frame> stack = STACK.get();
-            long parentId = stack.isEmpty() ? 0L : stack.peek().invocationId;
+            stack = STACK.get();
+            long parentId = 0L;
+            for (Frame parent : stack) {
+                if (parent.emitted && OPEN_FRAMES.containsKey(parent.invocationId)) {
+                    parentId = parent.invocationId;
+                    break;
+                }
+            }
             long invocationId = NEXT_INVOCATION_ID.getAndIncrement();
             long timestamp = System.nanoTime();
-            Frame frame = new Frame(invocationId, className, methodName, descriptor, timestamp);
-            stack.push(frame);
+            frame = new Frame(invocationId, className, methodName, descriptor, timestamp);
             String captured = CAPTURE_VALUES
                     ? ",\"arguments\":" + summarizeArguments(arguments, declaredTypes)
                     : "";
-            emit("{\"type\":\"ENTER\"" + common(timestamp) +
+            String record = "{\"type\":\"ENTER\"" + common(timestamp) +
                     ",\"invocation_id\":" + invocationId +
                     ",\"parent_id\":" + parentId +
                     ",\"class\":\"" + esc(className) + "\"" +
                     ",\"method\":\"" + esc(methodName) + "\"" +
                     ",\"descriptor\":\"" + esc(descriptor) + "\"" +
                     ",\"origin_test_line\":" + TEST_LINE.get().intValue() +
-                    captured + "}");
+                    captured + "}";
+            stack.push(frame);
+            frame.emitted = emit(record);
+            if (!frame.emitted) {
+                if (!stack.isEmpty() && stack.peek() == frame) stack.pop();
+                return;
+            }
+            OPEN_FRAMES.put(Long.valueOf(frame.invocationId), frame);
         } catch (Throwable ignored) {
+            try {
+                if (stack != null && frame != null && !frame.emitted) {
+                    stack.removeFirstOccurrence(frame);
+                }
+            } catch (Throwable cleanupIgnored) {
+            }
         }
     }
 
-    public static void exitNormal(Object value, Class<?> declaredType) {
-        exit("RETURN", null, value, declaredType);
+    public static void exitNormal(String className, String methodName, String descriptor,
+                                  Object value, Class<?> declaredType) {
+        exit(className, methodName, descriptor, "RETURN", null, value, declaredType);
     }
 
-    public static void exitThrow(Throwable error) {
-        exit("THROW", error, null, null);
+    public static void exitThrow(String className, String methodName, String descriptor,
+                                 Throwable error) {
+        exit(className, methodName, descriptor, "THROW", error, null, null);
     }
 
-    private static void exit(String type, Throwable error, Object value,
-                             Class<?> declaredType) {
+    private static void exit(String className, String methodName, String descriptor,
+                             String type, Throwable error, Object value, Class<?> declaredType) {
         try {
             if (OUT == null) return;
             Deque<Frame> stack = STACK.get();
-            if (stack.isEmpty()) return;
-            Frame frame = stack.pop();
-            long timestamp = System.nanoTime();
-            if (isTargetTest(frame)) {
-                ActiveAssertion active = ACTIVE_ASSERTION.get();
-                if (active != null) {
-                    assertionOutcome(
-                            "THROW".equals(type) ? "ASSERT_FAIL" : "ASSERT_PASS",
-                            active.range,
-                            error
-                    );
-                    ACTIVE_ASSERTION.remove();
+            Frame frame = null;
+            while (!stack.isEmpty()) {
+                Frame candidate = stack.pop();
+                if (candidate.className.equals(className)
+                        && candidate.methodName.equals(methodName)
+                        && candidate.descriptor.equals(descriptor)) {
+                    frame = candidate;
+                    break;
+                }
+                emitTraceGap(candidate, "missing exit callback before "
+                        + className + "." + methodName + descriptor);
+            }
+            if (frame == null) return;
+            if (!frame.emitted) return;
+            synchronized (frame) {
+                if (OPEN_FRAMES.get(Long.valueOf(frame.invocationId)) != frame) return;
+                long timestamp = System.nanoTime();
+                if (isTargetTest(frame)) {
+                    ActiveAssertion active = ACTIVE_ASSERTION.get();
+                    if (active != null) {
+                        assertionOutcome(
+                                "THROW".equals(type) ? "ASSERT_FAIL" : "ASSERT_PASS",
+                                active.range,
+                                error
+                        );
+                        ACTIVE_ASSERTION.remove();
+                    }
+                }
+                String extra = "";
+                if (error != null) {
+                    extra = ",\"exception_class\":\"" + esc(error.getClass().getName()) + "\"" +
+                            ",\"message\":\"" + esc(error.getMessage()) + "\"";
+                }
+                if (CAPTURE_VALUES && "RETURN".equals(type)) {
+                    extra += ",\"return_value\":" + summarizeReturn(value, declaredType);
+                }
+                if (emit("{\"type\":\"" + type + "\"" + common(timestamp) +
+                        ",\"invocation_id\":" + frame.invocationId +
+                        ",\"duration_ns\":" + Math.max(0L, timestamp - frame.enterNs) +
+                        ",\"origin_test_line\":" + TEST_LINE.get().intValue() +
+                        extra + "}")) {
+                    OPEN_FRAMES.remove(Long.valueOf(frame.invocationId), frame);
                 }
             }
-            String extra = "";
-            if (error != null) {
-                extra = ",\"exception_class\":\"" + esc(error.getClass().getName()) + "\"" +
-                        ",\"message\":\"" + esc(error.getMessage()) + "\"";
-            }
-            if (CAPTURE_VALUES && "RETURN".equals(type)) {
-                extra += ",\"return_value\":" + summarizeReturn(value, declaredType);
-            }
-            emit("{\"type\":\"" + type + "\"" + common(timestamp) +
-                    ",\"invocation_id\":" + frame.invocationId +
-                    ",\"duration_ns\":" + Math.max(0L, timestamp - frame.enterNs) +
-                    ",\"origin_test_line\":" + TEST_LINE.get().intValue() +
-                    extra + "}");
         } catch (Throwable ignored) {
         }
+    }
+
+    private static void emitTraceGap(Frame frame, String reason) {
+        if (frame == null || !frame.emitted) return;
+        synchronized (frame) {
+            if (OPEN_FRAMES.get(Long.valueOf(frame.invocationId)) != frame) return;
+            if (emitTraceGapRecord(frame, reason)) {
+                OPEN_FRAMES.remove(Long.valueOf(frame.invocationId), frame);
+            }
+        }
+    }
+
+    private static void closeTraceGaps(String reason) {
+        for (Map.Entry<Long, Frame> item : OPEN_FRAMES.entrySet()) {
+            Frame frame = item.getValue();
+            synchronized (frame) {
+                if (OPEN_FRAMES.get(item.getKey()) == frame
+                        && emitTraceGapRecord(frame, reason)) {
+                    OPEN_FRAMES.remove(item.getKey(), frame);
+                }
+            }
+        }
+        STACK.get().clear();
+    }
+
+    private static boolean emitTraceGapRecord(Frame frame, String reason) {
+        long timestamp = System.nanoTime();
+        return emit("{\"type\":\"THROW\"" + common(timestamp) +
+                ",\"invocation_id\":" + frame.invocationId +
+                ",\"duration_ns\":" + Math.max(0L, timestamp - frame.enterNs) +
+                ",\"origin_test_line\":" + TEST_LINE.get().intValue() +
+                ",\"exception_class\":\"fltrace.TraceGap\"" +
+                ",\"message\":\"" + esc(reason) + "\"}");
     }
 
     public static void testStart(String className, String methodName) {
@@ -233,6 +312,7 @@ public final class TraceRuntime {
 
     public static void testFailure(Throwable error) {
         try {
+            closeTraceGaps("missing exit callback before TEST_FAILURE");
             long timestamp = System.nanoTime();
             String exceptionClass = error == null ? "" : error.getClass().getName();
             String message = error == null ? "" : error.getMessage();
@@ -262,6 +342,7 @@ public final class TraceRuntime {
 
     public static void testEnd(boolean successful, int failureCount) {
         try {
+            closeTraceGaps("missing exit callback before TEST_END");
             ACTIVE_ASSERTION.remove();
             long timestamp = System.nanoTime();
             emit("{\"type\":\"TEST_END\"" + common(timestamp) +
@@ -332,8 +413,15 @@ public final class TraceRuntime {
         return result;
     }
 
-    private static synchronized void emit(String json) {
-        if (OUT != null) OUT.println(json);
+    private static synchronized boolean emit(String json) {
+        if (OUT == null) return false;
+        try {
+            byte[] record = (json + "\n").getBytes(StandardCharsets.UTF_8);
+            OUT.write(record);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static String summarizeArguments(Object[] values, Class<?>[] declaredTypes) {

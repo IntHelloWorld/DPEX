@@ -1,6 +1,8 @@
 package fltrace.runner;
 
 import fltrace.TraceRuntime;
+import junit.framework.TestCase;
+import junit.framework.TestSuite;
 import org.junit.runner.JUnitCore;
 import org.junit.runner.Request;
 import org.junit.runner.Result;
@@ -20,7 +22,11 @@ public class SingleTestRunner {
         JUnitCore core = new JUnitCore();
         Result result;
         try {
-            result = core.run(Request.method(cls, method));
+            if (TestCase.class.isAssignableFrom(cls)) {
+                result = core.run(TestSuite.createTest(cls, method));
+            } else {
+                result = core.run(Request.method(cls, method));
+            }
         } catch (Throwable error) {
             TraceRuntime.testFailure(error);
             TraceRuntime.testEnd(false, 1);

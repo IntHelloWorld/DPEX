@@ -1,52 +1,79 @@
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from mllmfl.domain.schemas import (
+from dpex.domain.schemas import (
     validate_localization_input,
     validate_refinement,
 )
-from mllmfl.domain.assertion_folding import fold_successful_assertions
-from mllmfl.domain.focus_viewport import plan_focus_viewport
-from mllmfl.domain.refinement_trace import (
+from dpex.domain.assertion_folding import fold_successful_assertions
+from dpex.domain.focus_viewport import plan_focus_viewport
+from dpex.domain.refinement_trace import (
     RefinementTraceTopology,
     build_method_catalog,
     build_refinement_trace,
     validate_refinement_trace,
 )
-from mllmfl.infrastructure.io import write_zstd_json
-from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.stages.refine.agent import run_agent
-from mllmfl.stages.refine.adapters import _autofl_diagnosis
-from mllmfl.stages.refine.context import (
+from dpex.infrastructure.io import write_zstd_json
+from dpex.infrastructure.layout import RunLayout
+from dpex.infrastructure.sequence_diagram import make_execution_text
+from dpex.infrastructure.trace_store import (
+    METHOD_SUMMARY_NAME,
+    TRACE_STORE_NAME,
+    SQLiteTraceTopology,
+    execution_to_store,
+    finalize_trace_store,
+)
+from dpex.stages.refine.agent import run_agent
+from dpex.stages.refine.adapters import _autofl_diagnosis
+from dpex.stages.refine.context import (
     AGENT_VARIANT_BASH_ONLY,
+    AGENT_VARIANT_DYNAMIC_TEXT,
+    AGENT_VARIANT_NO_ASSERTION_FOLDING,
+    AGENT_VARIANT_NO_VALUES,
+    AGENT_VARIANT_RAW_TRACE,
     BASH_ONLY_SYSTEM_PROMPT,
+    DYNAMIC_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     build_prompt,
     build_system_prompt,
+    refinement_agent_variant,
+    agent_variant_policy,
     selected_trace_tests,
 )
-from mllmfl.stages.refine.input import load_localization_input
-from mllmfl.stages.refine.graphs import (
+from dpex.stages.refine.input import load_localization_input
+from dpex.stages.refine.graphs import (
     EXECUTION_GRAPH_TOOL,
+    EXECUTION_TEXT_TOOL,
     FIND_METHOD_INVOCATION_ID_TOOL,
     MethodExecutionGraphs,
 )
-from mllmfl.stages.refine.parsing import (
+from dpex.stages.refine.parsing import (
     format_method_record,
     parse_model_response,
     validate_model_refinement,
 )
-from mllmfl.stages.refine.shell import (
+from dpex.stages.refine.shell import (
     BASH_TOOL,
     execute_bash,
+    source_inspection_workspace,
     validate_bash_command,
     validate_max_output_chars,
 )
-from mllmfl.stages.refine.stage import _refine_bug
-from mllmfl.infrastructure.method_location import resolve_source_method_reference
+from dpex.stages.refine.stage import (
+    NO_TRACE_SUITE_FINGERPRINT,
+    _bug_items,
+    _refine_bug,
+    _tests_without_trace,
+    refinement_viewport_configuration,
+)
+from dpex.infrastructure.method_location import (
+    java_executables,
+    resolve_source_method_reference,
+)
 
 
 def candidate() -> dict:
@@ -238,29 +265,32 @@ def write_trace_suite(
     )
     tests = []
     for test_id, test, trigger, execution, folding in pruned_entries:
-        trace = build_refinement_trace(
-            execution,
-            project=project,
-            test_id=test_id,
-            test=test,
-            method_ids=method_ids,
-            catalog_fingerprint=fingerprint,
+        execution = dict(execution)
+        execution["project"] = project
+        temporary = bug_dir / f"{test_id}.conversion"
+        temporary.mkdir(parents=True, exist_ok=True)
+        execution_to_store(
+            execution, temporary / TRACE_STORE_NAME,
+            temporary / METHOD_SUMMARY_NAME, test=test,
             assertion_folding=folding,
-            error_stack="",
-            test_output="",
+            defect_context={"error_stack": "", "test_output": ""},
         )
-        relative = f"traces/{test_id}.refinement-trace.json.zst"
-        write_zstd_json(bug_dir / relative, trace)
+        relative = f"traces/{test_id}.trace.sqlite3"
+        trace_fingerprint = finalize_trace_store(
+            temporary / TRACE_STORE_NAME, bug_dir / relative,
+            project=project, test_id=test_id, test=test,
+            method_ids=method_ids, catalog_fingerprint=fingerprint,
+        )
         tests.append({
             "test_id": test_id,
             "test": test,
             "trigger": trigger,
             "trace": relative,
-            "trace_fingerprint": trace["fingerprint"],
+            "trace_fingerprint": trace_fingerprint,
         })
     (bug_dir / "trace_suite.json").write_text(json.dumps({
         "schema": "execution-trace-suite",
-        "schema_version": 2,
+        "schema_version": 3,
         "project": project,
         "bug": bug,
         "method_catalog_fingerprint": fingerprint,
@@ -271,17 +301,87 @@ def write_trace_suite(
     return catalog, method_ids, fingerprint
 
 
-def normalized_topology(execution: dict) -> RefinementTraceTopology:
+def normalized_topology(execution: dict) -> SQLiteTraceTopology:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         write_trace_suite(root, [("T1", "p.T::test", 1, execution)])
         suite = json.loads((root / "trace_suite.json").read_text())
         trace_path = root / suite["tests"][0]["trace"]
-        from mllmfl.infrastructure.io import read_zstd_json
-        return RefinementTraceTopology.build(read_zstd_json(trace_path))
+        return SQLiteTraceTopology.open(trace_path)
 
 
 class RefinementSchemaTests(unittest.TestCase):
+    def test_bug_items_include_locator_results_without_trace_suites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = RunLayout(root / "run")
+            layout.ensure()
+            traced = layout.artifacts / "P" / "bug_1"
+            traced.mkdir(parents=True)
+            (traced / "trace_suite.json").write_text("{}", encoding="utf-8")
+            locator = root / "locator"
+            missing_trace = locator / "P" / "bug_2"
+            missing_trace.mkdir(parents=True)
+            (missing_trace / "locator_result.json").write_text(
+                "{}", encoding="utf-8"
+            )
+
+            self.assertEqual(
+                _bug_items(layout, ["P"], None, locator),
+                [("P", "1"), ("P", "2")],
+            )
+            self.assertEqual(
+                _bug_items(layout, ["P"], {"3"}, locator),
+                [("P", "3")],
+            )
+
+    @patch("dpex.stages.refine.stage.defects4j_environment")
+    @patch("dpex.stages.refine.stage.trigger_tests")
+    def test_missing_trace_uses_exported_tests_when_locator_omits_them(
+        self, export_tests, environment
+    ):
+        environment.return_value = {"PATH": "test"}
+        export_tests.return_value = ["p.T::fails", "p.T::fails"]
+
+        selected = _tests_without_trace({}, Path("workspace"))
+
+        self.assertEqual(selected, [{
+            "test_id": "T1", "test": "p.T::fails",
+        }])
+        export_tests.assert_called_once_with(
+            Path("workspace"), {"PATH": "test"}
+        )
+        export_tests.return_value = []
+        with self.assertRaisesRegex(ValueError, "no failing tests"):
+            _tests_without_trace({}, Path("workspace"))
+
+    def test_viewport_configuration_uses_json_and_cli_overrides(self):
+        config = {"uml": {
+            "max_upstream_calls": 7,
+            "max_downstream_calls": 11,
+            "max_internal_calls": 13,
+        }}
+        self.assertEqual(
+            refinement_viewport_configuration(config),
+            (7, 11, 13),
+        )
+        self.assertEqual(
+            refinement_viewport_configuration(
+                config, max_downstream_calls=5
+            ),
+            (7, 5, 13),
+        )
+        self.assertEqual(
+            refinement_viewport_configuration({"uml": {}}), (6, 6, 10)
+        )
+        for invalid in (0, -1, True, "6"):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                ValueError, "uml.max_upstream_calls must be a positive integer"
+            ):
+                refinement_viewport_configuration({
+                    "uml": {"max_upstream_calls": invalid}
+                })
+
     def test_locator_resolves_unique_generic_method_from_erased_signature(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -325,18 +425,209 @@ class RefinementSchemaTests(unittest.TestCase):
                 loaded["ranking"][0]["source_file"], "src/p/Wrapper.java"
             )
 
-    def test_system_prompt_briefly_describes_graph_tools_and_elements(self):
-        paragraphs = SYSTEM_PROMPT.split("\n\n")
-        self.assertEqual(len(paragraphs), 8)
-        self.assertIn("find_method_invocation_id", paragraphs[2])
-        self.assertIn("inspect_execution_graph", paragraphs[2])
-        self.assertIn("tests excluded by the upstream locator", paragraphs[2])
-        self.assertNotIn("offset", paragraphs[2])
-        self.assertIn("solid arrows are method calls", paragraphs[3])
-        self.assertIn("dashed arrows are returns or throws", paragraphs[3])
-        self.assertIn("invocation_id", paragraphs[3])
-        self.assertIn("omit N calls", paragraphs[3])
-        self.assertIn("exact", paragraphs[3])
+    def test_locator_resolves_generic_erasure_among_primitive_overloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            source = workspace / "src/p/Matchers.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\n"
+                "class Matchers {\n"
+                "  static int eq(int value) { return value; }\n"
+                "  static <T> T eq(T value) { return value; }\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            path = root / "input.json"
+            path.write_text(json.dumps({
+                "schema": "fault-localization-input",
+                "schema_version": 1,
+                "project": "P",
+                "bug": "1",
+                "locator": {"name": "external"},
+                "ranking": [{
+                    "candidate_id": "L001",
+                    "function": "p.Matchers.eq",
+                    "signature": "p.Matchers.eq(java.lang.Object)",
+                    "rank": 1,
+                    "reason": "generic overload",
+                    "source_file": "src/p/Matchers.java",
+                    "start_line": 4,
+                    "end_line": 4,
+                }],
+            }), encoding="utf-8")
+
+            loaded = load_localization_input(path, "P", "1", workspace)
+
+            self.assertEqual(
+                loaded["ranking"][0]["function"], "p.Matchers.eq"
+            )
+            self.assertEqual(loaded["ranking"][0]["start_line"], 4)
+
+    def test_java_executables_preserves_varargs_as_array_parameters(self):
+        methods = java_executables(
+            "package p; class Service { "
+            "void add(int index, String... values) {} "
+            "static <T> T[] merge(T[] first, T... rest) { return first; } "
+            "}"
+        )
+
+        self.assertEqual(methods[0].parameter_types, ("int", "String[]"))
+        self.assertEqual(methods[1].parameter_types, ("T[]", "T[]"))
+
+    def test_locator_resolves_generic_arrays_and_named_type_variables(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            source = workspace / "src/main/java/p/Arrays.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p; class Arrays {\n"
+                "  static int add(int[] values, int value) { return 0; }\n"
+                "  static <T> T[] add(T[] values, T value) { return values; }\n"
+                "  static <FUNC> void fit(int n, FUNC f, double[] guess) {}\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            path = root / "input.json"
+            path.write_text(json.dumps({
+                "schema": "fault-localization-input",
+                "schema_version": 1,
+                "project": "P",
+                "bug": "1",
+                "locator": {"name": "external"},
+                "ranking": [
+                    {
+                        "candidate_id": "L001",
+                        "function": "p.Arrays.add",
+                        "signature": "p.Arrays.add(java.lang.Object[], java.lang.Object)",
+                        "rank": 1,
+                        "reason": "generic array",
+                        "source_file": "src/main/java/p/Arrays.java",
+                        "start_line": 3,
+                        "end_line": 3,
+                    },
+                    {
+                        "candidate_id": "L002",
+                        "function": "p.Arrays.fit",
+                        "signature": "p.Arrays.fit(int, p.Function, double[])",
+                        "rank": 2,
+                        "reason": "bounded generic",
+                        "source_file": "src/main/java/p/Arrays.java",
+                        "start_line": 4,
+                        "end_line": 4,
+                    },
+                ],
+            }), encoding="utf-8")
+
+            loaded = load_localization_input(path, "P", "1", workspace)
+
+            self.assertEqual(
+                [item["start_line"] for item in loaded["ranking"]], [3, 4]
+            )
+
+    def test_locator_prefers_production_source_over_emulation_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            production = workspace / "src/main/java/p/Outer.java"
+            emulation = workspace / "contrib/emul/p/Outer.java"
+            for source in (production, emulation):
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(
+                    "package p; class Outer { static class Inner {\n"
+                    "  void run(String value) {}\n"
+                    "} }\n",
+                    encoding="utf-8",
+                )
+            path = root / "input.json"
+            path.write_text(json.dumps({
+                "schema": "fault-localization-input",
+                "schema_version": 1,
+                "project": "P",
+                "bug": "1",
+                "locator": {"name": "external"},
+                "ranking": [{
+                    "candidate_id": "L001",
+                    "function": "p.Outer$Inner.run",
+                    "signature": "p.Outer$Inner.run(java.lang.String)",
+                    "rank": 1,
+                    "reason": "duplicate source trees",
+                    "source_file": "src/main/java/p/Outer.java",
+                    "start_line": 2,
+                    "end_line": 2,
+                }],
+            }), encoding="utf-8")
+
+            loaded = load_localization_input(path, "P", "1", workspace)
+
+            self.assertEqual(
+                loaded["ranking"][0]["source_file"],
+                "src/main/java/p/Outer.java",
+            )
+
+    def test_dynamic_modes_share_a_runtime_evidence_prompt(self):
+        prompt = build_system_prompt(5)
+        self.assertEqual(SYSTEM_PROMPT, DYNAMIC_SYSTEM_PROMPT)
+        self.assertEqual(
+            refinement_agent_variant({"dpex": {}}),
+            AGENT_VARIANT_DYNAMIC_TEXT,
+        )
+        self.assertEqual(
+            prompt,
+            build_system_prompt(5, AGENT_VARIANT_DYNAMIC_TEXT),
+        )
+        self.assertNotEqual(
+            prompt,
+            build_system_prompt(5, AGENT_VARIANT_BASH_ONLY),
+        )
+        self.assertIn("expected to use the available dynamic-evidence tools", prompt)
+        self.assertIn("find_method_invocation_id", prompt)
+        self.assertIn("inspect_execution_graph", prompt)
+        self.assertIn("Do not rely only", prompt)
+        self.assertIn("static source review and reasoning", prompt)
+        self.assertIn("Treat dynamic evidence as diagnostic evidence", prompt)
+        self.assertIn("corrective patch", prompt)
+        self.assertIn("starting evidence, not a restriction", prompt)
+        self.assertIn("likely defect locations", prompt)
+        self.assertIn("Do not recall", prompt)
+        self.assertIn("remembered developer fixes", prompt)
+        self.assertIn("prior knowledge as unavailable", prompt)
+        self.assertNotIn("Defects4J", prompt)
+
+    def test_ablation_variants_resolve_one_explicit_policy_change(self):
+        expected = {
+            AGENT_VARIANT_NO_VALUES:
+                ("hidden", "structured-invocations", "enabled"),
+            AGENT_VARIANT_RAW_TRACE:
+                ("shown", "continuous-events", "enabled"),
+            AGENT_VARIANT_NO_ASSERTION_FOLDING:
+                ("shown", "structured-invocations", "disabled"),
+        }
+        for variant, values in expected.items():
+            with self.subTest(variant=variant):
+                self.assertEqual(
+                    refinement_agent_variant({"dpex": {"agent_variant": variant}}),
+                    variant,
+                )
+                policy = agent_variant_policy(variant)
+                self.assertEqual(
+                    (policy.value_visibility, policy.window_mode,
+                     policy.assertion_folding), values,
+                )
+                self.assertIn("In this ablation", build_system_prompt(5, variant))
+
+    def test_bash_only_uses_an_independent_static_prompt(self):
+        prompt = build_system_prompt(5, AGENT_VARIANT_BASH_ONLY)
+        self.assertEqual(
+            prompt,
+            BASH_ONLY_SYSTEM_PROMPT.replace("__TOP_K__", "5"),
+        )
+        self.assertIn("static file-reading commands only", prompt)
+        self.assertNotIn("dynamic-evidence", prompt)
+        self.assertNotIn("find_method_invocation_id", prompt)
+        self.assertNotIn("inspect_execution_graph", prompt)
 
     def test_input_source_range_must_match_buggy_java_ast(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -456,13 +747,28 @@ class RefinementSchemaTests(unittest.TestCase):
             "prompt_version": "refinement-method-lines-v1",
         }
         self.assertIs(validate_refinement(refined_v7), refined_v7)
+        dynamic_without_graph_v7 = {
+            **refined_v7,
+            "tool_rounds": 0,
+            "diagram_view_count": 0,
+            "terminal_command_count": 0,
+            "viewed_diagrams": [],
+            "inspected_candidate_ids": [],
+            "candidate_runtime_method_ids": {"L001": "M1"},
+            "inspected_invocation_ids": [],
+            "queried_methods": [],
+        }
+        self.assertIs(
+            validate_refinement(dynamic_without_graph_v7),
+            dynamic_without_graph_v7,
+        )
         bash_only_v7 = {
             **refined_v7,
             "agent_variant": "bash-only",
             "prompt_version": "refinement-method-lines-bash-only-v2",
-            "tool_rounds": 1,
+            "tool_rounds": 0,
             "diagram_view_count": 0,
-            "terminal_command_count": 1,
+            "terminal_command_count": 0,
             "viewed_diagrams": [],
             "inspected_candidate_ids": [],
             "candidate_runtime_method_ids": {},
@@ -470,9 +776,99 @@ class RefinementSchemaTests(unittest.TestCase):
             "queried_methods": [],
         }
         self.assertIs(validate_refinement(bash_only_v7), bash_only_v7)
+        refined_v8 = {
+            **refined_v7,
+            "schema_version": 8,
+            "prompt_version": "refinement-method-lines-neutral-v1",
+        }
+        self.assertIs(validate_refinement(refined_v8), refined_v8)
+        bash_only_v8 = {
+            **bash_only_v7,
+            "schema_version": 8,
+            "prompt_version": "refinement-method-lines-neutral-v1",
+        }
+        self.assertIs(validate_refinement(bash_only_v8), bash_only_v8)
+        refined_v9 = {
+            **refined_v8,
+            "schema_version": 9,
+            "prompt_version": "refinement-method-lines-neutral-v2",
+        }
+        self.assertIs(validate_refinement(refined_v9), refined_v9)
+        bash_only_v9 = {
+            **bash_only_v8,
+            "schema_version": 9,
+            "prompt_version": "refinement-method-lines-neutral-v2",
+        }
+        self.assertIs(validate_refinement(bash_only_v9), bash_only_v9)
+        refined_v10 = {
+            **refined_v9,
+            "schema_version": 10,
+            "prompt_version": "refinement-method-lines-neutral-v3",
+        }
+        self.assertIs(validate_refinement(refined_v10), refined_v10)
+        bash_only_v10 = {
+            **bash_only_v9,
+            "schema_version": 10,
+            "prompt_version": "refinement-method-lines-neutral-v3",
+        }
+        self.assertIs(validate_refinement(bash_only_v10), bash_only_v10)
+        refined_v11 = {
+            **refined_v10,
+            "schema_version": 11,
+        }
+        self.assertIs(validate_refinement(refined_v11), refined_v11)
+        dynamic_text_v11 = {
+            **refined_v11,
+            "agent_variant": "dynamic-text",
+            "diagram_view_count": 0,
+            "viewed_diagrams": [],
+        }
+        self.assertIs(validate_refinement(dynamic_text_v11), dynamic_text_v11)
+        with self.assertRaisesRegex(ValueError, "image evidence"):
+            validate_refinement({
+                **dynamic_text_v11,
+                "diagram_view_count": 1,
+                "viewed_diagrams": ["T1-M1-C1-D1"],
+            })
+        refined_v12 = {
+            **refined_v11,
+            "schema_version": 12,
+            "prompt_version": "refinement-method-lines-dynamic-v1",
+        }
+        self.assertIs(validate_refinement(refined_v12), refined_v12)
+        dynamic_text_v12 = {
+            **dynamic_text_v11,
+            "schema_version": 12,
+            "prompt_version": "refinement-method-lines-dynamic-v1",
+        }
+        self.assertIs(validate_refinement(dynamic_text_v12), dynamic_text_v12)
+        bash_only_v12 = {
+            **bash_only_v10,
+            "schema_version": 12,
+            "prompt_version": "refinement-method-lines-bash-only-v3",
+        }
+        self.assertIs(validate_refinement(bash_only_v12), bash_only_v12)
+        refined_v13 = {
+            **refined_v12,
+            "schema_version": 13,
+            "prompt_version": "refinement-method-lines-dynamic-v2",
+        }
+        self.assertIs(validate_refinement(refined_v13), refined_v13)
+        dynamic_text_v13 = {
+            **dynamic_text_v12,
+            "schema_version": 13,
+            "prompt_version": "refinement-method-lines-dynamic-v2",
+        }
+        self.assertIs(validate_refinement(dynamic_text_v13), dynamic_text_v13)
+        bash_only_v13 = {
+            **bash_only_v12,
+            "schema_version": 13,
+        }
+        self.assertIs(validate_refinement(bash_only_v13), bash_only_v13)
         with self.assertRaisesRegex(ValueError, "dynamic inspection evidence"):
             validate_refinement({
                 **bash_only_v7,
+                "tool_rounds": 1,
                 "diagram_view_count": 1,
                 "viewed_diagrams": ["T1-M1-C1-D1"],
             })
@@ -649,15 +1045,14 @@ class RefinementSchemaTests(unittest.TestCase):
             "METHOD|run|src/p/Service.java:3|first line second | detail",
         )
 
-    def test_bash_only_prompt_is_the_minimal_static_variant(self):
+    def test_bash_only_prompt_preserves_the_output_contract_without_dynamic_tools(self):
         prompt = build_system_prompt(5, AGENT_VARIANT_BASH_ONLY)
         self.assertEqual(prompt, BASH_ONLY_SYSTEM_PROMPT.replace("__TOP_K__", "5"))
-        self.assertIn("Use bash only to inspect buggy-project source", prompt)
-        self.assertIn("rg, grep, sed, cat, and find", prompt)
-        self.assertIn("Do not compile, run tests, execute project code", prompt)
-        self.assertNotIn("find_method_invocation_id", prompt)
+        self.assertNotEqual(prompt, build_system_prompt(5))
+        self.assertIn("corrective patch", prompt)
+        self.assertNotIn("execution graph", prompt.lower())
         self.assertNotIn("inspect_execution_graph", prompt)
-        self.assertNotIn("dynamic execution graph", prompt)
+        self.assertIn("METHOD|getServiceName", prompt)
 
     def test_locator_ranking_uses_agent_source_method_format(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -687,6 +1082,9 @@ class RefinementSchemaTests(unittest.TestCase):
             "METHOD|run|src/p/Service.java:4|upstream",
         )
         self.assertNotIn("p.Service.run()", locator_lines)
+        self.assertNotIn("Project: P", prompt)
+        self.assertNotIn("Bug: 1", prompt)
+        self.assertIn("Analyze the supplied buggy checkout", prompt)
 
     def test_adapts_autofl_prediction_without_using_grading_labels(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -766,6 +1164,130 @@ class RefinementSchemaTests(unittest.TestCase):
         ]}
         self.assertEqual(_autofl_diagnosis(value), "AutoFL final prediction")
 
+    def test_adapts_soapfl_result_with_visible_candidate_reasons(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            source = workspace / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n void run() {}\n void helper() {}\n}\n",
+                encoding="utf-8",
+            )
+            result_dir = root / "soapfl" / "d4j1.4.0-P-1"
+            result_dir.mkdir(parents=True)
+            (result_dir / "result.json").write_text(json.dumps({
+                "buggy_classes": ["p.Service"],
+                "buggy_methods": [
+                    {
+                        "method_name": "p.Service::run()",
+                        "score": 10,
+                        "reason": "Visible SoapFL explanation",
+                        "reasoning_content": "private reasoning",
+                    },
+                    {
+                        "method_name": "p.Service::helper()",
+                        "score": 2,
+                        "reason": "Secondary visible explanation",
+                    },
+                ],
+                "buggy_codes": {},
+            }), encoding="utf-8")
+            (result_dir / "model_messages.jsonl").write_text(
+                json.dumps({"request": {"input": [{
+                    "role": "user",
+                    "content": (
+                        "Failed tests: \n\n\"1) p.ServiceTest::fails\n"
+                        "2) p.OtherTest::breaks\n\""
+                    ),
+                }]}}) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = load_localization_input(
+                root / "soapfl", "P", "1", workspace
+            )
+
+            self.assertEqual(loaded["locator"]["name"], "SoapFL")
+            self.assertEqual(
+                [item["signature"] for item in loaded["ranking"]],
+                ["p.Service.run()", "p.Service.helper()"],
+            )
+            self.assertEqual(loaded["failing_tests"], [
+                "p.ServiceTest::fails", "p.OtherTest::breaks",
+            ])
+            self.assertEqual(
+                loaded["ranking"][0]["reason"], "Visible SoapFL explanation"
+            )
+            self.assertNotIn(
+                "private reasoning", json.dumps(loaded["ranking"])
+            )
+
+    def test_adapts_agentless_without_model_response_or_reasoning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            source = workspace / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n void run() {}\n void helper() {}\n}\n",
+                encoding="utf-8",
+            )
+            result_dir = root / "agentless" / "related_elements"
+            result_dir.mkdir(parents=True)
+            rows = [
+                {
+                    "instance_id": "P@2",
+                    "found_files": ["src/p/Other.java"],
+                    "found_related_locs": {
+                        "src/p/Other.java": ["method: Other.wrong"],
+                    },
+                },
+                {
+                    "instance_id": "P@1",
+                    "found_files": ["src/p/Service.java"],
+                    "found_related_locs": {
+                        "src/p/Service.java": [
+                            "method: Service.run", "method: Service.helper",
+                        ],
+                    },
+                    "related_loc_traj": [{
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                "The test `['p.ServiceTest.fails()', "
+                                "'p.OtherTest.breaks()']` failed."
+                            ),
+                        }],
+                        "response": "Visible Agentless localization explanation",
+                        "reasoning_content": "private reasoning",
+                    }],
+                },
+            ]
+            (result_dir / "loc_outputs.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            loaded = load_localization_input(
+                root / "agentless", "P", "1", workspace
+            )
+
+            self.assertEqual(loaded["locator"]["name"], "Agentless4Java")
+            self.assertEqual(
+                [item["signature"] for item in loaded["ranking"]],
+                ["p.Service.run()", "p.Service.helper()"],
+            )
+            self.assertEqual(loaded["failing_tests"], [
+                "p.ServiceTest::fails", "p.OtherTest::breaks",
+            ])
+            self.assertEqual(
+                loaded["ranking"][0]["reason"], "",
+            )
+            serialized = json.dumps(loaded["ranking"])
+            self.assertNotIn("Visible Agentless localization explanation", serialized)
+            self.assertNotIn("private reasoning", serialized)
+
     def test_selects_only_locator_failing_tests_in_locator_order(self):
         suite = {"tests": [
             {"test_id": "T1", "test": "p.FirstTest::fails"},
@@ -787,6 +1309,41 @@ class RefinementSchemaTests(unittest.TestCase):
 
 
 class BashToolTests(unittest.TestCase):
+    def test_source_inspection_workspace_exposes_only_java_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "workspace"
+            java = workspace / "src/main/java/p/Service.java"
+            java.parent.mkdir(parents=True)
+            java.write_text("package p; class Service {}\n", encoding="utf-8")
+            metadata = workspace / "src/changes/changes.xml"
+            metadata.parent.mkdir(parents=True)
+            metadata.write_text(
+                '<action issue="ISSUE-1">Exact fix location</action>\n',
+                encoding="utf-8",
+            )
+            (workspace / "RELEASE-NOTES.txt").write_text(
+                "Exact issue description\n", encoding="utf-8"
+            )
+            with source_inspection_workspace(workspace) as source_workspace:
+                listed = execute_bash(
+                    "find . -type f | sort", 2000, source_workspace, 5,
+                    static_only=True,
+                )
+                blocked = execute_bash(
+                    "cat src/changes/changes.xml", 2000, source_workspace, 5,
+                    static_only=True,
+                )
+                java_text = execute_bash(
+                    "cat src/main/java/p/Service.java", 2000,
+                    source_workspace, 5, static_only=True,
+                )
+        self.assertEqual(
+            listed["output"].strip(), "./src/main/java/p/Service.java"
+        )
+        self.assertFalse(blocked["ok"])
+        self.assertTrue(java_text["ok"])
+        self.assertIn("class Service", java_text["output"])
+
     def test_runs_in_project_root_and_merges_stdout_and_stderr(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
@@ -817,6 +1374,9 @@ class BashToolTests(unittest.TestCase):
     def test_tool_requires_command_and_maximum_output(self):
         parameters = BASH_TOOL["parameters"]
         self.assertEqual(BASH_TOOL["name"], "bash")
+        self.assertIn("Use this tool when", BASH_TOOL["description"])
+        self.assertIn("patch location", BASH_TOOL["description"])
+        self.assertIn("source-only", BASH_TOOL["description"])
         self.assertEqual(
             parameters["required"], ["command", "max_output_chars"]
         )
@@ -903,6 +1463,27 @@ class BashToolTests(unittest.TestCase):
 
 
 class GraphToolContractTests(unittest.TestCase):
+    def test_graph_tool_descriptions_state_purpose_and_use_conditions(self):
+        lookup = FIND_METHOD_INVOCATION_ID_TOOL["description"]
+        inspect = EXECUTION_GRAPH_TOOL["description"]
+        self.assertIn("Use this tool when", lookup)
+        self.assertIn("exact invocation_id", lookup)
+        self.assertIn("does not imply", lookup)
+        self.assertIn("Use this tool when", inspect)
+        self.assertIn("expected patch location", inspect)
+        self.assertIn("failure manifestation", inspect)
+        self.assertIn("not highlighted or presumed faulty", inspect)
+        self.assertIn("top to bottom", inspect)
+        self.assertIn("Participants are runtime classes", inspect)
+        self.assertIn("solid arrows are method calls", inspect)
+        self.assertIn("dashed arrows are returns or throws", inspect)
+        self.assertIn("test-scoped invocation_id", inspect)
+        self.assertIn("omit N calls", inspect)
+        self.assertNotIn("Defects4J", SYSTEM_PROMPT)
+        self.assertNotIn("Defects4J", BASH_TOOL["description"])
+        self.assertNotIn("Defects4J", lookup)
+        self.assertNotIn("Defects4J", inspect)
+
     def test_graph_tool_rejects_diagram_navigation(self):
         graphs = MethodExecutionGraphs.__new__(MethodExecutionGraphs)
 
@@ -924,8 +1505,8 @@ class GraphToolContractTests(unittest.TestCase):
             ])
             # Excluded tests are not part of this Agent task and their large
             # indexes must not be loaded merely to initialize the selected one.
-            (bug_dir / "traces/T2.refinement-trace.json.zst").write_bytes(
-                b"not zstd"
+            (bug_dir / "traces/T2.trace.sqlite3").write_bytes(
+                b"not sqlite"
             )
             graphs = MethodExecutionGraphs(
                 bug_dir,
@@ -984,8 +1565,7 @@ class GraphToolContractTests(unittest.TestCase):
             self.assertEqual(direct_result["invocation_id"], "T1-C3")
             self.assertEqual(set(result), {
                 "ok", "invocation_id", "visible_call_count",
-                "omitted_call_count", "has_omitted_calls",
-                "omitted_region_count", "focus_method",
+                "focus_method",
             })
             self.assertEqual(result["focus_method"], {
                 "name": "run",
@@ -998,6 +1578,92 @@ class GraphToolContractTests(unittest.TestCase):
             self.assertEqual(len(graphs._records), 1)
             self.assertEqual(image, fake_image)
             self.assertTrue(list(bug_dir.rglob("*.puml")))
+
+    def test_text_inspection_uses_the_same_viewport_without_rendering_png(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bug_dir = Path(directory)
+            execution = execution_fixture()
+            workspace = bug_dir / "workspace"
+            references = write_fixture_sources(workspace, execution)
+            write_trace_suite(bug_dir, [
+                ("T1", "p.ServiceTest::fails", 1, execution),
+            ])
+            graphs = MethodExecutionGraphs(
+                bug_dir,
+                {"uml": {}},
+                30,
+                max_upstream_calls=8,
+                max_downstream_calls=16,
+                max_internal_calls=16,
+                workspace=workspace,
+            )
+            lookup = graphs.find_invocation_ids({
+                "test_id": "T1",
+                "name": "run",
+                "line": references["p.Service.run()"],
+            })
+            invocation_id = lookup["invocations"][0]["invocation_id"]
+            with patch.object(
+                graphs, "_image_path", side_effect=AssertionError("rendered PNG")
+            ):
+                result = graphs.inspect_text({"invocation_id": invocation_id})
+
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(result["test_id"], "T1")
+            for field in (
+                "has_omitted_calls", "omitted_region_count",
+                "omitted_call_count", "execution_trace_format",
+            ):
+                self.assertNotIn(field, result)
+            self.assertIn(" CALL ", result["execution_trace"])
+            self.assertIn(" RETURN ", result["execution_trace"])
+            self.assertRegex(result["execution_trace"], r"T1-C[1-9]\d*")
+            self.assertEqual(graphs.viewed, [])
+            self.assertEqual(graphs.inspected_invocation_ids, [invocation_id])
+            self.assertEqual(list(bug_dir.rglob("*.png")), [])
+
+    def test_text_invocation_ids_can_be_reused_directly_across_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bug_dir = Path(directory)
+            execution = execution_fixture()
+            execution["invocations"][2]["exit_type"] = "THROW"
+            workspace = bug_dir / "workspace"
+            references = write_fixture_sources(workspace, execution)
+            write_trace_suite(bug_dir, [
+                ("T1", "p.ServiceTest::fails", 1, execution),
+                ("T2", "p.ServiceTest::alsoFails", 2, execution),
+            ])
+            graphs = MethodExecutionGraphs(
+                bug_dir, {"uml": {}}, 30, workspace=workspace,
+                max_upstream_calls=8, max_downstream_calls=16,
+                max_internal_calls=16,
+            )
+            for test_id in ("T1", "T2"):
+                with self.subTest(test_id=test_id):
+                    lookup = graphs.find_invocation_ids({
+                        "test_id": test_id, "name": "run",
+                        "line": references["p.Service.run()"],
+                    })
+                    self.assertTrue(lookup["ok"], lookup)
+                    focus = lookup["invocations"][0]["invocation_id"]
+                    result = graphs.inspect_text({"invocation_id": focus})
+                    self.assertTrue(result["ok"], result)
+                    trace = result["execution_trace"]
+                    labels = re.findall(r" CALL .*? \| (\S+) ", trace)
+                    self.assertIn(focus, labels)
+                    self.assertIn("TEST", labels)
+                    self.assertIn(f"throw_of={test_id}-C3", trace)
+                    self.assertNotRegex(trace, r"\bM[0-9]+-C[0-9]+\b")
+                    exits = re.findall(r"(?:return_of|throw_of)=(\S+)", trace)
+                    self.assertEqual(set(exits), set(labels))
+                    for label in labels:
+                        if label == "TEST":
+                            continue
+                        self.assertRegex(label, rf"^{test_id}-C[1-9]\d*$")
+                        following = graphs.inspect_text({"invocation_id": label})
+                        self.assertTrue(following["ok"], following)
+                        self.assertEqual(following["invocation_id"], label)
+                        self.assertEqual(following["test_id"], test_id)
 
     def test_semantic_omissions_use_regions_and_render_one_png(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1040,9 +1706,6 @@ class GraphToolContractTests(unittest.TestCase):
                 "ok": True,
                 "invocation_id": invocation_id,
                 "visible_call_count": int(entry_node["visible_call_count"]),
-                "omitted_call_count": int(entry_node["omitted_call_count"]),
-                "has_omitted_calls": True,
-                "omitted_region_count": 1,
                 "focus_method": {
                     "name": "focus",
                     "line": references["p.Service.focus()"],
@@ -1077,37 +1740,35 @@ class GraphToolContractTests(unittest.TestCase):
             self.assertNotIn("TO ", puml)
             self.assertNotIn("FROM ", puml)
             self.assertNotIn("VIEW ", puml)
+            self.assertNotIn("#C62828", puml)
+            self.assertNotIn("#FFCDD2", puml)
+            execution_text = entry_node["_execution_text"]
+            self.assertIn(" OMIT ", execution_text)
+            self.assertIn(" focus() | args=[]", execution_text)
+            self.assertRegex(execution_text, r"T1-C2 focus\(\)")
 
-    def test_refinement_trace_contains_topology_values_and_lookup_index(self):
+    def test_sqlite_refinement_trace_contains_topology_values_and_lookup_index(self):
         execution = execution_fixture()
         with tempfile.TemporaryDirectory() as directory:
             bug_dir = Path(directory)
             catalog, _, _ = write_trace_suite(bug_dir, [
                 ("T1", "p.ServiceTest::fails", 1, execution),
             ])
-            from mllmfl.infrastructure.io import read_zstd_json
-            value = read_zstd_json(
-                bug_dir / "traces/T1.refinement-trace.json.zst"
+            topology = SQLiteTraceTopology.open(
+                bug_dir / "traces/T1.trace.sqlite3"
             )
-        self.assertIs(validate_refinement_trace(value), value)
-        self.assertEqual(value["schema_version"], 2)
-        for obsolete in (
-            "execution", "default_execution", "parent_chain",
-            "thread_name", "duration_ns",
-        ):
-            self.assertNotIn(obsolete, json.dumps(value))
+            value = topology.trace
+        self.assertEqual(value["schema"], "sqlite-refinement-trace")
+        self.assertEqual(value["schema_version"], 1)
         service_id = next(
             item["method_id"] for item in catalog
             if item["signature"] == "p.Service.run()"
         )
-        occurrences = next(
-            item[1] for item in value["method_invocations"]
-            if item[0] == service_id
-        )
-        self.assertEqual(occurrences, [2, 6])
-        topology = RefinementTraceTopology.build(value)
+        occurrences = topology.method_invocations[service_id]
+        self.assertEqual(tuple(occurrences), (2, 6))
         self.assertEqual(topology.caller_signature(2), "p.Root.root()")
         self.assertEqual(topology.subtree_call_count(2), 4)
+        topology.connection.close()
 
     def test_focus_viewport_uses_independent_context_and_internal_budgets(self):
         execution = execution_fixture()
@@ -1191,6 +1852,35 @@ class GraphToolContractTests(unittest.TestCase):
             ],
         })
 
+    def test_missing_runtime_candidate_returns_actionable_correction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bug_dir = Path(directory)
+            execution = execution_fixture()
+            workspace = bug_dir / "workspace"
+            write_fixture_sources(workspace, execution)
+            absent = workspace / "src/p/Absent.java"
+            absent.parent.mkdir(parents=True, exist_ok=True)
+            absent.write_text(
+                "package p;\nclass Absent {\n  void missing() {}\n}\n",
+                encoding="utf-8",
+            )
+            write_trace_suite(bug_dir, [
+                ("T1", "p.ServiceTest::fails", 1, execution),
+            ])
+            graphs = MethodExecutionGraphs(
+                bug_dir, {"uml": {}}, 30, workspace=workspace
+            )
+            result = graphs.find_invocation_ids({
+                "test_id": "T1",
+                "name": "missing",
+                "line": "src/p/Absent.java:3",
+            })
+        self.assertFalse(result["ok"])
+        self.assertIn("exact source method is absent", result["error"])
+        self.assertIn("do not retry", result["error"])
+        self.assertIn("Use bash", result["error"])
+        self.assertIn("retain a locator candidate", result["error"])
+
     def test_graph_tools_separate_lookup_from_rendering(self):
         self.assertEqual(
             FIND_METHOD_INVOCATION_ID_TOOL["parameters"]["required"],
@@ -1205,6 +1895,118 @@ class GraphToolContractTests(unittest.TestCase):
         self.assertEqual(
             EXECUTION_GRAPH_TOOL["parameters"]["required"], ["invocation_id"]
         )
+        self.assertEqual(
+            EXECUTION_TEXT_TOOL["parameters"],
+            EXECUTION_GRAPH_TOOL["parameters"],
+        )
+
+    def test_dynamic_text_format_preserves_calls_values_and_returns(self):
+        root = {
+            "invocation_id": 1,
+            "class": "p.Test",
+            "method": "testCase",
+            "descriptor": "()V",
+            "enter_seq": 1,
+            "exit_seq": 4,
+            "exit_type": "RETURN",
+            "arguments": {
+                "count": 0, "items": [], "omitted_count": 0,
+                "truncated": False,
+            },
+            "return_value": {
+                "declared_type": "void", "runtime_type": "",
+                "kind": "void", "text": "", "truncated": False,
+            },
+        }
+        service = {
+            "invocation_id": 2,
+            "class": "p.Service",
+            "method": "foo",
+            "descriptor": "(ILp/CategoryItemRenderer;)I",
+            "enter_seq": 2,
+            "exit_seq": 3,
+            "exit_type": "RETURN",
+            "arguments": {
+                "count": 2,
+                "items": [{
+                    "index": 0, "declared_type": "int",
+                    "runtime_type": "java.lang.Integer", "kind": "number",
+                    "text": "3", "truncated": False,
+                }, {
+                    "index": 1, "declared_type": "p.CategoryItemRenderer",
+                    "runtime_type": "p.LineAndShapeRenderer", "kind": "object",
+                    "text": "<p.LineAndShapeRenderer>", "truncated": False,
+                }],
+                "omitted_count": 0,
+                "truncated": False,
+            },
+            "return_value": {
+                "declared_type": "int", "runtime_type": "java.lang.Integer",
+                "kind": "number", "text": "9", "truncated": False,
+            },
+        }
+        execution = {
+            "schema": "fullchain-execution",
+            "schema_version": 3,
+            "invocations": [root, service],
+            "calls": [{
+                "caller": "p.Test.testCase",
+                "callee": "p.Service.foo",
+                "caller_class": "p.Test",
+                "callee_class": "p.Service",
+                "callee_method": "foo",
+                "callee_descriptor": "(ILp/CategoryItemRenderer;)I",
+                "invocation_id": 2,
+                "parent_invocation_id": 1,
+                "enter_seq": 2,
+                "exit_seq": 3,
+                "exit_type": "RETURN",
+                "origin_test_line": 0,
+            }],
+        }
+
+        rendered = make_execution_text(
+            execution,
+            boundary_invocations=[root],
+            graph_folds=[],
+            invocation_labels={1: "T1-C1", 2: "T1-C2"},
+        )
+
+        self.assertEqual(rendered.splitlines(), [
+            "1 CALL external -> Test | T1-C1 testCase() | args=[]",
+            "2 CALL Test -> Service | T1-C2 foo(int, CategoryItemRenderer) | "
+            "args=[3, <LineAndShapeRenderer>]",
+            "3 RETURN Service -> Test | return_of=T1-C2 | value=9",
+            "4 RETURN Test -> external | return_of=T1-C1",
+        ])
+        hidden = make_execution_text(
+            execution,
+            boundary_invocations=[root],
+            graph_folds=[],
+            invocation_labels={1: "T1-C1", 2: "T1-C2"},
+            show_values=False,
+        )
+        self.assertNotIn("args=[3,", hidden)
+        self.assertNotIn("value=9", hidden)
+        self.assertIn("args=[<hidden-by-no-values>; count=2]", hidden)
+        self.assertIn("value=<hidden-by-no-values>", hidden)
+        self.assertIn("T1-C2", hidden)
+
+        for labels in ({1: "M1-C1", 2: "T1-C2"}, {2: "T1-C2"}):
+            with self.subTest(labels=labels):
+                with self.assertRaisesRegex(ValueError, "invocation label"):
+                    make_execution_text(
+                        execution, boundary_invocations=[root], graph_folds=[],
+                        invocation_labels=labels,
+                    )
+
+        synthetic = dict(root, invocation_id=0, synthetic=True)
+        synthetic_text = make_execution_text(
+            execution, boundary_invocations=[synthetic], graph_folds=[],
+            invocation_labels={2: "T1-C2"},
+        )
+        self.assertIn("| TEST testCase()", synthetic_text)
+        self.assertIn("return_of=TEST", synthetic_text)
 
 
 class _FakeGraphs:
@@ -1239,13 +2041,29 @@ class _FakeGraphs:
             "ok": True,
             "invocation_id": arguments["invocation_id"],
             "visible_call_count": 1,
-            "has_omitted_calls": False,
-            "omitted_region_count": 0,
             "focus_method": {
                 "name": "run",
                 "line": "src/p/Service.java:3",
             },
         }, self.image)
+
+    def inspect_text(self, arguments):
+        self.inspected_method_ids.append("M1")
+        self.inspected_invocation_ids.append(arguments["invocation_id"])
+        return {
+            "ok": True,
+            "invocation_id": arguments["invocation_id"],
+            "test_id": "T1",
+            "visible_call_count": 1,
+            "focus_method": {
+                "name": "run",
+                "line": "src/p/Service.java:3",
+            },
+            "execution_trace": (
+                "1 CALL Root -> Service | T1-C9 run() | args=[]\n"
+                "2 RETURN Service -> Root | return_of=T1-C9"
+            ),
+        }
 
     def viewed_diagram_id(self, invocation_id: str) -> str:
         return self.viewed[0]
@@ -1256,12 +2074,82 @@ class _FakeGraphs:
 
 
 class RefinementArtifactRetentionTests(unittest.TestCase):
-    @patch("mllmfl.stages.refine.stage.run_agent")
-    @patch("mllmfl.stages.refine.stage.runtime_method_ids")
-    @patch("mllmfl.stages.refine.stage.build_prompt")
-    @patch("mllmfl.stages.refine.stage.selected_trace_tests")
-    @patch("mllmfl.stages.refine.stage.MethodExecutionGraphs")
-    @patch("mllmfl.stages.refine.stage.load_localization_input")
+    @patch("dpex.stages.refine.stage.run_agent")
+    @patch("dpex.stages.refine.stage.build_prompt")
+    @patch("dpex.stages.refine.stage.MethodExecutionGraphs")
+    @patch("dpex.stages.refine.stage.load_localization_input")
+    def test_missing_trace_suite_automatically_uses_bash_only(
+        self, load_input, graph_class, prompt, agent
+    ):
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            workspace = layout.workspace_dir("P", "1")
+            workspace.mkdir(parents=True)
+            load_input.return_value = {
+                "schema": "fault-localization-input",
+                "schema_version": 1,
+                "project": "P",
+                "bug": "1",
+                "locator": {"name": "test"},
+                "failing_tests": ["p.ServiceTest::fails"],
+                "ranking": [candidate()],
+            }
+            prompt.return_value = "prompt"
+            agent.return_value = {
+                "ranking": [{
+                    "input_candidate_id": "L001",
+                    "reason": "static source evidence",
+                }],
+                "model": "test-model",
+                "agent_variant": "bash-only",
+                "prompt_version": "refinement-method-lines-bash-only-v3",
+                "inspected_method_ids": [],
+                "tool_rounds": 0,
+                "diagram_view_count": 0,
+                "viewed_diagrams": [],
+                "inspected_invocation_ids": [],
+                "queried_methods": [],
+                "terminal_command_count": 0,
+                "request_count": 1,
+                "usage": {},
+                "finalization_attempt_count": 1,
+                "final_length_retry_count": 0,
+                "final_finish_reason": "stop",
+            }
+
+            result = _refine_bug(
+                layout, "P", "1", Path("locator.json"),
+                {"dpex": {"agent_variant": "dynamic-text"}},
+                30, 1, False, True, 6, 6, 10, False,
+            )
+
+            self.assertEqual(result["status"], "OK")
+            graph_class.assert_not_called()
+            effective_config = agent.call_args.args[0]
+            self.assertEqual(
+                effective_config["dpex"]["agent_variant"], "bash-only"
+            )
+            self.assertEqual(agent.call_args.args[3], {})
+            self.assertIsNone(agent.call_args.args[4])
+            failure = prompt.call_args.args[4][0]
+            self.assertEqual(failure["test"], "p.ServiceTest::fails")
+            self.assertIn("trace collection failed", failure["error_stack"])
+            output = json.loads(
+                (layout.artifacts / "P/bug_1/refinement.json").read_text()
+            )
+            self.assertEqual(output["agent_variant"], "bash-only")
+            self.assertEqual(
+                output["suite_fingerprint"], NO_TRACE_SUITE_FINGERPRINT
+            )
+            self.assertEqual(output["candidate_runtime_method_ids"], {})
+
+    @patch("dpex.stages.refine.stage.run_agent")
+    @patch("dpex.stages.refine.stage.runtime_method_ids")
+    @patch("dpex.stages.refine.stage.build_prompt")
+    @patch("dpex.stages.refine.stage.selected_trace_tests")
+    @patch("dpex.stages.refine.stage.MethodExecutionGraphs")
+    @patch("dpex.stages.refine.stage.load_localization_input")
     def test_lean_refinement_retains_model_interaction_evidence(
         self,
         load_input,
@@ -1280,7 +2168,7 @@ class RefinementArtifactRetentionTests(unittest.TestCase):
             workspace.mkdir(parents=True)
             (bug_dir / "trace_suite.json").write_text(json.dumps({
                 "schema": "execution-trace-suite",
-                "schema_version": 2,
+                "schema_version": 3,
                 "project": "P",
                 "bug": "1",
                 "method_catalog_fingerprint": "f" * 64,
@@ -1295,7 +2183,7 @@ class RefinementArtifactRetentionTests(unittest.TestCase):
                     "test_id": "T1",
                     "test": "p.ServiceTest::fails",
                     "trigger": 1,
-                    "trace": "traces/T1.refinement-trace.json.zst",
+                    "trace": "traces/T1.trace.sqlite3",
                     "trace_fingerprint": "a" * 64,
                 }],
             }), encoding="utf-8")
@@ -1346,7 +2234,7 @@ class RefinementArtifactRetentionTests(unittest.TestCase):
                     }],
                     "model": "test-model",
                     "agent_variant": "dynamic-graph",
-                    "prompt_version": "refinement-method-lines-v1",
+                    "prompt_version": "refinement-method-lines-dynamic-v2",
                     "inspected_method_ids": ["M1"],
                     "tool_rounds": 1,
                     "diagram_view_count": 1,
@@ -1365,11 +2253,18 @@ class RefinementArtifactRetentionTests(unittest.TestCase):
 
             agent.side_effect = run_fake_agent
             result = _refine_bug(
-                layout, "P", "1", Path("locator.json"), {"mllm": {}},
+                layout, "P", "1", Path("locator.json"),
+                {"dpex": {"agent_variant": "dynamic-graph"}},
                 30, 1, False, True, 6, 6, 10, False,
             )
 
             self.assertEqual(result["status"], "OK")
+            self.assertEqual(
+                json.loads(
+                    (bug_dir / "refinement.json").read_text()
+                )["schema_version"],
+                14,
+            )
             self.assertTrue((bug_dir / "refine_conversation.jsonl").is_file())
             self.assertTrue((bug_dir / "refine_response_usage.jsonl").is_file())
             self.assertTrue(
@@ -1378,7 +2273,210 @@ class RefinementArtifactRetentionTests(unittest.TestCase):
 
 
 class RefinementAgentTests(unittest.TestCase):
-    @patch("mllmfl.stages.refine.agent._post_response")
+    @patch("dpex.stages.refine.agent._post_response")
+    def test_bash_only_agent_accepts_retained_candidate_without_bash(self, post):
+        final = (
+            "METHOD|run|src/p/Service.java:3|"
+            "the retained candidate already explains the failure"
+        )
+        post.return_value = (
+            {"role": "assistant", "content": final},
+            "vision", "resp-1", [{
+                "role": "assistant", "content": final,
+            }], {}, "stop",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n  void run() {}\n}\n",
+                encoding="utf-8",
+            )
+            result = run_agent(
+                {"dpex": {
+                    "agent_variant": "bash-only",
+                    "invalid_final_response_retries": 0,
+                }},
+                "prompt",
+                [{**candidate(), "end_line": 3}],
+                {},
+                None,
+                root,
+                30,
+                root / "refine_conversation.jsonl",
+                1,
+            )
+
+        self.assertEqual(len(post.call_args_list), 1)
+        self.assertEqual(result["ranking"][0]["input_candidate_id"], "L001")
+        self.assertEqual(result["tool_rounds"], 0)
+        self.assertEqual(result["terminal_command_count"], 0)
+
+    @patch("dpex.stages.refine.agent._post_response")
+    def test_agent_still_requires_source_inspection_for_new_method(self, post):
+        final = (
+            "METHOD|fix|src/p/Helper.java:3|"
+            "a newly discovered helper causes the bad state"
+        )
+        post.return_value = (
+            {"role": "assistant", "content": final},
+            "vision", "resp-1", [{
+                "role": "assistant", "content": final,
+            }], {}, "stop",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "src/p/Helper.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Helper {\n  void fix() {}\n}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                ValueError, "new methods require source inspection"
+            ):
+                run_agent(
+                    {"dpex": {
+                        "agent_variant": "bash-only",
+                        "invalid_final_response_retries": 0,
+                    }},
+                    "prompt",
+                    [{**candidate(), "end_line": 3}],
+                    {},
+                    None,
+                    root,
+                    30,
+                    root / "refine_conversation.jsonl",
+                    1,
+                )
+
+    @patch("dpex.stages.refine.agent._post_response")
+    def test_default_dynamic_text_agent_accepts_retained_candidate_without_tools(
+        self, post
+    ):
+        final = (
+            "METHOD|run|src/p/Service.java:3|"
+            "the retained candidate already explains the failure"
+        )
+        post.return_value = (
+            {"role": "assistant", "content": final},
+            "vision", "resp-1", [{
+                "role": "assistant", "content": final,
+            }], {}, "stop",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "graph.png"
+            image.write_bytes(b"png")
+            source = root / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n  void run() {}\n}\n",
+                encoding="utf-8",
+            )
+            result = run_agent(
+                {"dpex": {"invalid_final_response_retries": 0}},
+                "prompt",
+                [{**candidate(), "end_line": 3}],
+                {"L001": "M1"},
+                _FakeGraphs(image),
+                root,
+                30,
+                root / "refine_conversation.jsonl",
+                1,
+            )
+
+        self.assertEqual(len(post.call_args_list), 1)
+        self.assertEqual(result["agent_variant"], AGENT_VARIANT_DYNAMIC_TEXT)
+        self.assertEqual(result["ranking"][0]["input_candidate_id"], "L001")
+        self.assertEqual(result["tool_rounds"], 0)
+        self.assertEqual(result["diagram_view_count"], 0)
+        self.assertEqual(result["inspected_method_ids"], [])
+
+    @patch("dpex.stages.refine.agent._post_response")
+    def test_dynamic_text_agent_receives_trace_without_image(self, post):
+        inspect_call = {
+            "id": "call-1",
+            "type": "function",
+            "function": {
+                "name": "inspect_execution_graph",
+                "arguments": '{"invocation_id":"T1-C9"}',
+            },
+        }
+        final = (
+            "METHOD|run|src/p/Service.java:3|"
+            "the textual runtime trace identifies the bad return"
+        )
+        post.side_effect = [
+            (
+                {"role": "assistant", "content": None,
+                 "tool_calls": [inspect_call]},
+                "text-model", "resp-1", [{
+                    "role": "assistant", "content": None,
+                    "tool_calls": [inspect_call],
+                }], {}, "tool_calls",
+            ),
+            (
+                {"role": "assistant", "content": final},
+                "text-model", "resp-2", [{
+                    "role": "assistant", "content": final,
+                }], {}, "stop",
+            ),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image = root / "graph.png"
+            image.write_bytes(b"png")
+            source = root / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n  void run() {}\n}\n",
+                encoding="utf-8",
+            )
+            graphs = _FakeGraphs(image)
+            result = run_agent(
+                {"dpex": {
+                    "agent_variant": "dynamic-text",
+                    "invalid_final_response_retries": 0,
+                }},
+                "prompt",
+                [{**candidate(), "end_line": 3}],
+                {"L001": "M1"},
+                graphs,
+                root,
+                30,
+                root / "refine_conversation.jsonl",
+                1,
+            )
+            conversation = (root / "refine_conversation.jsonl").read_text()
+
+        tools = post.call_args_list[0].kwargs["tools"]
+        self.assertEqual(
+            [tool["name"] for tool in tools],
+            ["find_method_invocation_id", "inspect_execution_graph", "bash"],
+        )
+        self.assertIs(tools[1], EXECUTION_TEXT_TOOL)
+        second_input = post.call_args_list[1].args[1]
+        tool_result = next(
+            item for item in second_input if item.get("role") == "tool"
+        )
+        payload = json.loads(tool_result["content"])
+        self.assertIn("execution_trace", payload)
+        for field in (
+            "has_omitted_calls", "omitted_region_count",
+            "omitted_call_count", "execution_trace_format",
+        ):
+            self.assertNotIn(field, payload)
+        self.assertNotIn("image_ref", json.dumps(second_input))
+        self.assertNotIn("data:image", json.dumps(second_input))
+        self.assertNotIn("image_ref", conversation)
+        self.assertEqual(result["agent_variant"], "dynamic-text")
+        self.assertEqual(result["diagram_view_count"], 0)
+        self.assertEqual(result["viewed_diagrams"], [])
+        self.assertEqual(result["inspected_invocation_ids"], ["T1-C9"])
+
+    @patch("dpex.stages.refine.agent._post_response")
     def test_bash_only_agent_exposes_only_bash_and_has_no_graph_audit(self, post):
         bash_call = {
             "id": "call-1",
@@ -1420,7 +2518,7 @@ class RefinementAgentTests(unittest.TestCase):
                 encoding="utf-8",
             )
             result = run_agent(
-                {"mllm": {
+                {"dpex": {
                     "agent_variant": "bash-only",
                     "invalid_final_response_retries": 0,
                 }},
@@ -1443,7 +2541,7 @@ class RefinementAgentTests(unittest.TestCase):
         self.assertEqual(result["viewed_diagrams"], [])
         self.assertEqual(result["inspected_method_ids"], [])
 
-    @patch("mllmfl.stages.refine.agent._post_response")
+    @patch("dpex.stages.refine.agent._post_response")
     def test_empty_length_final_retries_same_request_with_larger_limit(self, post):
         inspect_call = {
             "id": "call-1",
@@ -1497,7 +2595,7 @@ class RefinementAgentTests(unittest.TestCase):
                 encoding="utf-8",
             )
             result = run_agent(
-                {"mllm": {
+                {"dpex": {
                     "invalid_final_response_retries": 0,
                     "max_tokens": 16384,
                     "final_length_retry_max_tokens": 32768,
@@ -1537,7 +2635,7 @@ class RefinementAgentTests(unittest.TestCase):
             [16384, 16384, 32768],
         )
 
-    @patch("mllmfl.stages.refine.agent._post_response")
+    @patch("dpex.stages.refine.agent._post_response")
     def test_empty_non_length_final_does_not_raise_token_limit(self, post):
         inspect_call = {
             "id": "call-1", "type": "function",
@@ -1576,7 +2674,7 @@ class RefinementAgentTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "response content is empty"):
                 run_agent(
-                    {"mllm": {
+                    {"dpex": {
                         "invalid_final_response_retries": 0,
                         "max_tokens": 16384,
                         "final_length_retry_max_tokens": 32768,
@@ -1595,7 +2693,7 @@ class RefinementAgentTests(unittest.TestCase):
             [16384, 16384],
         )
 
-    @patch("mllmfl.stages.refine.agent._post_response")
+    @patch("dpex.stages.refine.agent._post_response")
     def test_agent_finds_occurrences_then_opens_one_and_returns_subset(self, post):
         find_call = {
             "id": "call-1",
@@ -1668,7 +2766,10 @@ class RefinementAgentTests(unittest.TestCase):
             graphs = _FakeGraphs(image)
             input_candidate = {**candidate(), "end_line": 3}
             result = run_agent(
-                {"mllm": {"invalid_final_response_retries": 0}},
+                {"dpex": {
+                    "agent_variant": "dynamic-graph",
+                    "invalid_final_response_retries": 0,
+                }},
                 "prompt",
                 [input_candidate],
                 {"L001": "M1"},
@@ -1712,7 +2813,7 @@ class RefinementAgentTests(unittest.TestCase):
         self.assertEqual(third_input[-1]["content"][0]["type"], "image_url")
         self.assertNotIn("data:image", conversation)
 
-    @patch("mllmfl.stages.refine.agent._post_response")
+    @patch("dpex.stages.refine.agent._post_response")
     def test_agent_accepts_retained_candidate_without_inspecting_its_graph(
         self, post
     ):
@@ -1756,7 +2857,7 @@ class RefinementAgentTests(unittest.TestCase):
                 encoding="utf-8",
             )
             result = run_agent(
-                {"mllm": {"invalid_final_response_retries": 0}},
+                {"dpex": {"invalid_final_response_retries": 0}},
                 "prompt",
                 [
                     {**candidate(), "end_line": 3},

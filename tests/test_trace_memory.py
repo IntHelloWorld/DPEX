@@ -6,11 +6,11 @@ import sys
 import tempfile
 import unittest
 
-from mllmfl.domain.trace import build_trace, validate_trace
-from mllmfl.domain.trace import project_execution
-from mllmfl.domain.assertion_folding import fold_successful_assertions
-from mllmfl.domain.refinement_trace import build_method_catalog, build_refinement_trace
-from mllmfl.infrastructure.limited_process import run_limited
+from dpex.domain.trace import build_trace, validate_trace
+from dpex.domain.trace import project_execution
+from dpex.domain.assertion_folding import fold_successful_assertions
+from dpex.domain.refinement_trace import build_method_catalog, build_refinement_trace
+from dpex.infrastructure.limited_process import run_limited
 from tests.test_trace_domain import v5_events
 
 

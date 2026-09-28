@@ -6,14 +6,14 @@ import time
 import unittest
 from pathlib import Path
 
-from mllmfl.domain.trace import (
+from dpex.domain.trace import (
     build_trace,
     load_events,
     project_execution,
     validate_trace,
 )
-from mllmfl.infrastructure.plantuml import DEFAULT_PLANTUML_JAR, ensure_rendered
-from mllmfl.infrastructure.sequence_diagram import make_puml
+from dpex.infrastructure.plantuml import DEFAULT_PLANTUML_JAR, ensure_rendered
+from dpex.infrastructure.sequence_diagram import make_puml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +34,12 @@ class FullchainValueCaptureTests(unittest.TestCase):
                 "-d", str(cls.classes),
                 str(FIXTURES / "ValueWorkload.java"),
                 str(FIXTURES / "ValueDriver.java"),
+                str(FIXTURES / "StackOverflowWorkload.java"),
+                str(FIXTURES / "StackOverflowDriver.java"),
+                str(FIXTURES / "JUnit3SelectionTest.java"),
+                str(FIXTURES / "ConstructorFailureWorkload.java"),
+                str(FIXTURES / "ConstructorFailureDriver.java"),
+                str(FIXTURES / "TraceGapDriver.java"),
             ],
             check=True,
             capture_output=True,
@@ -181,6 +187,119 @@ class FullchainValueCaptureTests(unittest.TestCase):
         self.assertGreater(captured_size, plain_size)
         self.assertGreater(captured_seconds, 0)
         self.assertGreater(plain_seconds, 0)
+
+    def test_stack_overflow_keeps_jsonl_and_parent_links_complete(self):
+        raw = Path(self.temp.name) / "stack-overflow.jsonl"
+        raw.unlink(missing_ok=True)
+        command = [
+            "java",
+            "-Xss256k",
+            f"-Dfltrace.raw.file={raw}",
+            "-Dfltrace.test.class=overflowfixture.StackOverflowWorkload",
+            "-Dfltrace.test.method=recurse",
+            f"-javaagent:{AGENT_JAR}=class:overflowfixture.StackOverflowWorkload",
+            "-cp", f"{self.classes}:{AGENT_JAR}",
+            "overflowfixture.StackOverflowDriver",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("STACK_OVERFLOW_RECORDED", result.stdout)
+        self.assertNotIn("STACK_OVERFLOW_TOP=fltrace.TraceRuntime", result.stdout)
+        self.assertNotIn("fltrace-shutdown", result.stderr)
+        self.assertNotIn("NoSuchMethodError", result.stderr)
+        self.assertTrue(raw.read_bytes().endswith(b"\n"))
+
+        events = load_events(raw)
+        enter_ids = {
+            event["invocation_id"]
+            for event in events if event["type"] == "ENTER"
+        }
+        self.assertTrue(enter_ids)
+        self.assertTrue(all(
+            not event.get("parent_id") or event["parent_id"] in enter_ids
+            for event in events if event["type"] == "ENTER"
+        ))
+        self.assertTrue(all(
+            event["invocation_id"] in enter_ids
+            for event in events if event["type"] in {"RETURN", "THROW"}
+        ))
+        trace = build_trace(events)
+        validate_trace(trace)
+
+    def test_single_test_runner_selects_one_junit3_method(self):
+        raw = Path(self.temp.name) / "junit3-selection.jsonl"
+        raw.unlink(missing_ok=True)
+        command = [
+            "java",
+            f"-Dfltrace.raw.file={raw}",
+            "-Dfltrace.test.class=valuefixture.JUnit3SelectionTest",
+            "-Dfltrace.test.method=testSelected",
+            f"-javaagent:{AGENT_JAR}=class:valuefixture.JUnit3SelectionTest",
+            "-cp", f"{self.classes}:{AGENT_JAR}",
+            "fltrace.runner.SingleTestRunner",
+            "valuefixture.JUnit3SelectionTest",
+            "testSelected",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("Run count: 1", result.stdout)
+        self.assertIn("Failure count: 1", result.stdout)
+        self.assertIn("selected failure", result.stdout)
+        self.assertNotIn("unselected test ran", result.stdout)
+
+    def test_delegating_constructor_failure_has_no_unclosed_outer_enter(self):
+        raw = Path(self.temp.name) / "constructor-failure.jsonl"
+        raw.unlink(missing_ok=True)
+        command = [
+            "java",
+            f"-Dfltrace.raw.file={raw}",
+            "-Dfltrace.test.class=valuefixture.ConstructorFailureWorkload",
+            "-Dfltrace.test.method=scenario",
+            f"-javaagent:{AGENT_JAR}=class:valuefixture.ConstructorFailureWorkload",
+            "-cp", f"{self.classes}:{AGENT_JAR}",
+            "valuefixture.ConstructorFailureDriver",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CONSTRUCTOR_FAILURE_RECORDED", result.stdout)
+
+        events = load_events(raw)
+        constructors = [
+            event for event in events
+            if event.get("type") == "ENTER" and event.get("method") == "<init>"
+        ]
+        self.assertEqual(len(constructors), 1)
+        self.assertEqual(constructors[0]["descriptor"], "(Z)V")
+        trace = build_trace(events)
+        validate_trace(trace)
+
+    def test_missing_exit_callbacks_are_closed_as_explicit_trace_gaps(self):
+        raw = Path(self.temp.name) / "trace-gaps.jsonl"
+        raw.unlink(missing_ok=True)
+        command = [
+            "java",
+            f"-Dfltrace.raw.file={raw}",
+            "-Dfltrace.test.class=valuefixture.TraceGapDriver",
+            "-Dfltrace.test.method=scenario",
+            "-cp", f"{self.classes}:{AGENT_JAR}",
+            "valuefixture.TraceGapDriver",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("TRACE_GAPS_RECORDED", result.stdout)
+
+        events = load_events(raw)
+        trace = build_trace(events)
+        validate_trace(trace)
+        by_method = {
+            item["method"]: item for item in trace["invocations"]
+        }
+        self.assertEqual(by_method["outer"]["exit_type"], "RETURN")
+        for method in ("inner", "leftOpen", "workerLeftOpen"):
+            self.assertEqual(by_method[method]["exit_type"], "THROW")
+            self.assertEqual(
+                by_method[method]["exception_class"], "fltrace.TraceGap"
+            )
 
     def test_default_limits_render_long_values_to_png(self):
         trace = self.run_default_limit_workload()

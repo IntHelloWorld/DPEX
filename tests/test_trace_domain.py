@@ -5,25 +5,35 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from mllmfl.domain.trace import build_trace, load_events, project_execution, validate_trace
-from mllmfl.domain.assertion_folding import (
+from dpex.domain.trace import build_trace, load_events, project_execution, validate_trace
+from dpex.domain.assertion_folding import (
     fold_successful_assertions,
     validate_assertion_folding,
 )
-from mllmfl.stages.trace import (
-    TRACE_WORK_NAME,
+from dpex.stages.trace import (
     _suite_only_targets,
+    _write_trace_provenance,
     _write_trace_suites,
     archive_failed_raw_trace,
     assertion_range_argument,
     classpath_has_class,
     java_xml_compatibility_arguments,
+    load_trace_archive_configuration,
     load_trace_configuration,
+    DEFAULT_DEGRADATION_RAW_SIZE_BYTES,
     run as run_trace,
 )
-from mllmfl.domain.refinement_trace import validate_refinement_trace
-from mllmfl.infrastructure.io import read_zstd_json, write_zstd_json
-from mllmfl.infrastructure.layout import RunLayout
+from dpex.domain.refinement_trace import validate_refinement_trace
+from dpex.infrastructure.io import read_zstd_json, write_zstd_json
+from dpex.infrastructure.layout import RunLayout
+from dpex.infrastructure.trace_store import (
+    METHOD_SUMMARY_NAME,
+    TRACE_STORE_NAME,
+    SQLiteTraceTopology,
+    execution_to_store,
+    final_trace_archive_path,
+)
+from dpex.domain.schemas import validate_trace_suite
 
 
 def events(exit_type="RETURN"):
@@ -115,10 +125,34 @@ class EventParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
             path.write_text(json.dumps({"trace": expected}), encoding="utf-8")
-            self.assertEqual(load_trace_configuration(path), expected)
+            self.assertEqual(load_trace_configuration(path), {
+                **expected,
+                "degradation_raw_size_bytes": DEFAULT_DEGRADATION_RAW_SIZE_BYTES,
+                "retry_without_values_on_timeout": True,
+            })
+            self.assertFalse(load_trace_archive_configuration(path))
+            path.write_text(json.dumps({"trace": {
+                **expected, "archive_final_sqlite": True,
+            }}), encoding="utf-8")
+            self.assertEqual(load_trace_configuration(path), {
+                **expected,
+                "degradation_raw_size_bytes": DEFAULT_DEGRADATION_RAW_SIZE_BYTES,
+                "retry_without_values_on_timeout": True,
+            })
+            self.assertTrue(load_trace_archive_configuration(path))
+            path.write_text(json.dumps({"trace": {
+                **expected, "archive_final_sqlite": "yes",
+            }}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be boolean"):
+                load_trace_configuration(path)
+            path.write_text(json.dumps({"trace": {
+                **expected, "retry_without_values_on_timeout": "yes",
+            }}), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "must be boolean"):
+                load_trace_configuration(path)
             invalid = {**expected, "value_max_arguments_chars": 480}
             path.write_text(json.dumps({"trace": invalid}), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "exactly"):
+            with self.assertRaisesRegex(ValueError, "must contain"):
                 load_trace_configuration(path)
 
     def test_finds_a_compiled_class_on_directory_classpath(self):
@@ -289,6 +323,78 @@ class EventParsingTests(unittest.TestCase):
 
 
 class ExecutionProjectionTests(unittest.TestCase):
+    def test_trace_suite_accepts_per_trigger_capture_timeout_fallback(self):
+        capture = {
+            "capture_values": True,
+            "value_string_edge_chars": 10,
+            "value_container_edge_items": 2,
+            "value_nested_container_edge_items": 1,
+            "value_max_depth": 2,
+            "value_max_arguments": 8,
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            layout = RunLayout(Path(directory))
+            layout.ensure()
+            grouped = {("P", "1"): []}
+            for index, capture_values in enumerate((True, False), 1):
+                trigger = layout.trigger_dir("P", "1", index)
+                trigger.mkdir(parents=True)
+                trace = build_trace(v5_events(capture_values))
+                execution = project_execution(trace, "p.Test", "testCase")
+                execution.update({"project": "P", "process_exit_code": 1})
+                pruned, folding = fold_successful_assertions(execution)
+                execution_to_store(
+                    pruned,
+                    trigger / TRACE_STORE_NAME,
+                    trigger / METHOD_SUMMARY_NAME,
+                    test="p.Test::testCase",
+                    assertion_folding=folding,
+                    defect_context={
+                        "schema": "defect-context",
+                        "schema_version": 1,
+                        "test": "p.Test::testCase",
+                        "error_stack": "AssertionError",
+                        "test_output": "failed",
+                    },
+                )
+                effective = {**capture, "capture_values": capture_values}
+                _write_trace_provenance(
+                    trigger,
+                    requested_capture=capture,
+                    effective_capture=effective,
+                    capture_attempt_count=1 if capture_values else 2,
+                    fallback_reason=None if capture_values else "capture_timeout",
+                    storage_mode="normal" if capture_values else "degraded",
+                )
+                grouped[("P", "1")].append(
+                    ("P", "1", str(index), trigger)
+                )
+            _write_trace_suites(
+                layout,
+                grouped,
+                trace_config={
+                    **capture,
+                    "degradation_raw_size_bytes": (
+                        DEFAULT_DEGRADATION_RAW_SIZE_BYTES
+                    ),
+                    "retry_without_values_on_timeout": True,
+                },
+                retain_debug_artifacts=True,
+            )
+            summary = json.loads((
+                layout.artifacts / "P/bug_1/trace_suite_summary.json"
+            ).read_text())
+            self.assertEqual(
+                [item["capture_values"] for item in summary["tests"]],
+                [True, False],
+            )
+            self.assertEqual(
+                summary["tests"][1]["fallback_reason"], "capture_timeout"
+            )
+            self.assertEqual(
+                len(_suite_only_targets(layout, ["P"], {"1"}, None)), 2
+            )
+
     def test_trace_suite_consolidates_one_lean_normalized_trace(self):
         execution = project_execution(build_trace(events()), "p.Test", "testCase")
         execution.update({"project": "P", "process_exit_code": 1})
@@ -308,23 +414,32 @@ class ExecutionProjectionTests(unittest.TestCase):
             ]
             for path in legacy_duplicates:
                 path.write_text("obsolete")
-            write_zstd_json(trigger / TRACE_WORK_NAME, {
-                "schema": "refinement-trace-work",
-                "schema_version": 2,
-                "test": "p.Test::testCase",
-                "execution": pruned,
-                "assertion_folding": folding,
-                "defect_context": {
+            execution_to_store(
+                pruned, trigger / TRACE_STORE_NAME,
+                trigger / METHOD_SUMMARY_NAME,
+                test="p.Test::testCase", assertion_folding=folding,
+                defect_context={
                     "schema": "defect-context",
                     "schema_version": 1,
                     "test": "p.Test::testCase",
                     "error_stack": "AssertionError",
                     "test_output": "failed",
                 },
-            })
+            )
             grouped = {("P", "1"): [("P", "1", "1", trigger)]}
             _write_trace_suites(
-                layout, grouped, retain_debug_artifacts=False
+                layout, grouped,
+                trace_config={
+                    "capture_values": False,
+                    "value_string_edge_chars": 10,
+                    "value_container_edge_items": 2,
+                    "value_nested_container_edge_items": 1,
+                    "value_max_depth": 2,
+                    "value_max_arguments": 8,
+                    "degradation_raw_size_bytes": DEFAULT_DEGRADATION_RAW_SIZE_BYTES,
+                },
+                retain_debug_artifacts=False,
+                archive_final_sqlite=True,
             )
             suite = json.loads((
                 layout.artifacts / "P/bug_1/trace_suite.json"
@@ -332,11 +447,51 @@ class ExecutionProjectionTests(unittest.TestCase):
             trace_path = (
                 layout.artifacts / "P/bug_1" / suite["tests"][0]["trace"]
             )
-            trace = validate_refinement_trace(read_zstd_json(trace_path))
-            self.assertEqual(suite["schema_version"], 2)
+            self.assertFalse(trace_path.exists())
+            self.assertTrue(final_trace_archive_path(trace_path).is_file())
+            validate_trace_suite(suite, trace_path.parent.parent)
+            topology = SQLiteTraceTopology.open(trace_path)
+            trace = topology.trace
+            self.assertEqual(suite["schema_version"], 3)
+            suite_summary = json.loads((
+                layout.artifacts / "P/bug_1/trace_suite_summary.json"
+            ).read_text())
+            self.assertEqual(suite_summary["schema_version"], 3)
+            self.assertEqual(
+                suite_summary["tests"][0]["capture_attempt_count"], 1
+            )
+            legacy_summary = {
+                **suite_summary,
+                "schema_version": 2,
+                "trace_config": {
+                    key: value
+                    for key, value in suite_summary["trace_config"].items()
+                    if key != "retry_without_values_on_timeout"
+                },
+                "tests": [{
+                    key: value
+                    for key, value in item.items()
+                    if key in {"test_id", "trace_fingerprint", "call_count"}
+                } for item in suite_summary["tests"]],
+            }
+            summary_path = (
+                layout.artifacts / "P/bug_1/trace_suite_summary.json"
+            )
+            summary_path.write_text(json.dumps(legacy_summary))
+            self.assertEqual(
+                len(_suite_only_targets(layout, ["P"], {"1"}, None)), 1
+            )
+            summary_path.write_text(json.dumps(suite_summary))
+            self.assertEqual(
+                {key: suite_summary["trace_config"][key] for key in trace["capture"]},
+                trace["capture"],
+            )
+            self.assertEqual(suite_summary["tests"][0]["call_count"], 1)
             self.assertEqual(trace["failure"]["error_stack"], "AssertionError")
             self.assertEqual(trace["call_count"], 1)
-            self.assertFalse((trigger / TRACE_WORK_NAME).exists())
+            topology.close()
+            self.assertFalse(any(trace_path.parent.glob("*.materializing")))
+            self.assertFalse((trigger / TRACE_STORE_NAME).exists())
             self.assertFalse((trigger / "collect.json").exists())
             self.assertFalse((trigger / "trigger_test.txt").exists())
             self.assertFalse(any(path.exists() for path in legacy_duplicates))
@@ -354,6 +509,12 @@ class ExecutionProjectionTests(unittest.TestCase):
             self.assertEqual(recovered[0][0:3], ("P", "1", "1"))
             self.assertEqual(recovered[0][4], "p.Test::testCase")
             self.assertEqual(recovered[0][5]["call_count"], 1)
+            # Suite discovery is deliberately metadata-only and never opens
+            # the large final trace payload.
+            trace_path.write_bytes(b"not-a-zstd-stream")
+            self.assertEqual(
+                len(_suite_only_targets(layout, ["P"], {"1"}, None)), 1
+            )
 
             agent_jar = layout.root / "agent.jar"
             agent_jar.write_bytes(b"jar")
@@ -370,35 +531,44 @@ class ExecutionProjectionTests(unittest.TestCase):
 
             def retrace(*args, **kwargs):
                 output = args[1]
-                self.assertEqual(args[8], trace_config)
+                self.assertEqual(args[8], {
+                    **trace_config,
+                    "degradation_raw_size_bytes": DEFAULT_DEGRADATION_RAW_SIZE_BYTES,
+                    "retry_without_values_on_timeout": True,
+                })
                 self.assertEqual(
                     (output / "trigger_test.txt").read_text().strip(),
                     "p.Test::testCase",
                 )
                 self.assertFalse((output / "collect.json").exists())
-                work = {
-                    "schema": "refinement-trace-work",
-                    "schema_version": 2,
-                    "test": "p.Test::testCase",
-                    "execution": pruned,
-                    "assertion_folding": folding,
-                    "defect_context": {
+                execution_to_store(
+                    pruned, output / TRACE_STORE_NAME,
+                    output / METHOD_SUMMARY_NAME,
+                    test="p.Test::testCase", assertion_folding=folding,
+                    defect_context={
                         "schema": "defect-context",
                         "schema_version": 1,
                         "test": "p.Test::testCase",
                         "error_stack": "AssertionError",
                         "test_output": "failed",
                     },
-                }
-                write_zstd_json(output / TRACE_WORK_NAME, work)
-                return {"call_count": work["execution"]["call_count"]}
+                )
+                _write_trace_provenance(
+                    output,
+                    requested_capture=trace_config,
+                    effective_capture={**trace_config, "capture_values": False},
+                    capture_attempt_count=2,
+                    fallback_reason="capture_timeout",
+                    storage_mode="degraded",
+                )
+                return {"call_count": pruned["call_count"]}
 
             with (
                 patch(
-                    "mllmfl.stages.trace.defects4j_environment",
+                    "dpex.stages.trace.defects4j_environment",
                     return_value={},
                 ),
-                patch("mllmfl.stages.trace.trace_trigger", side_effect=retrace),
+                patch("dpex.stages.trace.trace_trigger", side_effect=retrace),
             ):
                 rerun = run_trace(
                     layout, ["P"], {"1"}, None, agent_jar,

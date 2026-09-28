@@ -2,8 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.stages import cleanup
+from dpex.infrastructure.layout import RunLayout
+from dpex.stages import cleanup
 
 
 class CleanupTests(unittest.TestCase):

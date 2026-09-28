@@ -15,6 +15,16 @@ SPEC.loader.exec_module(batch)
 
 
 class ClosureBatchTests(unittest.TestCase):
+    def test_workers_default_comes_from_batch_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.json'
+            config.write_text(json.dumps({'batch': {'workers': 30}}))
+            self.assertEqual(batch.configured_workers(config), 30)
+            for value in (0, True, '30'):
+                config.write_text(json.dumps({'batch': {'workers': value}}))
+                with self.assertRaises(ValueError):
+                    batch.configured_workers(config)
+
     def test_rejects_corrupt_or_mismatched_worker_result(self):
         with tempfile.TemporaryDirectory() as directory:
             layout = batch.RunLayout(Path(directory))
@@ -61,10 +71,15 @@ class ClosureBatchTests(unittest.TestCase):
             root = Path(directory)
             self.fixture(root, ['Closure_1', 'Closure_2', 'Closure_3'])
             config = root / 'config.json'
-            config.write_text(json.dumps({'mllm': {
-                'vision_model': 'deepseek-v4-flash-vision-exp', 'api_key_env': 'BATCH_TEST_KEY',
+            config.write_text(json.dumps({'dpex': {
+                'vision_model': 'deepseek-flash', 'api_key_env': 'BATCH_TEST_KEY',
+            }, 'uml': {
+                'max_upstream_calls': 4,
+                'max_downstream_calls': 4,
+                'max_internal_calls': 6,
             }}))
             calls = []
+            viewport_calls = []
 
             def fake_collect(*args, **kwargs):
                 bug = args[1]
@@ -73,6 +88,7 @@ class ClosureBatchTests(unittest.TestCase):
             def fake_refine(*args):
                 bug, dry_run = args[2], args[7]
                 calls.append((bug, dry_run))
+                viewport_calls.append(args[9:12])
                 if bug == '3':
                     raise TimeoutError('simulated request timeout')
                 return {'status': 'ERROR' if bug == '2' else ('DRY_RUN' if dry_run else 'OK')}
@@ -90,6 +106,13 @@ class ClosureBatchTests(unittest.TestCase):
             state = json.loads((root / 'run/summaries/batch_status.json').read_text())
             self.assertEqual(state['counts'], {'OK': 1, 'ERROR': 2})
             self.assertEqual(state['phase'], 'COMPLETED_WITH_ERRORS')
+            self.assertEqual(state['viewport'], {
+                'max_upstream_calls': 4,
+                'max_downstream_calls': 4,
+                'max_internal_calls': 6,
+            })
+            self.assertTrue(viewport_calls)
+            self.assertEqual(set(viewport_calls), {(4, 4, 6)})
 
 
 if __name__ == '__main__':

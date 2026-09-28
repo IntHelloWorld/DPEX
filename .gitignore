@@ -29,7 +29,6 @@ fullchain_tracer/target/
 
 # Local export archives
 *.tar
-*.tar.gz
 *.zip
 
 # Others
@@ -37,3 +36,9 @@ reproduce/
 benchmark/
 paper/
 .vscode/
+scripts/
+tmp/
+paper/
+figures/
+results/
+AGENTS.md

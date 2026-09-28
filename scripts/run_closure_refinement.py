@@ -20,11 +20,12 @@ import time
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from mllmfl.infrastructure.layout import RunLayout
-from mllmfl.infrastructure.io import write_csv
-from mllmfl.infrastructure.limited_process import run_limited
-from mllmfl.stages.refine.adapters import _autofl_predictions
-from mllmfl.stages.refine.stage import _refine_bug
+from dpex.infrastructure.layout import RunLayout
+from dpex.infrastructure.io import read_json, write_csv
+from dpex.infrastructure.limited_process import run_limited
+from dpex.domain.schemas import validate_trace_suite
+from dpex.stages.refine.adapters import _autofl_predictions
+from dpex.stages.refine.stage import _refine_bug, refinement_viewport_configuration
 
 
 def now():
@@ -58,12 +59,23 @@ def load_inputs(source, selected=None):
     return bugs
 
 
+def configured_workers(config_path):
+    document = json.loads(config_path.read_text())
+    batch = document.get('batch', {})
+    if not isinstance(batch, dict):
+        raise ValueError('config batch must be a JSON object')
+    workers = batch.get('workers', 30)
+    if not isinstance(workers, int) or isinstance(workers, bool) or workers < 1:
+        raise ValueError('config batch.workers must be a positive integer')
+    return workers
+
+
 def collect_isolated(layout, bug, config_path, args):
     log_dir = layout.stage_log_dir('collect', 'Closure', bug)
     log_dir.mkdir(parents=True, exist_ok=True)
     result_path = log_dir / 'worker_result.json'
     result_path.unlink(missing_ok=True)
-    command = [sys.executable, '-m', 'mllmfl.infrastructure.collect_worker',
+    command = [sys.executable, '-m', 'dpex.infrastructure.collect_worker',
                '--root', str(layout.root), '--config', str(config_path),
                '--project', 'Closure', '--bug', bug, '--timeout', str(args.timeout),
                '--address-space-bytes', str(args.collect_memory_gib * 1024 ** 3),
@@ -91,11 +103,20 @@ def collect_isolated(layout, bug, config_path, args):
 
 
 def main():
+    config_parser = argparse.ArgumentParser(add_help=False)
+    config_parser.add_argument(
+        '--config', type=Path,
+        default=REPO / 'config/dpex.deepseek-flash.local.json',
+    )
+    config_args, _ = config_parser.parse_known_args()
+    default_workers = configured_workers(config_args.config)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=REPO / 'runs/autofl-refine-deepseek-closure-all-standard-20260908')
     parser.add_argument('--locator-results', type=Path, default=REPO / 'reproduce/AutoFL-D4J/results/closure-all-standard-20260908')
-    parser.add_argument('--config', type=Path, default=REPO / 'config/mllm.deepseek-v4-flash-vision-exp.local.json')
-    parser.add_argument('--workers', type=int, default=10)
+    parser.add_argument('--trace-root', type=Path,
+                        help='existing run root whose trace suites are read directly')
+    parser.add_argument('--config', type=Path, default=config_args.config)
+    parser.add_argument('--workers', type=int, default=default_workers)
     parser.add_argument('--timeout', type=int, default=1200, help='timeout per external command/API request')
     parser.add_argument('--collect-timeout', type=int, default=3600, help='wall-clock limit per collected bug')
     parser.add_argument('--collect-memory-gib', type=int, default=6,
@@ -124,15 +145,29 @@ def main():
         parser.error('workers and resource limits must be positive')
     source = args.locator_results.resolve()
     config = json.loads(args.config.read_text())
-    cfg = config.get('mllm', config)
-    if cfg.get('vision_model') != 'deepseek-v4-flash-vision-exp':
-        raise ValueError('this batch requires deepseek-v4-flash-vision-exp')
+    cfg = config.get('dpex', config)
+    viewport = refinement_viewport_configuration(config)
+    if cfg.get('vision_model') != 'deepseek-flash':
+        raise ValueError('this batch requires deepseek-flash')
     if 'api_key' in cfg or not cfg.get('api_key_env'):
         raise ValueError('credentials must use api_key_env')
     bugs = load_inputs(source, set(args.bugs.split(',')) if args.bugs else None)
+    trace_layout = RunLayout(args.trace_root.resolve()) if args.trace_root else None
+    if trace_layout is not None:
+        for bug in bugs:
+            suite = validate_trace_suite(read_json(
+                trace_layout.artifacts / 'Closure' / f'bug_{bug}' / 'trace_suite.json'
+            ))
+            for spec in suite['tests']:
+                trace = trace_layout.artifacts / 'Closure' / f'bug_{bug}' / str(spec['trace'])
+                if not trace.is_file() and not trace.with_suffix(trace.suffix + '.zst').is_file():
+                    raise ValueError(f'missing external trace artifact for Closure-{bug}')
     if args.check:
         print(json.dumps({'validated_inputs': len(bugs), 'model': cfg['vision_model'],
-                          'workers': args.workers, 'collect_workers': 1,
+                          'workers': args.workers,
+                          'collect_workers': 0 if trace_layout else 1,
+                          'trace_root': str(trace_layout.root) if trace_layout else None,
+                          'viewport': viewport,
                           'api_key_present': bool(os.environ.get(cfg['api_key_env']))}))
         return 0
     if not args.dry_run and not os.environ.get(cfg['api_key_env']):
@@ -147,9 +182,16 @@ def main():
     state = {'schema': 'closure-refinement-batch', 'schema_version': 1,
              'pid': os.getpid(), 'started_at': now(), 'phase': 'RUNNING',
              'root': str(layout.root), 'locator_results': str(source),
+             'trace_root': str(trace_layout.root) if trace_layout else None,
              'model': cfg['vision_model'], 'reasoning_effort': cfg.get('reasoning_effort'),
              'max_tokens': cfg.get('max_tokens'), 'workers': args.workers,
-             'collect_workers': 1, 'dry_run': args.dry_run, 'total': len(bugs),
+             'viewport': {
+                 'max_upstream_calls': viewport[0],
+                 'max_downstream_calls': viewport[1],
+                 'max_internal_calls': viewport[2],
+             },
+             'collect_workers': 0 if trace_layout else 1,
+             'dry_run': args.dry_run, 'total': len(bugs),
              'collect_memory_gib': args.collect_memory_gib, 'collect_timeout_s': args.collect_timeout,
              'host_reserve_gib': args.host_reserve_gib,
              'bugs': {bug: {'status': 'PENDING'} for bug in bugs}}
@@ -181,10 +223,10 @@ def main():
         try:
             update(bug, 'DRY_RUNNING')
             arguments = (layout, 'Closure', bug, source, config, args.timeout, None)
-            row = _refine_bug(*arguments, True, False, 6, 6, 10, False)
+            row = _refine_bug(*arguments, True, False, *viewport, False, trace_layout)
             if row['status'] == 'DRY_RUN' and not args.dry_run:
                 update(bug, 'REFINING')
-                row = _refine_bug(*arguments, False, False, 6, 6, 10, False)
+                row = _refine_bug(*arguments, False, False, *viewport, False, trace_layout)
             update(bug, row['status'], result=row)
         except Exception as error:
             update(bug, 'ERROR', error=str(error))
@@ -200,20 +242,28 @@ def main():
                 # Bound the queue and retained trace volume while API work runs.
                 while len(pending) >= args.workers * 2:
                     _, pending = wait(pending, return_when=FIRST_COMPLETED)
-                update(bug, 'COLLECTING')
-                try:
-                    rows = collect_isolated(layout, bug, config_path, args)
-                except Exception as error:
-                    rows = [{'project': 'Closure', 'bug': bug, 'status': 'ERROR',
-                             'trigger_count': 0, 'checkout_removed': False,
-                             'resource_status': 'WORKER_ERROR'}]
-                    error_path = layout.stage_log_dir('collect', 'Closure', bug) / 'worker_error.log'
-                    error_path.parent.mkdir(parents=True, exist_ok=True)
-                    error_path.write_text(str(error) + '\n', encoding='utf-8')
+                if trace_layout is not None:
+                    suite = validate_trace_suite(read_json(
+                        trace_layout.artifacts / 'Closure' / f'bug_{bug}' / 'trace_suite.json'
+                    ))
+                    rows = [{'project': 'Closure', 'bug': bug, 'status': 'EXTERNAL',
+                             'trigger_count': len(suite['tests']), 'checkout_removed': True,
+                             'resource_status': 'NOT_RUN'}]
+                else:
+                    update(bug, 'COLLECTING')
+                    try:
+                        rows = collect_isolated(layout, bug, config_path, args)
+                    except Exception as error:
+                        rows = [{'project': 'Closure', 'bug': bug, 'status': 'ERROR',
+                                 'trigger_count': 0, 'checkout_removed': False,
+                                 'resource_status': 'WORKER_ERROR'}]
+                        error_path = layout.stage_log_dir('collect', 'Closure', bug) / 'worker_error.log'
+                        error_path.parent.mkdir(parents=True, exist_ok=True)
+                        error_path.write_text(str(error) + '\n', encoding='utf-8')
                 collected.extend(rows)
                 write_csv(layout.logs / 'collect.csv', collected,
                           ['project', 'bug', 'status', 'trigger_count', 'checkout_removed', 'resource_status'])
-                if len(rows) != 1 or rows[0]['status'] not in {'OK', 'SKIPPED'}:
+                if len(rows) != 1 or rows[0]['status'] not in {'OK', 'SKIPPED', 'EXTERNAL'}:
                     update(bug, 'COLLECT_ERROR', result=rows)
                     continue
                 update(bug, 'QUEUED', collect_status=rows[0]['status'])

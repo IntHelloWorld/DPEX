@@ -1,20 +1,25 @@
 import json
-import re
 import shutil
 import unittest
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from mllmfl.domain.assertion_folding import fold_successful_assertions
-from mllmfl.domain.focus_viewport import plan_focus_viewport
-from mllmfl.domain.refinement_trace import (
+from dpex.domain.assertion_folding import fold_successful_assertions
+from dpex.domain.focus_viewport import plan_focus_viewport
+from dpex.domain.refinement_trace import (
     RefinementTraceTopology,
     build_method_catalog,
     build_refinement_trace,
 )
-from mllmfl.infrastructure.io import write_zstd_json
-from mllmfl.stages.refine.graphs import MethodExecutionGraphs
+from dpex.infrastructure.io import write_zstd_json
+from dpex.infrastructure.trace_store import (
+    METHOD_SUMMARY_NAME,
+    TRACE_STORE_NAME,
+    execution_to_store,
+    finalize_trace_store,
+)
+from dpex.stages.refine.graphs import MethodExecutionGraphs
 
 
 GENERATED_ROOT = Path(__file__).resolve().parent / "generated/focus_viewport"
@@ -205,15 +210,27 @@ class FocusViewportSplitTests(unittest.TestCase):
         workspace = case_dir / "workspace"
         references = write_fixture_sources(workspace, execution)
         test = f"{call_tree['class']}::{call_tree['method']}"
-        trace, catalog, fingerprint = normalized_trace(
-            execution, test=test,
+        pruned, folding = fold_successful_assertions(execution)
+        pruned["project"] = "ViewportFixtures"
+        catalog, method_ids, fingerprint = build_method_catalog([pruned])
+        conversion = case_dir / "conversion"
+        conversion.mkdir()
+        execution_to_store(
+            pruned, conversion / TRACE_STORE_NAME,
+            conversion / METHOD_SUMMARY_NAME, test=test,
+            assertion_folding=folding,
+            defect_context={"error_stack": "", "test_output": ""},
         )
-        trace_path = trace_dir / "T1.refinement-trace.json.zst"
-        write_zstd_json(trace_path, trace)
+        trace_path = trace_dir / "T1.trace.sqlite3"
+        trace_fingerprint = finalize_trace_store(
+            conversion / TRACE_STORE_NAME, trace_path,
+            project="ViewportFixtures", test_id="T1", test=test,
+            method_ids=method_ids, catalog_fingerprint=fingerprint,
+        )
         (case_dir / "trace_suite.json").write_text(
             json.dumps({
                 "schema": "execution-trace-suite",
-                "schema_version": 2,
+                "schema_version": 3,
                 "project": "ViewportFixtures",
                 "bug": scenario,
                 "method_catalog_fingerprint": fingerprint,
@@ -223,8 +240,8 @@ class FocusViewportSplitTests(unittest.TestCase):
                     "test_id": "T1",
                     "test": test,
                     "trigger": 1,
-                    "trace": "traces/T1.refinement-trace.json.zst",
-                    "trace_fingerprint": trace["fingerprint"],
+                    "trace": "traces/T1.trace.sqlite3",
+                    "trace_fingerprint": trace_fingerprint,
                 }],
             }, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -339,16 +356,9 @@ class FocusViewportSplitTests(unittest.TestCase):
         self.assertIn(f"T1-C{focus_id} focus(int, Model)", puml)
         self.assertIn("args=[7, <ModelImpl>]", puml)
         self.assertIn("return value=<ResultImpl>", puml)
-        self.assertEqual(puml.count("-[#C62828]>"), 1)
-        self.assertIn(
-            f"<color:#B71C1C><b>T1-C{focus_id} "
-            "focus(int, Model)</b></color>\\n"
-            "<color:#B71C1C><b>args=[7, <ModelImpl>]</b></color>",
-            puml,
-        )
-        self.assertEqual(len(re.findall(
-            r"^activate p_[0-9a-f]+ #FFCDD2$", puml, re.MULTILINE
-        )), 1)
+        self.assertNotIn("-[#C62828]>", puml)
+        self.assertNotIn("<color:#B71C1C>", puml)
+        self.assertNotIn("#FFCDD2", puml)
         self.assertNotIn("arg0=", puml)
         self.assertNotIn("p.impl.", puml)
         self.assertNotIn("note ", puml)

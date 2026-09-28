@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from mllmfl.stages.refine.client import _post_response
+from dpex.stages.refine.client import _post_response
 
 
 TOOL = {
@@ -30,7 +30,7 @@ class FakeResponse:
 class RefinementClientTests(unittest.TestCase):
     def config(self, api_style: str) -> dict:
         return {
-            "mllm": {
+            "dpex": {
                 "api_style": api_style,
                 "base_url": "https://provider.example/v1",
                 "api_key_env": "REFINEMENT_TEST_KEY",
@@ -41,7 +41,7 @@ class RefinementClientTests(unittest.TestCase):
         }
 
     @patch.dict("os.environ", {"REFINEMENT_TEST_KEY": "secret"})
-    @patch("mllmfl.stages.refine.client.requests.post")
+    @patch("dpex.stages.refine.client.requests.post")
     def test_responses_payload_keeps_refinement_contract(self, post) -> None:
         post.return_value = FakeResponse({
             "id": "resp-1",
@@ -83,7 +83,7 @@ class RefinementClientTests(unittest.TestCase):
         self.assertFalse(payload["store"])
 
     @patch.dict("os.environ", {"REFINEMENT_TEST_KEY": "secret"})
-    @patch("mllmfl.stages.refine.client.requests.post")
+    @patch("dpex.stages.refine.client.requests.post")
     def test_chat_payload_preserves_reasoning_and_finish_reason(self, post) -> None:
         post.return_value = FakeResponse({
             "id": "chat-1",
