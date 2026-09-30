@@ -338,19 +338,25 @@ def runtime_method_ids(
 
 
 def selected_trace_tests(
-    localization_input: Dict[str, Any], suite: Dict[str, Any]
+    localization_input: Dict[str, Any], suite: Dict[str, Any],
+    *, allow_partial: bool = False, fallback_to_all: bool = False,
 ) -> list[Dict[str, Any]]:
     requested = localization_input.get("failing_tests")
     if requested is None:
         return [dict(item) for item in suite["tests"]]
     by_test = {str(item["test"]): item for item in suite["tests"]}
     missing = [test for test in requested if test not in by_test]
-    if missing:
+    if missing and not allow_partial:
         raise ValueError(
             "locator failing tests are absent from the trace suite: "
             + ", ".join(missing)
         )
-    return [dict(by_test[test]) for test in requested]
+    selected = [dict(by_test[test]) for test in requested if test in by_test]
+    if not selected:
+        if fallback_to_all:
+            return [dict(item) for item in suite["tests"]]
+        raise ValueError("locator failing tests have no overlap with the trace suite")
+    return selected
 
 
 def build_prompt(

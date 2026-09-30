@@ -74,6 +74,7 @@ from dpex.infrastructure.method_location import (
     java_executables,
     resolve_source_method_reference,
 )
+from dpex.infrastructure.java_source import find_java_file
 
 
 def candidate() -> dict:
@@ -335,6 +336,46 @@ class RefinementSchemaTests(unittest.TestCase):
                 [("P", "3")],
             )
 
+    def test_bug_items_discover_agentless_jsonl_without_trace_suites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = RunLayout(root / "run")
+            layout.ensure()
+            traced = layout.artifacts / "P" / "bug_1"
+            traced.mkdir(parents=True)
+            (traced / "trace_suite.json").write_text("{}", encoding="utf-8")
+            related = root / "agentless" / "related_elements"
+            related.mkdir(parents=True)
+            (related / "loc_outputs.jsonl").write_text(
+                "\n".join(json.dumps(row) for row in [
+                    {"instance_id": "P@2", "found_related_locs": {}},
+                    {"instance_id": "Other@3", "found_related_locs": {}},
+                ]) + "\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                _bug_items(layout, ["P"], None, root / "agentless"),
+                [("P", "1"), ("P", "2")],
+            )
+
+    def test_bug_items_discover_pingfl_results_without_trace_suites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            layout = RunLayout(root / "run")
+            layout.ensure()
+            traced = layout.artifacts / "P" / "bug_1"
+            traced.mkdir(parents=True)
+            (traced / "trace_suite.json").write_text("{}", encoding="utf-8")
+            result = root / "pingfl" / "P" / "P-2"
+            result.mkdir(parents=True)
+            (result / "debug_result.json").write_text("{}", encoding="utf-8")
+
+            self.assertEqual(
+                _bug_items(layout, ["P"], None, root / "pingfl"),
+                [("P", "1"), ("P", "2")],
+            )
+
     @patch("dpex.stages.refine.stage.defects4j_environment")
     @patch("dpex.stages.refine.stage.trigger_tests")
     def test_missing_trace_uses_exported_tests_when_locator_omits_them(
@@ -475,6 +516,52 @@ class RefinementSchemaTests(unittest.TestCase):
 
         self.assertEqual(methods[0].parameter_types, ("int", "String[]"))
         self.assertEqual(methods[1].parameter_types, ("T[]", "T[]"))
+
+        final_methods = java_executables(
+            "package p; class Service { void add(final Object... values) {} }"
+        )
+        self.assertEqual(final_methods[0].parameter_types, ("Object[]",))
+
+    def test_find_java_file_preserves_top_level_dollar_class_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            source = workspace / "src/p/$Types.java"
+            source.parent.mkdir(parents=True)
+            source.write_text("package p; class $Types {}\n", encoding="utf-8")
+
+            self.assertEqual(find_java_file(workspace, "p.$Types"), source)
+
+    def test_soapfl_method_code_disambiguates_nested_method(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            source = workspace / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p; class Service {\n"
+                "  void run() { Runnable r = new Runnable() {\n"
+                "    public void run() { helper(); }\n"
+                "  }; }\n"
+                "  void helper() {}\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            result_dir = root / "soapfl" / "d4j2.0.0-P-1"
+            result_dir.mkdir(parents=True)
+            (result_dir / "result.json").write_text(json.dumps({
+                "buggy_classes": ["p.Service"],
+                "buggy_methods": [{
+                    "method_name": "p.Service::run()",
+                    "method_code": "```java\n    public void run() { helper(); }\n```",
+                }],
+                "buggy_codes": {},
+            }), encoding="utf-8")
+
+            loaded = load_localization_input(
+                root / "soapfl", "P", "1", workspace
+            )
+
+            self.assertEqual(loaded["ranking"][0]["start_line"], 3)
 
     def test_locator_resolves_generic_arrays_and_named_type_variables(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1230,7 +1317,10 @@ class RefinementSchemaTests(unittest.TestCase):
             source = workspace / "src/p/Service.java"
             source.parent.mkdir(parents=True)
             source.write_text(
-                "package p;\nclass Service {\n void run() {}\n void helper() {}\n}\n",
+                "package p;\nclass Service {\n"
+                " Service(String name) {}\n"
+                " void run() {}\n void run(int count) {}\n"
+                " void helper() {}\n}\n",
                 encoding="utf-8",
             )
             result_dir = root / "agentless" / "related_elements"
@@ -1248,7 +1338,10 @@ class RefinementSchemaTests(unittest.TestCase):
                     "found_files": ["src/p/Service.java"],
                     "found_related_locs": {
                         "src/p/Service.java": [
-                            "method: Service.run", "method: Service.helper",
+                            "method: Service.notAMethod",
+                            "method: Service.run(int count)",
+                            "method: Service.helper",
+                            "method: Service.<init>(String name)",
                         ],
                     },
                     "related_loc_traj": [{
@@ -1276,7 +1369,10 @@ class RefinementSchemaTests(unittest.TestCase):
             self.assertEqual(loaded["locator"]["name"], "Agentless4Java")
             self.assertEqual(
                 [item["signature"] for item in loaded["ranking"]],
-                ["p.Service.run()", "p.Service.helper()"],
+                [
+                    "p.Service.run(int)", "p.Service.helper()",
+                    "p.Service.<init>(String)",
+                ],
             )
             self.assertEqual(loaded["failing_tests"], [
                 "p.ServiceTest::fails", "p.OtherTest::breaks",
@@ -1287,6 +1383,46 @@ class RefinementSchemaTests(unittest.TestCase):
             serialized = json.dumps(loaded["ranking"])
             self.assertNotIn("Visible Agentless localization explanation", serialized)
             self.assertNotIn("private reasoning", serialized)
+
+    def test_adapts_pingfl_line_range_ranking_and_failing_tests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "workspace"
+            source = workspace / "src/p/Service.java"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "package p;\nclass Service {\n"
+                " void run() {\n  int value = 1;\n }\n"
+                " void helper(int count) {}\n}\n",
+                encoding="utf-8",
+            )
+            result_dir = root / "pingfl" / "P" / "P-1"
+            result_dir.mkdir(parents=True)
+            (result_dir / "debug_result.json").write_text(json.dumps({
+                "p.ServiceTest::fails": {
+                    "0": {"prediction": "p.Service.run#3-5"},
+                },
+                "p.OtherTest.breaks()": {
+                    "0": {"prediction": "p.Service.helper#6-6"},
+                },
+            }), encoding="utf-8")
+            (result_dir / "method_rank_list.json").write_text(json.dumps([
+                "p.Service.1.run#3-5",
+                "p.Service.helper#6-6",
+            ]), encoding="utf-8")
+
+            loaded = load_localization_input(
+                root / "pingfl", "P", "1", workspace
+            )
+
+            self.assertEqual(loaded["locator"], {
+                "name": "PingFL", "source_format": "pingfl-debug-result",
+            })
+            self.assertEqual(
+                [item["signature"] for item in loaded["ranking"]],
+                ["p.Service.run()", "p.Service.helper(int)"],
+            )
+            self.assertNotIn("failing_tests", loaded)
 
     def test_selects_only_locator_failing_tests_in_locator_order(self):
         suite = {"tests": [
@@ -1306,6 +1442,20 @@ class RefinementSchemaTests(unittest.TestCase):
             selected_trace_tests({
                 "failing_tests": ["p.MissingTest::fails"],
             }, suite)
+        self.assertEqual(
+            [item["test_id"] for item in selected_trace_tests({
+                "failing_tests": [
+                    "p.ThirdTest::fails", "p.MissingTest::fails",
+                ],
+            }, suite, allow_partial=True)],
+            ["T3"],
+        )
+        self.assertEqual(
+            [item["test_id"] for item in selected_trace_tests({
+                "failing_tests": ["p.MissingTest::fails"],
+            }, suite, allow_partial=True, fallback_to_all=True)],
+            ["T1", "T2", "T3"],
+        )
 
 
 class BashToolTests(unittest.TestCase):

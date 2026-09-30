@@ -324,6 +324,7 @@ class SoapFLLocatorAdapter:
                 "function": signature.rsplit("(", 1)[0],
                 "signature": signature,
                 "reason": reason or "SoapFL final prediction",
+                "method_code": str(item.get("method_code") or ""),
             })
         if not ranking:
             raise ValueError("SoapFL result has no method candidates")
@@ -383,6 +384,35 @@ def _agentless_failing_tests(value: Dict[str, Any]) -> tuple[str, ...] | None:
     return None
 
 
+def _split_agentless_parameters(value: str) -> list[str]:
+    parameters = []
+    current = []
+    depth = 0
+    for character in value:
+        if character in "<([":
+            depth += 1
+        elif character in ">)]" and depth:
+            depth -= 1
+        if character == "," and depth == 0:
+            parameters.append("".join(current).strip())
+            current = []
+        else:
+            current.append(character)
+    parameters.append("".join(current).strip())
+    result = []
+    for parameter in parameters:
+        if not parameter:
+            continue
+        parameter = re.sub(r"^(?:final\s+)+", "", parameter).strip()
+        match = re.fullmatch(
+            r"(.+\S)\s+([A-Za-z_$][\w$]*)(\[\])?", parameter
+        )
+        if match is not None:
+            parameter = match.group(1) + (match.group(3) or "")
+        result.append(parameter)
+    return result
+
+
 class AgentlessLocatorAdapter:
     name = "agentless4java-related-locations"
 
@@ -425,7 +455,10 @@ class AgentlessLocatorAdapter:
             for location in locations:
                 for line in str(location).splitlines():
                     match = re.fullmatch(
-                        r"\s*method:\s*((?:[A-Za-z_$][\w$]*\.)*[A-Za-z_$][\w$]*)\s*",
+                        r"\s*method:\s*"
+                        r"((?:[A-Za-z_$][\w$]*\.)*"
+                        r"(?:[A-Za-z_$][\w$]*|<init>))"
+                        r"\s*(?:\(([^\r\n]*)\))?\s*",
                         line,
                     )
                     if match is None:
@@ -433,17 +466,37 @@ class AgentlessLocatorAdapter:
                             raise ValueError(f"invalid Agentless method location: {line}")
                         continue
                     function = match.group(1)
-                    identity = (str(source_file), function)
+                    parameters = (
+                        _split_agentless_parameters(match.group(2))
+                        if match.group(2) is not None else None
+                    )
+                    source_class = Path(str(source_file)).stem
+                    if "." not in function and function == source_class:
+                        function = f"{source_class}.<init>"
+                    elif (
+                        "." in function
+                        and function.rsplit(".", 1)[1]
+                        == function.rsplit(".", 1)[0].rsplit(".", 1)[-1]
+                    ):
+                        class_name = function.rsplit(".", 1)[0]
+                        function = f"{class_name}.<init>"
+                    identity = (
+                        str(source_file), function,
+                        tuple(parameters) if parameters is not None else None,
+                    )
                     if identity in seen:
                         continue
                     seen.add(identity)
-                    ranking.append({
+                    candidate = {
                         "function": function,
                         "signature": function + "()",
                         "source_file": str(source_file),
                         "parameter_types_unknown": True,
                         "reason": "",
-                    })
+                    }
+                    if parameters is not None:
+                        candidate["parameter_types"] = parameters
+                    ranking.append(candidate)
         if not ranking:
             raise ValueError("Agentless result has no method candidates")
         return AdaptedLocatorResult(
@@ -454,11 +507,91 @@ class AgentlessLocatorAdapter:
         )
 
 
+_PINGFL_METHOD_ID = re.compile(
+    r"(?P<function>(?:[A-Za-z_$][\w$]*\.|[1-9]\d*\.)+"
+    r"[A-Za-z_$][\w$]*)#(?P<start>[1-9]\d*)-(?P<end>[1-9]\d*)"
+)
+
+
+class PingFLLocatorAdapter:
+    name = "pingfl-debug-result"
+
+    def candidate_paths(
+        self, source: Path, project: str, bug: str
+    ) -> Sequence[Path]:
+        if source.is_file():
+            return (source,)
+        return (
+            source / project / f"{project}-{bug}" / "debug_result.json",
+        )
+
+    def matches(self, path: Path, value: Dict[str, Any]) -> bool:
+        if path.name != "debug_result.json" or not isinstance(value, dict):
+            return False
+        ranking_path = path.with_name("method_rank_list.json")
+        return ranking_path.is_file() and all(
+            isinstance(test, str) and isinstance(processes, dict)
+            for test, processes in value.items()
+        )
+
+    def adapt(
+        self,
+        path: Path,
+        value: Dict[str, Any],
+        project: str,
+        bug: str,
+    ) -> AdaptedLocatorResult:
+        if path.parent.name != f"{project}-{bug}":
+            raise ValueError(
+                f"PingFL result identity does not match selected bug: {path.parent.name}"
+            )
+        ranking_value = read_json(path.with_name("method_rank_list.json"))
+        if not isinstance(ranking_value, list):
+            raise ValueError("PingFL method ranking must be an array")
+        ranking = []
+        seen = set()
+        for index, raw_method_id in enumerate(ranking_value):
+            if not isinstance(raw_method_id, str):
+                raise ValueError(f"invalid PingFL method ID at index {index}")
+            match = _PINGFL_METHOD_ID.fullmatch(raw_method_id.strip())
+            if match is None:
+                raise ValueError(f"invalid PingFL method ID: {raw_method_id}")
+            method_id = raw_method_id.strip()
+            if method_id in seen:
+                continue
+            seen.add(method_id)
+            start_line = int(match.group("start"))
+            end_line = int(match.group("end"))
+            if end_line < start_line:
+                raise ValueError(f"invalid PingFL method line range: {raw_method_id}")
+            ranking.append({
+                "function": match.group("function"),
+                "signature": match.group("function") + "()",
+                "start_line": start_line,
+                "end_line": end_line,
+                "source_range_identity": True,
+                "reason": "PingFL final ranking",
+            })
+        if not ranking:
+            raise ValueError("PingFL result has no method candidates")
+        return AdaptedLocatorResult(
+            path=path,
+            locator={"name": "PingFL", "source_format": self.name},
+            ranking=ranking,
+            # PingFL's published ranking is aggregated across its debugging
+            # sessions.  Let DPEX use every failing execution in the selected
+            # trace suite; Defects4J revisions can rename or replace trigger
+            # tests without changing the project/bug identity.
+            failing_tests=None,
+        )
+
+
 LOCATOR_ADAPTERS: tuple[LocatorResultAdapter, ...] = (
     CanonicalLocatorAdapter(),
     AutoFLLocatorAdapter(),
     SoapFLLocatorAdapter(),
     AgentlessLocatorAdapter(),
+    PingFLLocatorAdapter(),
 )
 
 

@@ -90,6 +90,38 @@ def _locator_bug_items(
             result.add((match.group(1), match.group(2)))
         return result
 
+    agentless_path = locator_results / "related_elements" / "loc_outputs.jsonl"
+    if agentless_path.is_file():
+        try:
+            rows = [
+                json.loads(line)
+                for line in agentless_path.read_text(
+                    encoding="utf-8", errors="strict"
+                ).splitlines()
+                if line.strip()
+            ]
+        except (OSError, UnicodeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                f"cannot discover Agentless bugs from {agentless_path}: {error}"
+            ) from error
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            identity = row.get("instance_id")
+            if not isinstance(identity, str):
+                continue
+            project, separator, bug = identity.partition("@")
+            if separator and project in selected_projects and bug.isdigit():
+                result.add((project, bug))
+
+    for project in selected_projects:
+        for path in (locator_results / project).glob(
+            f"{project}-*/debug_result.json"
+        ):
+            bug = path.parent.name.removeprefix(f"{project}-")
+            if bug.isdigit():
+                result.add((project, bug))
+
     for project in selected_projects:
         for parent in (
             locator_results / project,
@@ -271,7 +303,17 @@ def _refine_bug(
             invalid_final_response_retries(effective_config)
             finalization_limits(effective_config)
             selected_tests = (
-                selected_trace_tests(localization_input, suite)
+                selected_trace_tests(
+                    localization_input,
+                    suite,
+                    allow_partial=(
+                        localization_input["locator"].get("name")
+                        in {"Agentless4Java", "SoapFL"}
+                    ),
+                    fallback_to_all=(
+                        localization_input["locator"].get("name") == "SoapFL"
+                    ),
+                )
                 if suite is not None
                 else _tests_without_trace(localization_input, workspace)
             )

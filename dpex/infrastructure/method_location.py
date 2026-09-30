@@ -114,7 +114,13 @@ def _parameter_types(source: bytes, node: Node) -> tuple[str, ...]:
         # whose type is its first named child rather than a named ``type``
         # field.  Do not silently drop varargs from readable signatures.
         if type_node is None and parameter.type == "spread_parameter":
-            type_node = next(iter(parameter.named_children), None)
+            type_node = next(
+                (
+                    child for child in parameter.named_children
+                    if child.type not in {"modifiers", "identifier"}
+                ),
+                None,
+            )
         if type_node is None:
             continue
         value = normalize_java_type(_text(source, type_node))

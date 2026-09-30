@@ -18,18 +18,23 @@ def _read(path: Path) -> str:
 
 
 def find_java_file(workspace: Path, class_name: str) -> Optional[Path]:
-    outer = class_name.split("$")[0]
-    filename = outer.rsplit(".", 1)[-1] + ".java"
-    package = outer.rsplit(".", 1)[0] if "." in outer else ""
+    package, simple_class = (
+        class_name.rsplit(".", 1) if "." in class_name else ("", class_name)
+    )
+    filenames = [simple_class + ".java"]
+    outer_simple = simple_class.split("$", 1)[0]
+    if outer_simple and outer_simple + ".java" not in filenames:
+        filenames.append(outer_simple + ".java")
     candidates = [
         path
+        for filename in filenames
         for path in workspace.rglob(filename)
         if not IGNORED_PARTS.intersection(path.parts)
     ]
     # Prefer the production source tree when a checkout also contains an
     # emulation, contribution, example, or generated copy of the same class.
     # Defects4J projects commonly use either src/main/java or src/java.
-    def source_priority(path: Path) -> tuple[int, str]:
+    def source_priority(path: Path) -> tuple[int, int, str]:
         relative = path.relative_to(workspace).as_posix()
         if relative.startswith("src/main/java/"):
             priority = 0
@@ -39,7 +44,7 @@ def find_java_file(workspace: Path, class_name: str) -> Optional[Path]:
             priority = 2
         else:
             priority = 3
-        return priority, relative
+        return filenames.index(path.name), priority, relative
 
     candidates.sort(key=source_priority)
     for path in candidates:

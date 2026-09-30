@@ -6,11 +6,14 @@ from typing import Any, Dict, Sequence
 from dpex.domain.models import Ranking
 from dpex.domain.schemas import validate_localization_input
 from dpex.infrastructure.method_location import (
+    MethodLocation,
     java_executables,
+    normalize_java_type,
     resolve_method_location,
     same_parameters,
     signature_parameter_types,
 )
+from dpex.infrastructure.java_source import find_java_file
 
 from .adapters import adapt_locator_result
 
@@ -18,9 +21,23 @@ from .adapters import adapt_locator_result
 def _canonical_function(function: str) -> str:
     normalized = function.strip()
     class_name, method = normalized.rsplit(".", 1)
-    if method == class_name.rsplit(".", 1)[-1]:
+    if method in {
+        class_name.rsplit(".", 1)[-1],
+        class_name.rsplit("$", 1)[-1],
+    }:
         method = "<init>"
     return f"{class_name}.{method}"
+
+
+def _normalized_method_code(value: str) -> str:
+    code = value.strip()
+    if code.startswith("```"):
+        lines = code.splitlines()
+        lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines.pop()
+        code = "\n".join(lines)
+    return re.sub(r"\s+", "", code)
 
 
 _GENERIC_TYPE_VARIABLE = re.compile(r"[A-Z][A-Z0-9_]*(?:\[\])*")
@@ -55,7 +72,8 @@ def _matches_erased_generic_parameters(
 
 
 def _resolve_locator_method(
-    workspace: Path, function: str, signature: str, descriptor: str
+    workspace: Path, function: str, signature: str, descriptor: str,
+    method_code: str = "",
 ):
     canonical_function = _canonical_function(function)
     suffix = signature[signature.rfind("("):]
@@ -74,36 +92,52 @@ def _resolve_locator_method(
     expected = signature_parameter_types(canonical_signature)
     matches = []
     name_matches = []
+    canonical_dotted = canonical_function.replace("$", ".")
     for path in workspace.rglob("*.java"):
         try:
-            executables = java_executables(
-                path.read_text(encoding="utf-8", errors="replace")
-            )
+            source_text = path.read_text(encoding="utf-8", errors="replace")
+            executables = java_executables(source_text)
         except (OSError, ValueError):
             continue
         for executable in executables:
             normalized = executable.function.replace("$", ".")
             if not (
-                normalized == canonical_function
-                or normalized.endswith("." + canonical_function)
+                normalized == canonical_dotted
+                or normalized.endswith("." + canonical_dotted)
             ):
                 continue
-            name_matches.append(executable)
+            entry = (path, source_text, executable)
+            name_matches.append(entry)
             if same_parameters(executable.parameter_types, expected):
-                matches.append(executable)
+                matches.append(entry)
     matches = list(dict.fromkeys(matches))
+    name_matches = list(dict.fromkeys(name_matches))
+    normalized_code = _normalized_method_code(method_code)
+    if normalized_code:
+        code_matches = []
+        for entry in name_matches:
+            _, source_text, executable = entry
+            lines = source_text.splitlines()
+            source_code = "\n".join(
+                lines[executable.start_line - 1 : executable.end_line]
+            )
+            if _normalized_method_code(source_code) == normalized_code:
+                code_matches.append(entry)
+        if len(code_matches) == 1:
+            matches = code_matches
     if len(matches) == 1:
-        selected = matches[0]
+        selected_entry = matches[0]
     elif len(name_matches) == 1:
         # Locator signatures describe erased generic parameters (for example
         # ``T`` as ``java.lang.Object``), while source parsing retains the type
         # variable.  A single declaration is still unambiguous without making
         # overload resolution permissive.
-        selected = name_matches[0]
+        selected_entry = name_matches[0]
     else:
         erased_generic_matches = [
-            executable
-            for executable in name_matches
+            entry
+            for entry in name_matches
+            for executable in (entry[2],)
             if _matches_erased_generic_parameters(
                 executable.parameter_types, expected
             )
@@ -112,15 +146,18 @@ def _resolve_locator_method(
             raise ValueError(
                 f"cannot uniquely resolve locator method: {signature}"
             )
-        selected = erased_generic_matches[0]
+        selected_entry = erased_generic_matches[0]
+    selected_path, _, selected = selected_entry
     resolved_function = selected.function
     canonical_signature = resolved_function + suffix
-    source_signature = (
-        resolved_function + "(" + ",".join(selected.parameter_types) + ")"
-    )
     return (
-        resolve_method_location(
-            workspace, resolved_function, signature=source_signature
+        MethodLocation(
+            function=resolved_function,
+            source_file=selected_path.resolve().relative_to(
+                workspace.resolve()
+            ).as_posix(),
+            start_line=selected.start_line,
+            end_line=selected.end_line,
         ),
         canonical_signature,
     )
@@ -135,12 +172,13 @@ def _location_ranking(
     start_line = item.get("start_line")
     end_line = item.get("end_line")
     descriptor = str(item.get("descriptor") or "")
+    method_code = str(item.get("method_code") or "")
     if not function:
         raise ValueError(f"locator candidate at rank {rank} has no function")
     if not signature:
         raise ValueError(f"locator candidate at rank {rank} has no signature")
     location, canonical_signature = _resolve_locator_method(
-        workspace, function, signature, descriptor
+        workspace, function, signature, descriptor, method_code
     )
     if source_file or start_line is not None or end_line is not None:
         if (
@@ -171,33 +209,137 @@ def _canonical_candidates(
 ) -> list[Dict[str, Any]]:
     result = []
     seen_locations = set()
+    source_range_file_cache = {}
     for index, raw in enumerate(ranking, 1):
         if not isinstance(raw, dict):
             raise ValueError(f"invalid locator ranking at index {index - 1}")
         items = []
-        if raw.get("parameter_types_unknown") is True:
+        if raw.get("source_range_identity") is True:
+            raw_function = str(raw.get("function") or "").strip()
+            raw_class, method_name = raw_function.rsplit(".", 1)
+            class_parts = [
+                part for part in raw_class.replace("$", ".").split(".")
+                if not part.isdigit()
+            ]
+            normalized_class = ".".join(class_parts)
+            normalized_method = (
+                "<init>"
+                if class_parts and method_name == class_parts[-1]
+                else method_name
+            )
+            normalized_function = f"{normalized_class}.{normalized_method}"
+            candidate_paths = []
+            for class_part in reversed(class_parts):
+                filename = class_part + ".java"
+                paths = source_range_file_cache.get(filename)
+                if paths is None:
+                    paths = list(workspace.rglob(filename))
+                    source_range_file_cache[filename] = paths
+                for path in paths:
+                    if path not in candidate_paths:
+                        candidate_paths.append(path)
+            source_range_executables = []
+            for path in candidate_paths:
+                try:
+                    executables = java_executables(
+                        path.read_text(encoding="utf-8", errors="replace")
+                    )
+                except (OSError, ValueError):
+                    continue
+                relative = path.relative_to(workspace).as_posix()
+                source_range_executables.extend(
+                    (relative, executable) for executable in executables
+                )
+            start_line = raw.get("start_line")
+            end_line = raw.get("end_line")
+            matches = [
+                (source_file, executable)
+                for source_file, executable in source_range_executables
+                if executable.start_line == start_line
+                and executable.end_line == end_line
+                and normalized_function.endswith(
+                    executable.function.replace("$", ".")
+                )
+            ]
+            if len(matches) != 1:
+                # Anonymous classes have no declared type name in the source
+                # AST, so PingFL's numeric class segment disappears here. The
+                # exact method name and source interval remain unambiguous.
+                matches = [
+                    (source_file, executable)
+                    for source_file, executable in source_range_executables
+                    if executable.function.rsplit(".", 1)[-1]
+                    == normalized_method
+                    and executable.start_line == start_line
+                    and executable.end_line == end_line
+                ]
+            if len(matches) != 1:
+                raise ValueError(
+                    "cannot uniquely resolve PingFL method ID: "
+                    f"{raw_function}#{start_line}-{end_line}"
+                )
+            source_file, executable = matches[0]
+            items = [replace(
+                Ranking(
+                    function=executable.function,
+                    signature=(
+                        executable.function + "(" +
+                        ",".join(executable.parameter_types) + ")"
+                    ),
+                    rank=index,
+                    reason=str(raw.get("reason") or ""),
+                ),
+                source_file=source_file,
+                start_line=executable.start_line,
+                end_line=executable.end_line,
+            )]
+        elif raw.get("parameter_types_unknown") is True:
             source_file = str(raw.get("source_file") or "").strip()
             function = str(raw.get("function") or "").strip().replace("$", ".")
-            matching_files = [
-                path for path in workspace.rglob("*.java")
-                if path.relative_to(workspace).as_posix().endswith(source_file)
-            ]
-            if len(matching_files) != 1:
+            source_class = source_file.removesuffix(".java").replace("/", ".")
+            matching_file = find_java_file(workspace, source_class)
+            if matching_file is None:
+                suffix_matches = [
+                    path for path in workspace.rglob(Path(source_file).name)
+                    if path.relative_to(workspace).as_posix().endswith(source_file)
+                ]
+                suffix_matches.sort(key=lambda path: (
+                    0 if path.relative_to(workspace).as_posix().startswith(
+                        "src/main/java/"
+                    ) else 1,
+                    path.relative_to(workspace).as_posix(),
+                ))
+                matching_file = suffix_matches[0] if suffix_matches else None
+            if matching_file is None:
                 raise ValueError(
-                    f"cannot uniquely resolve Agentless source file: {source_file}"
+                    f"cannot resolve Agentless source file: {source_file}"
                 )
             executables = java_executables(
-                matching_files[0].read_text(encoding="utf-8", errors="replace")
+                matching_file.read_text(encoding="utf-8", errors="replace")
             )
             matches = [
                 executable for executable in executables
                 if executable.function.replace("$", ".").endswith("." + function)
                 or executable.function.replace("$", ".") == function
             ]
-            if not matches:
-                raise ValueError(
-                    f"cannot resolve Agentless locator method: {function}"
+            expected_parameters = raw.get("parameter_types")
+            if isinstance(expected_parameters, list):
+                normalized_expected = tuple(
+                    normalize_java_type(str(parameter))
+                    for parameter in expected_parameters
                 )
+                matches = [
+                    executable for executable in matches
+                    if same_parameters(
+                        executable.parameter_types, normalized_expected
+                    )
+                ]
+            if not matches:
+                # Agentless can label a field-like or hallucinated member as a
+                # method alongside valid physical declarations.  Such entries
+                # cannot participate in a method-level refinement ranking;
+                # retain the resolvable candidates in their original order.
+                continue
             for executable in matches:
                 items.append(replace(
                     Ranking(
@@ -209,7 +351,7 @@ def _canonical_candidates(
                         rank=index,
                         reason=str(raw.get("reason") or ""),
                     ),
-                    source_file=matching_files[0].relative_to(workspace).as_posix(),
+                    source_file=matching_file.relative_to(workspace).as_posix(),
                     start_line=executable.start_line,
                     end_line=executable.end_line,
                 ))
